@@ -6,7 +6,7 @@ Dex is a personal engineering operator for iMessage. Send it a task, let a fresh
 
 Dex is designed around one product promise: after a one-time setup in Terminal, the everyday interface is iMessage.
 
-> **Implementation status:** the complete Dex runtime, cloud service, setup flow, and deterministic golden path are implemented and green in automated acceptance. Real Gemini, Claude-Mem, Claude CLI, Codex CLI, and Modal create/execute/detach/reconnect smoke checks have passed on this Mac. Live Sendblue pairing, a full Codex/Modal continuation, and physical sleep still require the deployment configuration described below; those external steps are not simulated or claimed as complete.
+> **Implementation status:** Dex Cloud and the paired Mac daemon are live. Real Sendblue pairing and messaging, concurrent fresh Codex/Claude workers, Claude-Mem retrieval, the production battery-policy path, ChatGPT-account-backed Codex in Modal, and local-to-cloud handoff have all run successfully. The release monitor has also collected a result from a real detached Modal sandbox before terminating it. Physical sleep remains an explicit final demo action and is not claimed as completed here.
 
 ## Set up once
 
@@ -32,7 +32,7 @@ The full local and cloud configuration is listed in [`.env.example`](.env.exampl
 | `DEX_DEVICE_ID` | Paired Dex device identity | Normally written by setup; may override runtime config |
 | `DEX_DEVICE_KEY_ID` | Device signing-key identifier | Normally written by setup; may override runtime config |
 | `DEX_CLOUD_SERVER_KEYS_JSON` | JSON array of pinned Dex Cloud Ed25519 public keys | Required for setup and signed-command verification |
-| `DEX_SENDBLUE_LINE` or `SENDBLUE_NUMBER` | Dex's iMessage phone number | Required so setup can show where to send `PAIR …`; the second name reuses the existing Appfi convention |
+| `DEX_SENDBLUE_LINE` or `SENDBLUE_NUMBER` | Dex's iMessage phone number | Required so setup can show where to send `PAIR …`; the second name is a compatibility alias |
 | `GEMINI_API_KEY` | Gemini router credential | Model-assisted natural-language routing; deterministic routes still work without it |
 | `MODAL_TOKEN_ID` | Modal account token ID | Optional locally when an authenticated `~/.modal.toml` profile exists; required for headless cloud monitoring |
 | `MODAL_TOKEN_SECRET` | Modal account token secret | Optional locally when an authenticated `~/.modal.toml` profile exists; required for headless cloud monitoring |
@@ -140,22 +140,23 @@ npm test -- --run
 npm run build
 ```
 
-The current suite has **111 passing tests across 18 files**. It includes one composed golden-path acceptance that crosses signed Sendblue ingress, pairing and device sync, concurrent fresh Codex/Claude workers, semantic status, memory and failed-approach continuity, the production battery-policy function, Modal startup acknowledgement, deterministic cloud monitoring, the sleep gate, and exactly-once Sendblue completion. External provider boundaries in that acceptance use controlled fakes; cryptography, Git worktrees/bundles, subprocesses, persistence, and package installation are real.
+The current suite has **135 passing tests across 21 files**. It includes one composed golden-path acceptance that crosses signed Sendblue ingress, pairing and device sync, concurrent fresh Codex/Claude workers, semantic status, memory and failed-approach continuity, the production battery-policy function, Modal startup acknowledgement, deterministic cloud monitoring, the sleep gate, and exactly-once Sendblue completion. External provider boundaries in that acceptance use controlled fakes; cryptography, Git worktrees/bundles, subprocesses, persistence, and package installation are real.
 
 Additional safe live checks completed on this Mac:
 
 - Gemini 3.5 Flash-Lite with `minimal` and Gemini 3.7 Flash with `low` both returned valid structured routes;
 - a real Claude-Mem observation was written, summarized, searched, and fetched back as observation `#5873`;
 - authenticated local Codex and Claude adapters each completed a disposable Git-fixture edit; and
-- `dex doctor` sees Node 22, macOS, Git, both authenticated CLIs, `pmset`, `caffeinate`, and a healthy Claude-Mem worker.
+- two fresh Modal sandboxes accepted the persistent ChatGPT-backed Codex login with both API-key variables blank;
+- a live iMessage created concurrent fresh Codex and Claude workers in isolated worktrees;
+- a controlled 8% reading produced the real low-battery policy event and Sendblue alert;
+- a live Claude task was checkpointed with 13 continuity items and started fresh Codex in Modal; and
+- the release monitor collected and durably accepted a result from real detached sandbox `sb-3NcmwQhUtX31ZZprmIohOn` before termination.
 
-The following deployment-only proofs remain before claiming the physical demo is complete:
+The following final-stage proofs remain before claiming the physical sleep demo is complete:
 
-- live iMessage ingress or completion delivery;
-- live owner pairing against Dex Cloud;
-- a real Modal sandbox continuation or reconnect;
-- a real Mac sleep while cloud work continues; or
-- recovery of cloud code back into the local repository.
+- one full post-fix coding-worker completion delivered exactly once through Sendblue; and
+- a real Mac sleep after cloud ownership is confirmed, followed by completion while the Mac remains asleep.
 
 ## After the golden path
 

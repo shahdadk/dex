@@ -324,7 +324,7 @@ Additional execution authority lives outside that file:
 - setup requires the Dex iMessage number plus Modal account credentials; and
 - Modal must receive the cloud model credential and matching handoff verification key, either as ephemeral scoped values or through the configured named secret.
 
-Dex Cloud accepts existing Appfi secret-name aliases (`SENDBLUE_NUMBER`, `SENDBLUE_API_SECRET`, and `SENDBLUE_WEBHOOK_SECRET`) as well as Dex's canonical names. Values remain in the deployment secret manager; they are never copied into source or handoffs.
+Dex Cloud accepts legacy secret-name aliases (`SENDBLUE_NUMBER`, `SENDBLUE_API_SECRET`, and `SENDBLUE_WEBHOOK_SECRET`) as well as Dex's canonical names. Values remain in the deployment secret manager; they are never copied into source or handoffs.
 
 These values belong in the appropriate Keychain, service, or secret manager—not in Git, task state, event payloads, or handoffs.
 
