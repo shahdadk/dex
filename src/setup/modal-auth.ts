@@ -28,6 +28,11 @@ const ModalVolumeNameSchema = z.string().regex(
   "Modal Codex auth Volume name must be 1-63 lowercase letters, numbers, dots, underscores, or hyphens",
 );
 
+const ModalVolumeEntriesSchema = z.array(z.object({
+  filename: z.string(),
+  type: z.string(),
+}).passthrough());
+
 type Runner = (command: string, args: readonly string[]) => Promise<ExecResult>;
 
 export interface SeedModalCodexAuthOptions {
@@ -74,7 +79,7 @@ export async function validateLocalCodexAuth(authPath = path.join(os.homedir(), 
   }
 }
 
-/** Seeds auth directly from the user's home directory; no credential enters the repository. */
+/** Seeds auth directly from the user's home directory only when absent; no credential enters the repository. */
 export async function seedModalCodexAuth(options: SeedModalCodexAuthOptions = {}): Promise<{ volumeName: string }> {
   const authPath = options.authPath ?? path.join(os.homedir(), ".codex", "auth.json");
   const volumeName = ModalVolumeNameSchema.parse(
@@ -86,11 +91,29 @@ export async function seedModalCodexAuth(options: SeedModalCodexAuthOptions = {}
   if (created.exitCode !== 0 && !/already exists/i.test(`${created.stdout}\n${created.stderr}`)) {
     throw new Error("Could not create the private Modal Codex auth Volume");
   }
-  const uploaded = await runner("modal", [
-    "volume", "put", "--force", volumeName, authPath, "auth.json",
-  ]);
-  if (uploaded.exitCode !== 0) {
-    throw new Error("Could not upload the Codex auth cache to the private Modal Volume");
+  const existing = await runner("modal", ["volume", "ls", "--json", volumeName, "auth.json"]);
+  let hasRemoteAuth = false;
+  if (existing.exitCode === 0) {
+    let entries: z.infer<typeof ModalVolumeEntriesSchema>;
+    try {
+      entries = ModalVolumeEntriesSchema.parse(JSON.parse(existing.stdout));
+    } catch (error) {
+      throw new Error("Could not validate the private Modal Codex auth Volume listing", { cause: error });
+    }
+    hasRemoteAuth = entries.some((entry) => entry.filename === "auth.json" && entry.type === "file");
+    if (!hasRemoteAuth) {
+      throw new Error("The Modal Codex auth path exists but is not a regular auth.json file");
+    }
+  } else if (!/no such file or directory/i.test(`${existing.stdout}\n${existing.stderr}`)) {
+    throw new Error("Could not inspect the private Modal Codex auth Volume");
+  }
+  if (!hasRemoteAuth) {
+    const uploaded = await runner("modal", [
+      "volume", "put", volumeName, authPath, "auth.json",
+    ]);
+    if (uploaded.exitCode !== 0) {
+      throw new Error("Could not seed the Codex auth cache in the private Modal Volume");
+    }
   }
   const modal = options.modal ?? new ModalAdapter();
   let sandbox: Awaited<ReturnType<ModalAdapter["create"]>> | undefined;
@@ -108,7 +131,18 @@ export async function seedModalCodexAuth(options: SeedModalCodexAuthOptions = {}
     }
     const permissions = await sandbox.exec(["chmod", "600", path.join(MODAL_CODEX_HOME, "auth.json")]);
     if (await permissions.wait() !== 0) throw new Error("Could not secure the remote Codex auth cache");
-    const status = await sandbox.exec(["codex", "login", "status"], { env: { CODEX_HOME: MODAL_CODEX_HOME } });
+    const accountEnvironment = {
+      CODEX_HOME: MODAL_CODEX_HOME,
+      OPENAI_API_KEY: "",
+      CODEX_API_KEY: "",
+    };
+    const keyCheck = await sandbox.exec([
+      "node",
+      "-e",
+      "if (process.env.OPENAI_API_KEY || process.env.CODEX_API_KEY) process.exit(1)",
+    ], { env: accountEnvironment });
+    if (await keyCheck.wait() !== 0) throw new Error("Modal Codex account verification exposed an API key");
+    const status = await sandbox.exec(["codex", "login", "status"], { env: accountEnvironment });
     if (await status.wait() !== 0) throw new Error("Codex did not accept the seeded ChatGPT account login");
   } finally {
     try {

@@ -22,11 +22,15 @@ export class MessageRouter {
   }
 
   async route(rawMessage: string): Promise<RouteResult> {
-    const message = rawMessage.trim().replace(/^dex[:,]?\s*/i, "");
+    const message = rawMessage.trim().replace(/[‘’]/g, "'").replace(/^dex[:,]?\s*/i, "");
     if (!message) throw new Error("Dex received an empty message");
 
     const exact = deterministicActions(message);
     if (exact.length > 0) return { actions: DexActionsSchema.parse(exact), source: "deterministic" };
+
+    if (hasExplicitAgentAssignment(message)) {
+      return { actions: DexActionsSchema.parse(deterministicTaskSplit(message)), source: "deterministic" };
+    }
 
     const ambiguous = isAmbiguous(message);
     if (this.#gemini.available) {
@@ -126,6 +130,10 @@ function deterministicTaskSplit(message: string): DexAction[] {
 
 function isAmbiguous(message: string): boolean {
   return message.length > 240 || /\b(?:it|that|this|thing|same|before|figure out|whatever)\b/i.test(message);
+}
+
+function hasExplicitAgentAssignment(message: string): boolean {
+  return /\b(?:have|use)\s+(?:claude|codex)\b|\b(?:with|using)\s+(?:claude|codex)\b|\b(?:claude|codex)\s+(?:to\s+)?(?:fix|investigate|implement|build|review|debug|add|finish|test)\b/i.test(message);
 }
 
 function normalizeTaskQuery(value: string): string {

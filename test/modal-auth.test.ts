@@ -28,7 +28,7 @@ describe("Modal Codex account auth", () => {
     await expect(validateLocalCodexAuth(fixture.authPath)).resolves.toBeUndefined();
   });
 
-  it("creates the named volume with argv and secures the mounted cache", async () => {
+  it("seeds a missing named-volume cache and secures the mounted cache", async () => {
     const fixture = await authFixture();
     const runnerCommands: string[][] = [];
     const executions: Array<{ argv: string[]; params?: Record<string, unknown> }> = [];
@@ -47,23 +47,65 @@ describe("Modal Codex account auth", () => {
     } as unknown as ModalAdapter;
     const runner = vi.fn(async (command: string, args: readonly string[]) => {
       runnerCommands.push([command, ...args]);
+      if (args[1] === "ls") {
+        return { stdout: "", stderr: "No such file or directory", exitCode: 1 };
+      }
       return { stdout: "", stderr: "", exitCode: 0 };
     });
 
     await expect(seedModalCodexAuth({ authPath: fixture.authPath, volumeName: "private-auth", runner, modal })).resolves.toEqual({ volumeName: "private-auth" });
     expect(runnerCommands).toEqual([
       ["modal", "volume", "create", "private-auth"],
-      ["modal", "volume", "put", "--force", "private-auth", fixture.authPath, "auth.json"],
+      ["modal", "volume", "ls", "--json", "private-auth", "auth.json"],
+      ["modal", "volume", "put", "private-auth", fixture.authPath, "auth.json"],
     ]);
     expect(executions).toContainEqual({ argv: ["chmod", "700", "/codex-home"] });
     expect(executions).toContainEqual({ argv: ["chmod", "600", "/codex-home/auth.json"] });
     expect(executions).toContainEqual({
+      argv: ["node", "-e", "if (process.env.OPENAI_API_KEY || process.env.CODEX_API_KEY) process.exit(1)"],
+      params: { env: { CODEX_HOME: "/codex-home", OPENAI_API_KEY: "", CODEX_API_KEY: "" } },
+    });
+    expect(executions).toContainEqual({
       argv: ["codex", "login", "status"],
-      params: { env: { CODEX_HOME: "/codex-home" } },
+      params: { env: { CODEX_HOME: "/codex-home", OPENAI_API_KEY: "", CODEX_API_KEY: "" } },
     });
     expect(sandbox.copyFromLocal).not.toHaveBeenCalled();
     expect(sandbox.terminate).toHaveBeenCalledWith({ wait: true });
     expect(JSON.stringify({ runnerCommands, executions })).not.toContain("secret");
+  });
+
+  it("preserves the refreshed account credential already stored in Modal", async () => {
+    const fixture = await authFixture();
+    const runnerCommands: string[][] = [];
+    const process = { stdout: { readText: async () => "" }, stderr: { readText: async () => "" }, wait: async () => 0 };
+    const sandbox = {
+      exec: vi.fn(async () => process),
+      terminate: vi.fn(async () => undefined),
+    };
+    const modal = {
+      create: vi.fn(async () => sandbox),
+      close: vi.fn(async () => undefined),
+    } as unknown as ModalAdapter;
+    const runner = vi.fn(async (command: string, args: readonly string[]) => {
+      runnerCommands.push([command, ...args]);
+      if (args[1] === "ls") {
+        return {
+          stdout: JSON.stringify([{ filename: "auth.json", type: "file", size: "4.0 KiB" }]),
+          stderr: "",
+          exitCode: 0,
+        };
+      }
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+
+    await seedModalCodexAuth({ authPath: fixture.authPath, volumeName: "private-auth", runner, modal });
+
+    expect(runnerCommands).toEqual([
+      ["modal", "volume", "create", "private-auth"],
+      ["modal", "volume", "ls", "--json", "private-auth", "auth.json"],
+    ]);
+    expect(runnerCommands.some((argv) => argv.includes("put"))).toBe(false);
+    expect(sandbox.terminate).toHaveBeenCalledWith({ wait: true });
   });
 
   it("serializes workers with a durable owner-checked lease", async () => {
