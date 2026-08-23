@@ -126,6 +126,9 @@ describe("Cloud Tasks Modal monitoring", () => {
     const sandbox = {
       poll: vi.fn(async () => null),
       detach: vi.fn(async () => undefined),
+      copyToLocal: vi.fn(async () => {
+        throw Object.assign(new Error("No such file or directory"), { code: "ENOENT" });
+      }),
     } as unknown as ModalSandbox;
     const modal = {
       fromId: vi.fn(async () => sandbox),

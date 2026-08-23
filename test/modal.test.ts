@@ -310,6 +310,72 @@ describe("ModalMonitor", () => {
     expect(callbacks).toHaveLength(1);
   });
 
+  it("collects a completed result while the sandbox hold process is still running", async () => {
+    const calls: string[] = [];
+    const callbacks: ModalTerminalEvent[] = [];
+    const raw = sandbox(null, calls);
+    const { ModalSandbox } = await import("../src/cloud/modal/index.js");
+    const monitor = new ModalMonitor({
+      modal: { fromId: async () => new ModalSandbox(raw) },
+      now: () => STARTED_AT_MS + 20_000,
+      schedule: async () => {
+        throw new Error("completed results must not be rescheduled");
+      },
+      onTerminal: async (event) => {
+        callbacks.push(event);
+      },
+      readResult: async () => result(),
+    });
+
+    await expect(monitor.run({
+      taskId: "task-1",
+      sandboxId: "sb-1",
+      handoffSha256: HASH,
+      startedAt: STARTED_AT,
+    })).resolves.toMatchObject({
+      kind: "terminal",
+      callbackInvoked: true,
+      event: { status: "succeeded", reason: "result", exitCode: 0 },
+    });
+
+    expect(callbacks).toHaveLength(1);
+    expect(calls).toContain("terminate");
+    expect(calls).not.toContain("detach");
+  });
+
+  it("keeps a readable result alive when durable terminal delivery fails", async () => {
+    const calls: string[] = [];
+    const raw = sandbox(null, calls);
+    const { ModalSandbox } = await import("../src/cloud/modal/index.js");
+    let attempts = 0;
+    const monitor = new ModalMonitor({
+      modal: { fromId: async () => new ModalSandbox(raw) },
+      now: () => STARTED_AT_MS + 20_000,
+      schedule: async () => undefined,
+      onTerminal: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error("durable store unavailable");
+      },
+      readResult: async () => result(),
+    });
+    const request = {
+      taskId: "task-1",
+      sandboxId: "sb-1",
+      handoffSha256: HASH,
+      startedAt: STARTED_AT,
+    } as const;
+
+    await expect(monitor.run(request)).rejects.toThrow("durable store unavailable");
+    expect(calls).not.toContain("terminate");
+
+    await expect(monitor.run(request)).resolves.toMatchObject({
+      kind: "terminal",
+      event: { status: "succeeded", reason: "result" },
+    });
+    expect(attempts).toBe(2);
+    expect(calls).toContain("terminate");
+  });
+
   it("fails closed on invalid results and enforces the 25 minute deadline", async () => {
     const events: ModalTerminalEvent[] = [];
     const { ModalSandbox } = await import("../src/cloud/modal/index.js");

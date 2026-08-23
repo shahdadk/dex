@@ -323,6 +323,9 @@ describe("durable outbox and monitor execution", () => {
       poll: vi.fn(async () => null),
       detach: vi.fn(async () => undefined),
       terminate: vi.fn(async () => undefined),
+      copyToLocal: vi.fn(async () => {
+        throw Object.assign(new Error("No such file or directory"), { code: "ENOENT" });
+      }),
     } as unknown as ModalSandbox;
     const modal = { fromId: vi.fn(async () => sandbox) } as unknown as Pick<ModalAdapter, "fromId">;
     const terminal = vi.fn(async () => undefined);

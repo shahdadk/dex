@@ -130,7 +130,14 @@ export class ModalTaskMover implements TaskMover {
         workdir: "/workspace",
         env: { CODEX_HOME: "/codex-home" },
         name: MODAL_CODEX_WORKER_SANDBOX_NAME,
-        command: ["/bin/sh", "-c", "while [ ! -f /dex/ready ]; do sleep 0.2; done; exec node /dex/cloud-worker.js"],
+        // Keep the Sandbox alive after the worker writes result.json so the
+        // detached cloud monitor can retrieve the artifact before terminating
+        // it. A bounded hold prevents an orphan from running indefinitely.
+        command: [
+          "/bin/sh",
+          "-c",
+          "while [ ! -f /dex/ready ]; do sleep 0.2; done; node /dex/cloud-worker.js; status=$?; if [ -f /dex/result.json ]; then sleep 300; fi; exit $status",
+        ],
         tags: { product: "dex", task: task.id },
       },
     });

@@ -126,6 +126,33 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function resultNotReady(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "ENOENT" || /not found|no such file|does not exist/i.test(errorMessage(error));
+}
+
+async function readValidatedResult(
+  dependencies: ModalMonitorDependencies,
+  sandbox: ModalSandbox,
+  request: ParsedModalMonitorRequest,
+): Promise<ModalResultArtifact> {
+  const raw = await (dependencies.readResult ?? readResultFromSandbox)(
+    sandbox,
+    request.resultPath,
+  );
+  const artifact = ModalResultArtifactSchema.parse(raw);
+  if (artifact.taskId !== request.taskId) {
+    throw new Error("Result taskId does not match monitor taskId");
+  }
+  if (artifact.handoffSha256 !== request.handoffSha256) {
+    throw new Error("Result handoffSha256 does not match the verified handoff");
+  }
+  if (artifact.status === "succeeded" && !artifact.validation.passed) {
+    throw new Error("A succeeded result must report passing validation");
+  }
+  return artifact;
+}
+
 export class ModalMonitor {
   readonly #dependencies: ModalMonitorDependencies;
   readonly #once: ModalMonitorOnce;
@@ -148,6 +175,43 @@ export class ModalMonitor {
       exitCode = await sandbox.poll();
     } catch (error) {
       observationError = error;
+    }
+
+    // The worker intentionally keeps a detached Sandbox alive for a bounded
+    // period after atomically writing result.json. Consume that result while
+    // the filesystem is still reachable, then terminate the hold process.
+    if (exitCode === null && sandbox && now < deadline) {
+      let artifact: ModalResultArtifact | undefined;
+      try {
+        artifact = await readValidatedResult(this.#dependencies, sandbox, request);
+      } catch (error) {
+        if (!resultNotReady(error)) {
+          const outcome = await this.#deliverTerminal({
+            taskId: request.taskId,
+            sandboxId: request.sandboxId,
+            completionKey: terminalKey(request.taskId),
+            status: "failed",
+            reason: "invalid_result",
+            exitCode: null,
+            error: errorMessage(error),
+          });
+          await sandbox.terminate().catch(() => undefined);
+          return outcome;
+        }
+      }
+      if (artifact) {
+        const outcome = await this.#deliverTerminal({
+          taskId: request.taskId,
+          sandboxId: request.sandboxId,
+          completionKey: terminalKey(request.taskId),
+          status: artifact.status,
+          reason: "result",
+          exitCode: artifact.status === "succeeded" ? 0 : 1,
+          result: artifact,
+        });
+        await sandbox.terminate().catch(() => undefined);
+        return outcome;
+      }
     }
 
     if (exitCode === null && now < deadline) {
@@ -200,19 +264,7 @@ export class ModalMonitor {
     let artifactError: unknown;
     try {
       if (!sandbox) throw observationError ?? new Error("Sandbox unavailable");
-      const raw = await (
-        this.#dependencies.readResult ?? readResultFromSandbox
-      )(sandbox, request.resultPath);
-      artifact = ModalResultArtifactSchema.parse(raw);
-      if (artifact.taskId !== request.taskId) {
-        throw new Error("Result taskId does not match monitor taskId");
-      }
-      if (artifact.handoffSha256 !== request.handoffSha256) {
-        throw new Error("Result handoffSha256 does not match the verified handoff");
-      }
-      if (artifact.status === "succeeded" && !artifact.validation.passed) {
-        throw new Error("A succeeded result must report passing validation");
-      }
+      artifact = await readValidatedResult(this.#dependencies, sandbox, request);
     } catch (error) {
       artifactError = error;
       artifact = undefined;
