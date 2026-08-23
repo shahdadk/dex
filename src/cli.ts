@@ -64,8 +64,8 @@ program
     if (checks.some((check) => check.status === "fail")) {
       throw new Error("Required setup checks failed; fix them and run dex setup again.");
     }
-    if (!process.env.MODAL_TOKEN_ID || !process.env.MODAL_TOKEN_SECRET) {
-      throw new Error("Modal credentials are required for Dex cloud continuity");
+    if (checks.find((check) => check.name === "Modal")?.status !== "pass") {
+      throw new Error("An authenticated Modal environment or CLI profile is required for Dex cloud continuity");
     }
     if (!process.env.DEX_HANDOFF_SIGNING_KEY) {
       throw new Error("DEX_HANDOFF_SIGNING_KEY is required and must also exist in the configured Modal secret");

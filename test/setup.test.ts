@@ -155,11 +155,18 @@ describe("setup command", () => {
     const writeFile = vi.fn(async () => undefined);
     const loadConfig = vi.fn(async () => config());
     const parseConfig = vi.fn((value: unknown) => value);
-    const runDoctor = vi.fn(async () => [{
-      name: "Node",
-      status: "pass",
-      detail: "Node 22",
-    }]);
+    const runDoctor = vi.fn(async () => [
+      {
+        name: "Node",
+        status: "pass",
+        detail: "Node 22",
+      },
+      {
+        name: "Modal",
+        status: "pass",
+        detail: "authenticated CLI profile available",
+      },
+    ]);
     const installRuntime = vi.fn(async () => "/tmp/runtime");
     const installLaunchAgent = vi.fn(async () => "/tmp/agent.plist");
     const pairMac = vi.fn(async () => ({
@@ -230,8 +237,6 @@ describe("setup command", () => {
       persistRuntimeSecrets,
     }));
 
-    vi.stubEnv("MODAL_TOKEN_ID", "modal-token-id");
-    vi.stubEnv("MODAL_TOKEN_SECRET", "modal-token-secret");
     vi.stubEnv("DEX_HANDOFF_SIGNING_KEY", "handoff-signing-key");
     vi.stubEnv("GEMINI_API_KEY", "gemini-key");
     process.argv = [

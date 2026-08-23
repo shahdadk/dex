@@ -68,15 +68,36 @@ export async function runDoctor(config: DexConfig): Promise<DoctorCheck[]> {
 
   checks.push(await claudeMemCheck());
   checks.push(await dexCloudCheck(config));
-  checks.push({
-    name: "Modal",
-    status: process.env.MODAL_TOKEN_ID && process.env.MODAL_TOKEN_SECRET ? "pass" : "warn",
-    detail: process.env.MODAL_TOKEN_ID && process.env.MODAL_TOKEN_SECRET ? "credentials available" : "credentials not visible locally",
-    ...(process.env.MODAL_TOKEN_ID && process.env.MODAL_TOKEN_SECRET
-      ? {}
-      : { fix: "Configure Modal credentials through Dex Cloud or local environment." }),
-  });
+  checks.push(await modalCheck());
   return checks;
+}
+
+async function modalCheck(): Promise<DoctorCheck> {
+  const tokenId = Boolean(process.env.MODAL_TOKEN_ID);
+  const tokenSecret = Boolean(process.env.MODAL_TOKEN_SECRET);
+  if (tokenId !== tokenSecret) {
+    return {
+      name: "Modal",
+      status: "fail",
+      detail: "only one Modal environment credential is configured",
+      fix: "Set both MODAL_TOKEN_ID and MODAL_TOKEN_SECRET, or unset both and use an authenticated Modal profile.",
+    };
+  }
+  if (tokenId && tokenSecret) {
+    return { name: "Modal", status: "pass", detail: "environment credentials available" };
+  }
+  if (await commandExists("modal")) {
+    const token = await execFile("modal", ["token", "info"]);
+    if (token.exitCode === 0) {
+      return { name: "Modal", status: "pass", detail: "authenticated CLI profile available" };
+    }
+  }
+  return {
+    name: "Modal",
+    status: "warn",
+    detail: "no authenticated environment or CLI profile found",
+    fix: "Run `modal token new --verify`, or set MODAL_TOKEN_ID and MODAL_TOKEN_SECRET.",
+  };
 }
 
 async function commandVersion(command: string): Promise<string> {
