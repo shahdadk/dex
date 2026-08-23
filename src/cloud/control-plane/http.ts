@@ -166,8 +166,9 @@ export function createDexControlPlaneFetchHandler(
           }
           throw error;
         }
-        // Device sync is the normal source of modal.monitor.registered events.
-        if (dispatchMonitors) await options.onMonitorRegistered?.();
+        // Every accepted device sync can enqueue Sendblue messages. Drain the
+        // transactional outbox even when no Modal monitor was registered.
+        await options.onMonitorRegistered?.();
         return jsonResponse(200, result, {
           "x-appfi-next-sequence": String(result.nextSequence ?? ""),
         });

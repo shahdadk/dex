@@ -632,7 +632,8 @@ describe("durable device transport events", () => {
         conversationId: CONVERSATION,
       },
     }] }));
-    expect(onMonitorRegistered).not.toHaveBeenCalled();
+    expect(onMonitorRegistered).toHaveBeenCalledOnce();
+    onMonitorRegistered.mockClear();
 
     await expect(client.sync(createDexSyncPayload({ events: [{
       id: "invalid-monitor-event",
