@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -30,12 +30,15 @@ describe("Modal Codex account auth", () => {
 
   it("creates the named volume with argv and secures the mounted cache", async () => {
     const fixture = await authFixture();
-    const commands: string[][] = [];
-    const copied: string[][] = [];
+    const runnerCommands: string[][] = [];
+    const executions: Array<{ argv: string[]; params?: Record<string, unknown> }> = [];
     const process = { stdout: { readText: async () => "" }, stderr: { readText: async () => "" }, wait: async () => 0 };
     const sandbox = {
-      exec: vi.fn(async (argv: string[]) => { commands.push(argv); return process; }),
-      copyFromLocal: vi.fn(async (local: string, remote: string) => { copied.push([local, remote]); }),
+      exec: vi.fn(async (argv: string[], params?: Record<string, unknown>) => {
+        executions.push({ argv, ...(params ? { params } : {}) });
+        return process;
+      }),
+      copyFromLocal: vi.fn(async () => undefined),
       terminate: vi.fn(async () => undefined),
     };
     const modal = {
@@ -43,26 +46,38 @@ describe("Modal Codex account auth", () => {
       close: vi.fn(async () => undefined),
     } as unknown as ModalAdapter;
     const runner = vi.fn(async (command: string, args: readonly string[]) => {
-      commands.push([command, ...args]);
+      runnerCommands.push([command, ...args]);
       return { stdout: "", stderr: "", exitCode: 0 };
     });
 
     await expect(seedModalCodexAuth({ authPath: fixture.authPath, volumeName: "private-auth", runner, modal })).resolves.toEqual({ volumeName: "private-auth" });
-    expect(commands).toContainEqual(["modal", "volume", "create", "private-auth"]);
-    expect(commands).toContainEqual(["chmod", "700", "/codex-home"]);
-    expect(commands).toContainEqual(["chmod", "600", "/codex-home/auth.json"]);
-    expect(commands).toContainEqual(["codex", "login", "status"]);
-    expect(copied).toEqual([[fixture.authPath, "/codex-home/auth.json"]]);
-    expect(JSON.stringify({ commands, copied: copied.map(([, remote]) => remote) })).not.toContain("secret");
+    expect(runnerCommands).toEqual([
+      ["modal", "volume", "create", "private-auth"],
+      ["modal", "volume", "put", "--force", "private-auth", fixture.authPath, "auth.json"],
+    ]);
+    expect(executions).toContainEqual({ argv: ["chmod", "700", "/codex-home"] });
+    expect(executions).toContainEqual({ argv: ["chmod", "600", "/codex-home/auth.json"] });
+    expect(executions).toContainEqual({
+      argv: ["codex", "login", "status"],
+      params: { env: { CODEX_HOME: "/codex-home" } },
+    });
+    expect(sandbox.copyFromLocal).not.toHaveBeenCalled();
+    expect(sandbox.terminate).toHaveBeenCalledWith({ wait: true });
+    expect(JSON.stringify({ runnerCommands, executions })).not.toContain("secret");
   });
 
   it("serializes workers with a durable owner-checked lease", async () => {
     const fixture = await authFixture();
     const leasePath = path.join(fixture.directory, "account.lease");
     await acquireCodexAuthLease(leasePath, "task-one");
+    expect((await stat(leasePath)).mode & 0o777).toBe(0o600);
     await expect(acquireCodexAuthLease(leasePath, "task-two")).rejects.toThrow("holds the shared account-auth lease");
     await expect(releaseCodexAuthLease(leasePath, "task-two")).rejects.toThrow("owned by another task");
-    await releaseCodexAuthLease(leasePath, "task-one");
+    await Promise.all([
+      releaseCodexAuthLease(leasePath, "task-one"),
+      releaseCodexAuthLease(leasePath, "task-one"),
+    ]);
+    await expect(releaseCodexAuthLease(leasePath, "task-one")).resolves.toBeUndefined();
     expect(JSON.parse(await readFile(path.join(fixture.directory, "auth.json"), "utf8"))).toMatchObject({ auth_mode: "chatgpt" });
   });
 });

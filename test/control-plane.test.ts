@@ -107,8 +107,14 @@ async function issuePairingCode(
   return setupCode;
 }
 
-function localFetch(service: DexControlPlaneService): DexFetch {
-  const handler = createDexControlPlaneFetchHandler({ service });
+function localFetch(
+  service: DexControlPlaneService,
+  onMonitorRegistered?: () => Promise<void>,
+): DexFetch {
+  const handler = createDexControlPlaneFetchHandler({
+    service,
+    ...(onMonitorRegistered === undefined ? {} : { onMonitorRegistered }),
+  });
   return async (input, init) => handler(new Request(input, init));
 }
 
@@ -603,6 +609,7 @@ describe("durable device transport events", () => {
   it("registers one monitor job before acknowledgement and dispatches it once", async () => {
     const state = fixture();
     const paired = await pairDevice(state);
+    const onMonitorRegistered = vi.fn(async () => undefined);
     const client = new DexCloudMessagingClient({
       baseUrl: "https://cloud.dex.test",
       deviceId: paired.deviceId,
@@ -610,7 +617,7 @@ describe("durable device transport events", () => {
       keyPair: paired.deviceKey,
       pinnedServerKeys: [],
       initialSequence: paired.nextSequence - 1,
-      fetch: localFetch(state.service),
+      fetch: localFetch(state.service, onMonitorRegistered),
       now: () => state.now.value,
       nonce: (sequence) => `monitor-event-${sequence}`,
     });
@@ -625,6 +632,7 @@ describe("durable device transport events", () => {
         conversationId: CONVERSATION,
       },
     }] }));
+    expect(onMonitorRegistered).not.toHaveBeenCalled();
 
     await expect(client.sync(createDexSyncPayload({ events: [{
       id: "invalid-monitor-event",
@@ -650,7 +658,15 @@ describe("durable device transport events", () => {
         resultPath: "/dex/result.json",
       },
     } as const;
+    onMonitorRegistered.mockClear();
+    onMonitorRegistered.mockRejectedValueOnce(new Error("Cloud Tasks unavailable"));
+    await expect(client.sync(createDexSyncPayload({ events: [monitorEvent] })))
+      .rejects.toMatchObject({ status: 500, code: "internal_error", retryable: true });
+    expect(await state.repository.listPendingMonitorJobs(100)).toHaveLength(1);
+
+    onMonitorRegistered.mockClear();
     const registered = await client.sync(createDexSyncPayload({ events: [monitorEvent] }));
+    expect(onMonitorRegistered).toHaveBeenCalledOnce();
     expect(registered.acceptedEventIds).toEqual(["monitor-registered-1"]);
     expect(await state.repository.getTask("local-modal-task")).toMatchObject({
       status: "running",
@@ -843,6 +859,43 @@ describe("bounded HTTP surface", () => {
       expect(await response.json()).toEqual({ status: "unavailable" });
     }
     expect((await handler(new Request("https://cloud.dex.test/livez"))).status).toBe(200);
+
+    const wrongMethod = await handler(new Request("https://cloud.dex.test/readyz", {
+      method: "POST",
+    }));
+    expect(wrongMethod.status).toBe(405);
+    expect(wrongMethod.headers.get("allow")).toBe("GET");
+    expect(await wrongMethod.json()).toEqual({ code: "method_not_allowed" });
+  });
+
+  it("runs only the monitor body returned by Cloud Tasks verification", async () => {
+    const state = fixture();
+    const verified = { request: { taskId: "verified-task" } };
+    const verify = vi.fn(async (_headers: Headers, body: unknown) => {
+      expect(body).toEqual({ untrusted: true });
+      return verified;
+    });
+    const run = vi.fn(async (body: unknown) => ({ accepted: body === verified }));
+    const handler = createDexControlPlaneFetchHandler({
+      service: state.service,
+      monitorTask: { verify, run },
+    });
+
+    const response = await handler(new Request(
+      "https://cloud.dex.test/internal/modal/monitor",
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer signed-cloud-task-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ untrusted: true }),
+      },
+    ));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ accepted: true });
+    expect(verify).toHaveBeenCalledOnce();
+    expect(run).toHaveBeenCalledWith(verified);
   });
 
   it("returns safe errors without echoing configured secrets", async () => {

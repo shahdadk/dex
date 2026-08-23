@@ -82,6 +82,16 @@ function parseJson(body: string): unknown {
   }
 }
 
+function requestsMonitorDispatch(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || !("events" in value)) return false;
+  const events = (value as { events?: unknown }).events;
+  return Array.isArray(events) && events.some((event) =>
+    typeof event === "object" &&
+    event !== null &&
+    "type" in event &&
+    event.type === "modal.monitor.registered");
+}
+
 function validBodyLimit(value: number): number {
   if (!Number.isSafeInteger(value) || value < 1_024 || value > 1024 * 1024) {
     throw new RangeError("Control-plane body limit must be between 1 KiB and 1 MiB");
@@ -99,13 +109,13 @@ export function createDexControlPlaneFetchHandler(
   return async (request: Request): Promise<Response> => {
     try {
       const url = new URL(request.url);
-      if (request.method === "GET" && url.pathname === "/livez") {
-        return jsonResponse(200, { status: "ok" });
-      }
-      if (
-        request.method === "GET" &&
-        (url.pathname === "/readyz" || url.pathname === "/healthz")
-      ) {
+      const isLiveness = url.pathname === "/livez";
+      const isReadiness = url.pathname === "/readyz" || url.pathname === "/healthz";
+      if (isLiveness || isReadiness) {
+        if (request.method !== "GET") {
+          return jsonResponse(405, { code: "method_not_allowed" }, { allow: "GET" });
+        }
+        if (isLiveness) return jsonResponse(200, { status: "ok" });
         try {
           await readiness();
           return jsonResponse(200, { status: "ok" });
@@ -121,6 +131,7 @@ export function createDexControlPlaneFetchHandler(
         service.verifySendblueRequest(request.headers);
         const body = await boundedBody(request, limit);
         const result = await service.processSendblueWebhook(parseJson(body), request.headers);
+        await options.onMonitorRegistered?.();
         return jsonResponse(200, result);
       }
       if (url.pathname === "/v1/device/pair") {
@@ -134,11 +145,29 @@ export function createDexControlPlaneFetchHandler(
       }
       if (url.pathname === "/v1/device/sync") {
         const body = await boundedBody(request, limit);
-        const result = await service.syncDevice({
-          body,
-          headers: request.headers,
-          json: parseJson(body),
-        });
+        const json = parseJson(body);
+        const dispatchMonitors = requestsMonitorDispatch(json);
+        let result: Awaited<ReturnType<DexControlPlaneService["syncDevice"]>>;
+        try {
+          result = await service.syncDevice({
+            body,
+            headers: request.headers,
+            json,
+          });
+        } catch (error) {
+          // A prior sync may have committed before its Cloud Tasks API call
+          // failed. Its signed retry is stale, but must still drain that outbox.
+          if (
+            dispatchMonitors &&
+            error instanceof ControlPlaneError &&
+            error.code === "stale_sequence"
+          ) {
+            await options.onMonitorRegistered?.();
+          }
+          throw error;
+        }
+        // Device sync is the normal source of modal.monitor.registered events.
+        if (dispatchMonitors) await options.onMonitorRegistered?.();
         return jsonResponse(200, result, {
           "x-appfi-next-sequence": String(result.nextSequence ?? ""),
         });
@@ -153,12 +182,16 @@ export function createDexControlPlaneFetchHandler(
       if (url.pathname === "/v1/modal/results") {
         service.verifyInternalRequest(request.headers);
         const body = await boundedBody(request, limit);
-        return jsonResponse(200, await service.handleModalTerminal(parseJson(body)));
+        const result = await service.handleModalTerminal(parseJson(body));
+        await options.onMonitorRegistered?.();
+        return jsonResponse(200, result);
       }
       if (url.pathname === "/internal/modal/monitor" && options.monitorTask) {
         const body = parseJson(await boundedBody(request, limit));
         const verified = await options.monitorTask.verify(request.headers, body);
-        return jsonResponse(200, await options.monitorTask.run(verified));
+        const result = await options.monitorTask.run(verified);
+        await options.onMonitorRegistered?.();
+        return jsonResponse(200, result);
       }
       return jsonResponse(404, { code: "not_found" });
     } catch (error) {
@@ -214,8 +247,10 @@ export function createDexControlPlaneHttpHandler(
   return (request, response): void => {
     void (async () => {
       try {
-        const body = await readNodeBody(request, limit);
         const method = request.method ?? "GET";
+        const body = method === "GET" || method === "HEAD"
+          ? (request.resume(), Buffer.alloc(0))
+          : await readNodeBody(request, limit);
         const webRequest = new Request(`http://control-plane.local${request.url ?? "/"}`, {
           method,
           headers: webHeaders(request.headers),

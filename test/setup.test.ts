@@ -23,6 +23,7 @@ const mockedModules = [
   "../src/setup/onboarding.js",
   "../src/local/daemon/control-socket.js",
   "../src/local/pairing/secrets.js",
+  "../src/setup/modal-auth.js",
 ] as const;
 
 afterEach(() => {
@@ -176,6 +177,7 @@ describe("setup command", () => {
       pairedConversationId: "conversation-1",
     }));
     const persistRuntimeSecrets = vi.fn(async () => undefined);
+    const seedModalCodexAuth = vi.fn(async () => ({ volumeName: "dex-codex-auth" }));
     const modalConstructor = vi.fn();
     const machineConstructor = vi.fn();
     const updateState = vi.fn(async (mutator: (state: { projects: Record<string, unknown>; revision: number }) => void) => {
@@ -238,7 +240,7 @@ describe("setup command", () => {
     }));
     vi.doMock("../src/setup/modal-auth.js", () => ({
       DEFAULT_MODAL_CODEX_AUTH_VOLUME: "dex-codex-auth",
-      seedModalCodexAuth: vi.fn(async () => ({ volumeName: "dex-codex-auth" })),
+      seedModalCodexAuth,
     }));
 
     vi.stubEnv("DEX_HANDOFF_SIGNING_KEY", "handoff-signing-key");
@@ -268,6 +270,7 @@ describe("setup command", () => {
       deviceName: "Test Mac",
     }));
     expect(runDoctor).toHaveBeenCalledOnce();
+    expect(seedModalCodexAuth).toHaveBeenCalledOnce();
     expect(persistRuntimeSecrets).toHaveBeenCalledOnce();
     expect(modalConstructor).not.toHaveBeenCalled();
     expect(machineConstructor).not.toHaveBeenCalled();

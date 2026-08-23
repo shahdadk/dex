@@ -291,15 +291,14 @@ function nonSecretEnvironment(): NodeJS.ProcessEnv {
   ));
 }
 
-/**
- * The coding worker receives only its model credential. Handoff signing and
- * Modal control credentials remain outside the worker trust boundary.
- */
+/** The Codex subprocess receives CODEX_HOME, but no environment credentials. */
 function codexEnvironment(): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {
     ...nonSecretEnvironment(),
     NO_COLOR: "1",
   };
+  delete environment.CODEX_API_KEY;
+  delete environment.OPENAI_API_KEY;
   return environment;
 }
 
@@ -309,6 +308,8 @@ async function verifyCodexAuthentication(): Promise<void> {
     throw new Error("Codex requires a persistent CODEX_HOME account login");
   }
   const authPath = path.join(codexHome, "auth.json");
+  const homeMetadata = await stat(codexHome);
+  if (!homeMetadata.isDirectory()) throw new Error("The configured CODEX_HOME is not a directory");
   if (!(await exists(authPath))) {
     throw new Error("Codex account authentication is missing from the configured CODEX_HOME");
   }
@@ -316,6 +317,10 @@ async function verifyCodexAuthentication(): Promise<void> {
   if (!metadata.isFile()) throw new Error("Codex account authentication cache is not a regular file");
   await chmod(codexHome, 0o700);
   await chmod(authPath, 0o600);
+  const [securedHome, securedAuth] = await Promise.all([stat(codexHome), stat(authPath)]);
+  if ((securedHome.mode & 0o777) !== 0o700 || (securedAuth.mode & 0o777) !== 0o600) {
+    throw new Error("Codex account authentication permissions could not be secured");
+  }
 }
 
 function redactText(value: string): string {

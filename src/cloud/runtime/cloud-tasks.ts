@@ -24,9 +24,24 @@ export interface CloudTasksMonitorConfig {
   serviceAccountEmail: string;
 }
 
+const BoundedIdentifierSchema = z.string()
+  .min(1)
+  .max(512)
+  .refine((value) => value === value.trim() && !/[\u0000-\u001f\u007f]/.test(value));
+
+const StrictModalMonitorRequestSchema = ModalMonitorRequestSchema.extend({
+  taskId: BoundedIdentifierSchema,
+  sandboxId: BoundedIdentifierSchema,
+  attempt: z.number().int().min(0).max(10_000).default(0),
+  resultPath: z.string().startsWith("/").max(1_024).default("/dex/result.json"),
+}).strict();
+
 const CloudTasksMonitorBodySchema = z.object({
-  idempotencyKey: z.string().trim().min(1).max(512),
-  request: ModalMonitorRequestSchema,
+  idempotencyKey: z.string()
+    .min(1)
+    .max(1_024)
+    .refine((value) => value === value.trim() && !/[\u0000-\u001f\u007f]/.test(value)),
+  request: StrictModalMonitorRequestSchema,
 }).strict();
 
 export type CloudTasksMonitorBody = z.output<typeof CloudTasksMonitorBodySchema>;
@@ -41,24 +56,44 @@ export function cloudTaskId(idempotencyKey: string): string {
   return `modal-${createHash("sha256").update(idempotencyKey).digest("hex")}`;
 }
 
+export function modalMonitorIdempotencyKey(
+  request: Pick<ParsedModalMonitorRequest, "taskId" | "attempt">,
+): string {
+  return request.attempt === 0
+    ? `modal-monitor:${request.taskId}:initial`
+    : `modal-monitor:${request.taskId}:attempt:${request.attempt}`;
+}
+
 export class CloudTasksMonitorDispatcher {
   readonly #config: CloudTasksMonitorConfig;
   readonly #client: CloudTasksClientLike;
+  readonly #now: () => number;
 
-  constructor(config: CloudTasksMonitorConfig, client: CloudTasksClientLike = new CloudTasksClient()) {
+  constructor(
+    config: CloudTasksMonitorConfig,
+    client: CloudTasksClientLike = new CloudTasksClient(),
+    now: () => number = Date.now,
+  ) {
     this.#config = config;
     this.#client = client;
+    this.#now = now;
   }
 
   dispatch(job: MonitorJobRecord): Promise<void> {
     return this.schedule({
       idempotencyKey: job.idempotencyKey,
       request: ModalMonitorRequestSchema.parse(job.request),
-      delayMs: Math.max(0, Date.parse(job.availableAt) - Date.now()),
+      delayMs: Math.max(0, Date.parse(job.availableAt) - this.#now()),
     });
   }
 
   async schedule(schedule: ModalMonitorSchedule): Promise<void> {
+    if (!Number.isSafeInteger(schedule.delayMs) || schedule.delayMs < 0) {
+      throw new RangeError("Cloud Tasks monitor delay must be a non-negative integer");
+    }
+    if (schedule.idempotencyKey !== modalMonitorIdempotencyKey(schedule.request)) {
+      throw new TypeError("Cloud Tasks monitor idempotency key does not match its request");
+    }
     const parent = this.#client.queuePath(
       this.#config.project,
       this.#config.location,
@@ -90,7 +125,7 @@ export class CloudTasksMonitorDispatcher {
             },
           },
           ...(schedule.delayMs === 0 ? {} : {
-            scheduleTime: { seconds: Math.floor((Date.now() + schedule.delayMs) / 1_000) },
+            scheduleTime: timestamp(this.#now() + schedule.delayMs),
           }),
         },
       });
@@ -99,6 +134,16 @@ export class CloudTasksMonitorDispatcher {
       if (code !== 6 && code !== "ALREADY_EXISTS") throw error;
     }
   }
+}
+
+function timestamp(milliseconds: number): { seconds: number; nanos: number } {
+  if (!Number.isSafeInteger(milliseconds) || milliseconds < 0) {
+    throw new RangeError("Cloud Tasks monitor schedule time is invalid");
+  }
+  return {
+    seconds: Math.floor(milliseconds / 1_000),
+    nanos: (milliseconds % 1_000) * 1_000_000,
+  };
 }
 
 export interface CloudTasksTokenVerifier {
@@ -120,16 +165,6 @@ export class CloudTasksRequestAuthenticator {
     const authorization = headers.get("authorization");
     const match = authorization?.match(/^Bearer ([^\s]+)$/);
     if (!match) throw new ControlPlaneError(401, "invalid_cloud_task", "Cloud Tasks OIDC bearer token is required");
-    const result = CloudTasksMonitorBodySchema.safeParse(body);
-    if (!result.success) throw new ControlPlaneError(400, "invalid_cloud_task", "Invalid Cloud Tasks monitor body");
-    const parsed = result.data;
-    const expectedTask = cloudTaskId(parsed.idempotencyKey);
-    if (
-      headers.get("x-cloudtasks-queuename") !== this.#config.queue ||
-      headers.get("x-cloudtasks-taskname") !== expectedTask
-    ) {
-      throw new ControlPlaneError(401, "invalid_cloud_task", "Cloud Tasks request headers do not match the configured queue and task");
-    }
     try {
       const ticket = await this.#verifier.verifyIdToken({
         idToken: match[1]!,
@@ -142,6 +177,24 @@ export class CloudTasksRequestAuthenticator {
     } catch {
       throw new ControlPlaneError(401, "invalid_cloud_task", "Cloud Tasks OIDC token is invalid");
     }
+
+    const mediaType = headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+    if (mediaType !== "application/json") {
+      throw new ControlPlaneError(415, "invalid_cloud_task", "Cloud Tasks monitor body must be JSON");
+    }
+    const result = CloudTasksMonitorBodySchema.safeParse(body);
+    if (!result.success) throw new ControlPlaneError(400, "invalid_cloud_task", "Invalid Cloud Tasks monitor body");
+    const parsed = result.data;
+    if (parsed.idempotencyKey !== modalMonitorIdempotencyKey(parsed.request)) {
+      throw new ControlPlaneError(400, "invalid_cloud_task", "Cloud Tasks monitor identity does not match its request");
+    }
+    const expectedTask = cloudTaskId(parsed.idempotencyKey);
+    if (
+      headers.get("x-cloudtasks-queuename") !== this.#config.queue ||
+      headers.get("x-cloudtasks-taskname") !== expectedTask
+    ) {
+      throw new ControlPlaneError(401, "invalid_cloud_task", "Cloud Tasks request headers do not match the configured queue and task");
+    }
     return parsed;
   }
 }
@@ -152,7 +205,7 @@ export class CloudTasksModalMonitor {
   constructor(options: {
     modal: Pick<ModalAdapter, "fromId">;
     once: ModalMonitorOnce;
-    dispatcher: CloudTasksMonitorDispatcher;
+    dispatcher: Pick<CloudTasksMonitorDispatcher, "schedule">;
     onTerminal(input: unknown): Promise<void>;
     now?: () => number;
   }) {

@@ -6,8 +6,10 @@ import { generateDexDeviceKeyPair } from "../src/cloud/messaging/index.js";
 import type { ModalAdapter, ModalSandbox } from "../src/cloud/modal/index.js";
 import {
   AtomicFileStateBackend,
+  CloudSqlPostgresStateBackend,
   DurableDexCloudRepository,
   DurableModalMonitorOnce,
+  PostgresStateBackend,
 } from "../src/cloud/persistence/index.js";
 import {
   ConfiguredAssociationVerifier,
@@ -55,6 +57,7 @@ function config(filePath: string): DexCloudConfig {
 }
 
 afterEach(async () => {
+  vi.useRealTimers();
   await Promise.all(directories.splice(0).map((directory) =>
     rm(directory, { recursive: true, force: true })));
   vi.restoreAllMocks();
@@ -91,6 +94,40 @@ describe("Dex Cloud environment and verified ownership", () => {
       publicKey: key.publicKey,
     });
     expect(loaded.signingKey.privateKey).not.toBe("");
+
+    const withCloudTasks = await loadDexCloudConfig({
+      ...base,
+      DEX_DATABASE_URL: "postgresql://dex:password@db.example.test/dex",
+      DEX_CLOUD_TASKS_PROJECT: "dex-project",
+      DEX_CLOUD_TASKS_LOCATION: "northamerica-northeast1",
+      DEX_CLOUD_TASKS_QUEUE: "modal-monitors",
+      DEX_CLOUD_TASKS_SERVICE_URL: "https://dex.example.test",
+      DEX_CLOUD_TASKS_AUDIENCE: "https://dex.example.test",
+      DEX_CLOUD_TASKS_SERVICE_ACCOUNT: "tasks@dex-project.iam.gserviceaccount.com",
+    });
+    expect(withCloudTasks.cloudTasks).toEqual({
+      project: "dex-project",
+      location: "northamerica-northeast1",
+      queue: "modal-monitors",
+      serviceUrl: "https://dex.example.test",
+      audience: "https://dex.example.test",
+      serviceAccountEmail: "tasks@dex-project.iam.gserviceaccount.com",
+    });
+    await expect(loadDexCloudConfig({
+      ...base,
+      DEX_DATABASE_URL: "postgresql://dex:password@db.example.test/dex",
+      DEX_CLOUD_TASKS_QUEUE: "modal-monitors",
+    })).rejects.toThrow("DEX_CLOUD_TASKS_PROJECT");
+    await expect(loadDexCloudConfig({
+      ...base,
+      DEX_DATABASE_URL: "postgresql://dex:password@db.example.test/dex",
+      DEX_CLOUD_TASKS_PROJECT: "dex-project",
+      DEX_CLOUD_TASKS_LOCATION: "northamerica-northeast1",
+      DEX_CLOUD_TASKS_QUEUE: "modal-monitors",
+      DEX_CLOUD_TASKS_SERVICE_URL: "http://dex.example.test",
+      DEX_CLOUD_TASKS_AUDIENCE: "https://dex.example.test",
+      DEX_CLOUD_TASKS_SERVICE_ACCOUNT: "tasks@dex-project.iam.gserviceaccount.com",
+    })).rejects.toThrow("must be an HTTPS URL");
 
     const cloudSql = await loadDexCloudConfig({
       ...base,
@@ -193,6 +230,36 @@ describe("Dex Cloud environment and verified ownership", () => {
 });
 
 describe("durable outbox and monitor execution", () => {
+  it("validates connection sources before opening Cloud SQL or PostgreSQL resources", () => {
+    expect(() => new PostgresStateBackend({})).toThrow(
+      "Exactly one PostgreSQL connection source is required",
+    );
+    expect(() => new PostgresStateBackend({
+      databaseUrl: "postgresql://dex:password@db.example.test/dex",
+      poolOptions: {
+        stream: () => { throw new Error("must not connect"); },
+        user: "dex",
+        database: "dex",
+      },
+    })).toThrow("Exactly one PostgreSQL connection source is required");
+    expect(() => new CloudSqlPostgresStateBackend({
+      instanceConnectionName: "dex-project:northamerica-northeast1:dex",
+      database: "dex",
+      user: "dex@dex-project.iam",
+      ipType: "PSC" as "PUBLIC",
+    })).toThrow("Cloud SQL IP type must be PUBLIC or PRIVATE");
+  });
+
+  it("closes the file backend once and rejects readiness checks after shutdown", async () => {
+    const backend = new AtomicFileStateBackend({ filePath: await stateFile() });
+    await backend.ready();
+    const first = backend.close();
+    const second = backend.close();
+    expect(second).toBe(first);
+    await first;
+    await expect(backend.ready()).rejects.toThrow("backend is closed");
+  });
+
   it("persists control-plane state and reconciles after an ambiguous send without another POST", async () => {
     const filePath = await stateFile();
     const firstBackend = new AtomicFileStateBackend({ filePath });
@@ -313,6 +380,134 @@ describe("durable outbox and monitor execution", () => {
 });
 
 describe("runnable cloud composition", () => {
+  it("coalesces concurrent readiness probes and reports shutdown as unavailable", async () => {
+    const backend = new AtomicFileStateBackend({ filePath: await stateFile() });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const ready = vi.spyOn(backend, "ready").mockImplementation(async () => gate);
+    const modal = {
+      fromId: vi.fn(),
+      close: vi.fn(async () => undefined),
+    } as unknown as ModalAdapter;
+    const runtime = createDexCloudRuntime({
+      config: config(await stateFile()),
+      backend,
+      modal,
+    });
+
+    const probes = Array.from({ length: 12 }, () =>
+      runtime.fetchHandler(new Request("https://cloud.dex.test/readyz")));
+    await vi.waitFor(() => expect(ready).toHaveBeenCalledOnce());
+    release();
+    expect((await Promise.all(probes)).map(({ status }) => status))
+      .toEqual(Array.from({ length: 12 }, () => 200));
+
+    await runtime.close();
+    const afterClose = await runtime.fetchHandler(new Request("https://cloud.dex.test/readyz"));
+    expect(afterClose.status).toBe(503);
+  });
+
+  it("serializes concurrent listen and close calls", async () => {
+    const runtimeConfig = config(await stateFile());
+    runtimeConfig.port = 0;
+    const modal = {
+      fromId: vi.fn(),
+      close: vi.fn(async () => undefined),
+    } as unknown as ModalAdapter;
+    const runtime = createDexCloudRuntime({ config: runtimeConfig, modal });
+
+    const [firstAddress, secondAddress] = await Promise.all([
+      runtime.listen(),
+      runtime.listen(),
+    ]);
+    expect(secondAddress).toEqual(firstAddress);
+    const firstClose = runtime.close();
+    const secondClose = runtime.close();
+    expect(secondClose).toBe(firstClose);
+    await firstClose;
+    expect(modal.close).toHaveBeenCalledOnce();
+  });
+
+  it("closes persistence even when Modal cleanup fails", async () => {
+    const backend = new AtomicFileStateBackend({ filePath: await stateFile() });
+    const modal = {
+      fromId: vi.fn(),
+      close: vi.fn(async () => { throw new Error("Modal cleanup failed"); }),
+    } as unknown as ModalAdapter;
+    const runtime = createDexCloudRuntime({
+      config: config(await stateFile()),
+      backend,
+      modal,
+    });
+
+    await expect(runtime.close()).rejects.toThrow("Modal cleanup failed");
+    await expect(backend.ready()).rejects.toThrow("backend is closed");
+  });
+
+  it("drains outboxes from requests without a timer when Cloud Tasks owns monitoring", async () => {
+    const calls: string[] = [];
+    const sendblueFetch = vi.fn(async (input: string | URL | Request) => {
+      calls.push(String(input));
+      return new Response(JSON.stringify({
+        message_handle: "provider-cloud-tasks-1",
+        status: "QUEUED",
+        content: "Dex needs a paired Mac before it can accept engineering work. Run dex setup to begin.",
+        from_number: DEX_LINE,
+        number: PHONE,
+        is_outbound: true,
+        date_created: NOW_ISO,
+      }), { status: 200 });
+    });
+    const modal = {
+      fromId: vi.fn(),
+      close: vi.fn(async () => undefined),
+    } as unknown as ModalAdapter;
+    const cloudConfig: DexCloudConfig = {
+      ...config(await stateFile()),
+      cloudTasks: {
+        project: "dex-project",
+        location: "northamerica-northeast1",
+        queue: "modal-monitors",
+        serviceUrl: "https://dex.example.test",
+        audience: "https://dex.example.test",
+        serviceAccountEmail: "tasks@dex-project.iam.gserviceaccount.com",
+      },
+    };
+    const runtime = createDexCloudRuntime({
+      config: cloudConfig,
+      fetch: sendblueFetch,
+      modal,
+      now: () => NOW,
+    });
+    const interval = vi.spyOn(globalThis, "setInterval");
+
+    runtime.startBackgroundWork();
+    expect(interval).not.toHaveBeenCalled();
+    await runtime.runCycle();
+
+    const webhook = await runtime.fetchHandler(new Request(
+      "https://cloud.dex.test/webhooks/sendblue",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "sb-signing-secret": "webhook-secret",
+        },
+        body: JSON.stringify({
+          content: "implement durable retries",
+          is_outbound: false,
+          message_handle: "incoming-cloud-tasks-1",
+          date_sent: NOW_ISO,
+          from_number: PHONE,
+          to_number: DEX_LINE,
+        }),
+      },
+    ));
+    expect(webhook.status).toBe(200);
+    await runtime.close();
+    expect(calls).toEqual(["https://api.sendblue.com/api/send-message"]);
+  });
+
   it("serves webhook/pair/sync routes and drains the resulting Sendblue outbox", async () => {
     const calls: Array<{ url: string; method: string; body?: string }> = [];
     const sendblueFetch = vi.fn(async (

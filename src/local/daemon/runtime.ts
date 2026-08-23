@@ -1,4 +1,5 @@
 import { hostname } from "node:os";
+import path from "node:path";
 import { z } from "zod";
 import { ClaudeAgentAdapter, CodexAgentAdapter } from "../../agents/index.js";
 import { ModalTaskMover, type ModalMonitorRegistration } from "../../cloud/modal-task-mover.js";
@@ -20,7 +21,6 @@ import { simulatedBatteryReading } from "../power/battery.js";
 import { DexCloudBridge } from "./cloud-bridge.js";
 import { DexPowerController } from "./power-controller.js";
 import { releaseCodexAuthLease } from "../../setup/modal-auth.js";
-import path from "node:path";
 
 const MessagePayloadSchema = z.object({
   text: z.string().min(1).max(20_000),
@@ -157,33 +157,38 @@ export class DexDaemonRuntime {
         await this.#power.restore();
       } else if (type === "task.cloud.completed") {
         const completion = CloudCompletionPayloadSchema.parse(payload);
-        await this.#store.updateState((state) => {
-          const task = state.tasks[completion.taskId];
-          if (!task) throw new Error(`Unknown completed cloud task: ${completion.taskId}`);
-          task.status = completion.status === "succeeded"
-            ? "completed"
-            : completion.status === "cancelled" ? "cancelled" : "failed";
-          task.stage = completion.status === "succeeded" ? "done" : "failed";
-          task.latestSummary = completion.summary;
-          task.updatedAt = new Date().toISOString();
-          if (completion.tests) task.testStatus = completion.tests;
-          const workerId = completion.workerId ?? task.currentWorkerId;
-          const worker = workerId ? state.workers[workerId] : undefined;
-          if (worker) {
-            worker.status = completion.status === "succeeded"
+        try {
+          await this.#store.updateState((state) => {
+            const task = state.tasks[completion.taskId];
+            if (!task) throw new Error(`Unknown completed cloud task: ${completion.taskId}`);
+            task.status = completion.status === "succeeded"
               ? "completed"
-              : completion.status === "cancelled" ? "stopped" : "failed";
-            worker.lastMessage = completion.summary;
-            worker.endedAt = new Date().toISOString();
-            if (completion.exitCode !== undefined && completion.exitCode !== null) worker.exitCode = completion.exitCode;
-          }
-        });
-        await this.#events.append({
-          type: completion.status === "succeeded" ? "task.completed" : "task.failed",
-          taskId: completion.taskId,
-          payload: { status: completion.status, summary: completion.summary, source: "modal-monitor" },
-        });
-        await releaseCodexAuthLease(this.#codexAuthLeasePath, completion.taskId);
+              : completion.status === "cancelled" ? "cancelled" : "failed";
+            task.stage = completion.status === "succeeded" ? "done" : "failed";
+            task.latestSummary = completion.summary;
+            task.updatedAt = new Date().toISOString();
+            if (completion.tests) task.testStatus = completion.tests;
+            const workerId = completion.workerId ?? task.currentWorkerId;
+            const worker = workerId ? state.workers[workerId] : undefined;
+            if (worker) {
+              worker.status = completion.status === "succeeded"
+                ? "completed"
+                : completion.status === "cancelled" ? "stopped" : "failed";
+              worker.lastMessage = completion.summary;
+              worker.endedAt = new Date().toISOString();
+              if (completion.exitCode !== undefined && completion.exitCode !== null) worker.exitCode = completion.exitCode;
+            }
+          });
+          await this.#events.append({
+            type: completion.status === "succeeded" ? "task.completed" : "task.failed",
+            taskId: completion.taskId,
+            payload: { status: completion.status, summary: completion.summary, source: "modal-monitor" },
+          });
+        } finally {
+          // A validated terminal callback means this worker can no longer
+          // refresh the shared account cache, even if local bookkeeping fails.
+          await releaseCodexAuthLease(this.#codexAuthLeasePath, completion.taskId);
+        }
       } else {
         throw new Error(`Unsupported Dex command: ${type}`);
       }

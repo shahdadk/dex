@@ -14,6 +14,8 @@ import { ModalStartupAcknowledgementSchema, type ModalStartupAcknowledgement } f
 import type { TaskKnowledge } from "../memory/index.js";
 import { acquireCodexAuthLease, DEFAULT_MODAL_CODEX_AUTH_VOLUME, releaseCodexAuthLease } from "../setup/modal-auth.js";
 
+export const MODAL_CODEX_WORKER_SANDBOX_NAME = "dex-codex-account-worker";
+
 export interface ModalMonitorRegistration {
   taskId: string;
   workerId: string;
@@ -127,6 +129,7 @@ export class ModalTaskMover implements TaskMover {
         timeoutMs: 25 * 60_000,
         workdir: "/workspace",
         env: { CODEX_HOME: "/codex-home" },
+        name: MODAL_CODEX_WORKER_SANDBOX_NAME,
         command: ["/bin/sh", "-c", "while [ ! -f /dex/ready ]; do sleep 0.2; done; exec node /dex/cloud-worker.js"],
         tags: { product: "dex", task: task.id },
       },

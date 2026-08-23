@@ -1,4 +1,4 @@
-import { access, appendFile, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, appendFile, chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -129,6 +129,8 @@ process.stdin.on("end", () => {
   fs.writeFileSync(process.env.FAKE_CODEX_PROMPT_PATH, prompt, "utf8");
   fs.writeFileSync(process.env.FAKE_CODEX_ENV_PATH, JSON.stringify({
     codexHome: process.env.CODEX_HOME,
+    codexApiKey: process.env.CODEX_API_KEY,
+    openAiApiKey: process.env.OPENAI_API_KEY,
     handoffSigningKey: process.env.DEX_HANDOFF_SIGNING_KEY,
     modalToken: process.env.MODAL_TOKEN_SECRET,
   }), "utf8");
@@ -146,8 +148,8 @@ process.stdin.on("end", () => {
 async function runWorker(fixture: WorkerFixture) {
   const binaryDirectory = await installFakeCodex(fixture.directory);
   const codexHome = path.join(fixture.directory, "codex-home");
-  await mkdir(codexHome, { mode: 0o700 });
-  await writeFile(path.join(codexHome, "auth.json"), JSON.stringify({ auth_mode: "chatgpt", tokens: {} }), { mode: 0o600 });
+  await mkdir(codexHome, { mode: 0o755 });
+  await writeFile(path.join(codexHome, "auth.json"), JSON.stringify({ auth_mode: "chatgpt", tokens: {} }), { mode: 0o644 });
   return execFile(process.execPath, ["--import", "tsx", CLOUD_WORKER], {
     cwd: REPOSITORY_ROOT,
     env: {
@@ -157,6 +159,8 @@ async function runWorker(fixture: WorkerFixture) {
       DEX_CLOUD_PROJECT: fixture.projectPath,
       DEX_HANDOFF_SIGNING_KEY: SIGNING_KEY,
       MODAL_TOKEN_SECRET: "modal-test-secret",
+      CODEX_API_KEY: "must-not-reach-codex",
+      OPENAI_API_KEY: "must-not-reach-codex",
       CODEX_HOME: codexHome,
       FAKE_CODEX_PROMPT_PATH: fixture.promptPath,
       FAKE_CODEX_ENV_PATH: fixture.environmentPath,
@@ -237,6 +241,8 @@ describe("Modal cloud worker", () => {
     expect(JSON.parse(await readFile(fixture.environmentPath, "utf8"))).toEqual({
       codexHome: path.join(fixture.directory, "codex-home"),
     });
+    expect((await stat(path.join(fixture.directory, "codex-home"))).mode & 0o777).toBe(0o700);
+    expect((await stat(path.join(fixture.directory, "codex-home", "auth.json"))).mode & 0o777).toBe(0o600);
     expect(JSON.parse(await readFile(path.join(fixture.cloudRoot, "result.json"), "utf8"))).toMatchObject({
       status: "succeeded",
       summary: "Cloud work completed. DEX_HANDOFF_SIGNING_KEY=[REDACTED]",

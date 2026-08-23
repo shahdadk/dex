@@ -62,6 +62,11 @@ export class DexCloudRuntime {
   readonly #onBackgroundError: (error: unknown) => void;
   #timer: ReturnType<typeof setInterval> | undefined;
   #cycleTail: Promise<unknown> = Promise.resolve();
+  #readinessCheck: Promise<void> | undefined;
+  #listenPromise: Promise<AddressInfo> | undefined;
+  #closePromise: Promise<void> | undefined;
+  #backgroundCycleRunning = false;
+  #backgroundWorkStarted = false;
   #closed = false;
 
   constructor(options: DexCloudRuntimeOptions) {
@@ -99,7 +104,11 @@ export class DexCloudRuntime {
       run(body: unknown): Promise<unknown>;
     } | undefined;
     if (options.config.cloudTasks !== undefined) {
-      const dispatcher = new CloudTasksMonitorDispatcher(options.config.cloudTasks);
+      const dispatcher = new CloudTasksMonitorDispatcher(
+        options.config.cloudTasks,
+        undefined,
+        now,
+      );
       const authenticator = new CloudTasksRequestAuthenticator(options.config.cloudTasks);
       const cloudMonitor = new CloudTasksModalMonitor({
         modal: this.modal,
@@ -118,13 +127,15 @@ export class DexCloudRuntime {
         run: (body) => cloudMonitor.run((body as CloudTasksMonitorBody).request),
       };
     }
-    const readiness = (): Promise<void> => this.backend.ready();
+    const readiness = (): Promise<void> => this.#checkReadiness();
     const handlerOptions = {
       service: this.service,
       readiness,
       ...(monitorTask === undefined ? {} : {
         monitorTask,
-        onMonitorRegistered: async () => { await this.#cloudTasksOutbox!.dispatchPending(); },
+        // With no resident timer, each mutating request drains both the monitor
+        // outbox and terminal/user notifications before Cloud Run can scale down.
+        onMonitorRegistered: async () => { await this.runCycle(); },
       }),
     };
     this.fetchHandler = createDexControlPlaneFetchHandler(handlerOptions);
@@ -182,36 +193,58 @@ export class DexCloudRuntime {
     return operation;
   }
 
-  async listen(): Promise<AddressInfo> {
-    if (this.#closed) throw new Error("Dex Cloud runtime is closed");
-    if (!this.server.listening) {
-      await new Promise<void>((resolve, reject) => {
-        const onError = (error: Error): void => {
-          this.server.off("listening", onListening);
-          reject(error);
-        };
-        const onListening = (): void => {
-          this.server.off("error", onError);
-          resolve();
-        };
-        this.server.once("error", onError);
-        this.server.once("listening", onListening);
-        this.server.listen(this.config.port, this.config.host);
-      });
-    }
-    this.startBackgroundWork();
-    const address = this.server.address();
-    if (!address || typeof address === "string") {
-      throw new Error("Dex Cloud server did not expose a TCP address");
-    }
-    return address;
+  listen(): Promise<AddressInfo> {
+    if (this.#closed) return Promise.reject(new Error("Dex Cloud runtime is closed"));
+    if (this.#listenPromise !== undefined) return this.#listenPromise;
+    const operation = (async () => {
+      if (!this.server.listening) {
+        await new Promise<void>((resolve, reject) => {
+          const onError = (error: Error): void => {
+            this.server.off("listening", onListening);
+            reject(error);
+          };
+          const onListening = (): void => {
+            this.server.off("error", onError);
+            resolve();
+          };
+          this.server.once("error", onError);
+          this.server.once("listening", onListening);
+          this.server.listen(this.config.port, this.config.host);
+        });
+      }
+      this.startBackgroundWork();
+      const address = this.server.address();
+      if (!address || typeof address === "string") {
+        throw new Error("Dex Cloud server did not expose a TCP address");
+      }
+      return address;
+    })();
+    this.#listenPromise = operation;
+    void operation.catch(() => {
+      if (this.#listenPromise === operation) this.#listenPromise = undefined;
+    });
+    return operation;
   }
 
   startBackgroundWork(): void {
     if (this.#closed) throw new Error("Dex Cloud runtime is closed");
-    if (this.#timer !== undefined) return;
+    if (this.#backgroundWorkStarted) return;
+    this.#backgroundWorkStarted = true;
     const tick = (): void => {
-      void this.runCycle().catch(this.#onBackgroundError);
+      if (this.#backgroundCycleRunning || this.#closed) return;
+      this.#backgroundCycleRunning = true;
+      void this.runCycle()
+        .catch((error) => {
+          try {
+            this.#onBackgroundError(error);
+          } catch {
+            // A reporting hook must not turn a handled background failure into
+            // an unhandled rejection.
+          }
+        })
+        .finally(() => {
+          this.#backgroundCycleRunning = false;
+        });
     };
     if (this.config.cloudTasks !== undefined) {
       tick();
@@ -222,21 +255,57 @@ export class DexCloudRuntime {
     tick();
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) return;
+  close(): Promise<void> {
+    if (this.#closePromise !== undefined) return this.#closePromise;
     this.#closed = true;
-    if (this.#timer !== undefined) {
-      clearInterval(this.#timer);
-      this.#timer = undefined;
-    }
-    if (this.server.listening) {
-      await new Promise<void>((resolve, reject) => {
-        this.server.close((error) => error ? reject(error) : resolve());
-      });
-    }
-    await this.#cycleTail.catch(() => undefined);
-    await this.modal.close();
-    await this.backend.close();
+    this.#closePromise = (async () => {
+      const failures: unknown[] = [];
+      if (this.#timer !== undefined) {
+        clearInterval(this.#timer);
+        this.#timer = undefined;
+      }
+      await this.#listenPromise?.catch(() => undefined);
+      if (this.server.listening) {
+        try {
+          await new Promise<void>((resolve, reject) => {
+            this.server.close((error) => error ? reject(error) : resolve());
+          });
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      await this.#cycleTail.catch(() => undefined);
+      try {
+        await this.modal.close();
+      } catch (error) {
+        failures.push(error);
+      }
+      try {
+        await this.backend.close();
+      } catch (error) {
+        failures.push(error);
+      }
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) {
+        throw new AggregateError(failures, "Dex Cloud runtime shutdown failed");
+      }
+    })();
+    return this.#closePromise;
+  }
+
+  #checkReadiness(): Promise<void> {
+    if (this.#readinessCheck !== undefined) return this.#readinessCheck;
+    const operation = Promise.resolve().then(async () => {
+      if (this.#closed) throw new Error("Dex Cloud runtime is closed");
+      await this.backend.ready();
+      if (this.#closed) throw new Error("Dex Cloud runtime is closed");
+    });
+    this.#readinessCheck = operation;
+    const clear = (): void => {
+      if (this.#readinessCheck === operation) this.#readinessCheck = undefined;
+    };
+    void operation.then(clear, clear);
+    return operation;
   }
 }
 

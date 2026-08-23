@@ -59,6 +59,8 @@ export class PostgresStateBackend implements DexCloudStateBackend {
   readonly #pool: PgPoolLike;
   readonly #rowId: string;
   readonly #ready: Promise<void>;
+  #closePromise: Promise<void> | undefined;
+  #closed = false;
 
   constructor(options: PostgresStateBackendOptions) {
     if ((options.databaseUrl === undefined) === (options.poolOptions === undefined)) {
@@ -115,7 +117,9 @@ export class PostgresStateBackend implements DexCloudStateBackend {
   }
 
   async read<T>(reader: (state: DexCloudStateDocument) => T | Promise<T>): Promise<T> {
+    this.#assertOpen();
     await this.#ready;
+    this.#assertOpen();
     const result = await this.#pool.query<{ state: unknown }>(
       "SELECT state FROM dex_cloud_state WHERE id = $1",
       [this.#rowId],
@@ -130,7 +134,9 @@ export class PostgresStateBackend implements DexCloudStateBackend {
   }
 
   async mutate<T>(mutation: (state: DexCloudStateDocument) => T | Promise<T>): Promise<T> {
+    this.#assertOpen();
     await this.#ready;
+    this.#assertOpen();
     const client = await this.#pool.connect();
     try {
       await client.query("BEGIN");
@@ -158,8 +164,18 @@ export class PostgresStateBackend implements DexCloudStateBackend {
     }
   }
 
-  async close(): Promise<void> {
-    await this.#pool.end();
+  close(): Promise<void> {
+    if (this.#closePromise !== undefined) return this.#closePromise;
+    this.#closed = true;
+    this.#closePromise = (async () => {
+      await this.#ready.catch(() => undefined);
+      await this.#pool.end();
+    })();
+    return this.#closePromise;
+  }
+
+  #assertOpen(): void {
+    if (this.#closed) throw new Error("Dex cloud persistence backend is closed");
   }
 }
 
@@ -174,13 +190,30 @@ export interface CloudSqlPostgresStateBackendOptions {
 
 /** Cloud SQL durability using ADC and automatic IAM database authentication. */
 export class CloudSqlPostgresStateBackend implements DexCloudStateBackend {
-  readonly #connector = new Connector();
+  readonly #connector: Connector;
   readonly #backend: Promise<PostgresStateBackend>;
+  #closePromise: Promise<void> | undefined;
+  #closed = false;
 
   constructor(options: CloudSqlPostgresStateBackendOptions) {
     if (!options.instanceConnectionName || !options.database || !options.user) {
       throw new TypeError("Cloud SQL instance, database, and IAM user are required");
     }
+    if (options.ipType !== undefined && options.ipType !== "PUBLIC" && options.ipType !== "PRIVATE") {
+      throw new TypeError("Cloud SQL IP type must be PUBLIC or PRIVATE");
+    }
+    if (options.rowId !== undefined && !/^[A-Za-z0-9_.:-]{1,128}$/.test(options.rowId)) {
+      throw new TypeError("Dex cloud state row ID is invalid");
+    }
+    if (
+      options.maxConnections !== undefined &&
+      (!Number.isSafeInteger(options.maxConnections) ||
+        options.maxConnections < 1 ||
+        options.maxConnections > 32)
+    ) {
+      throw new RangeError("PostgreSQL connection count must be between one and 32");
+    }
+    this.#connector = new Connector();
     this.#backend = this.#connect(options);
     void this.#backend.catch(() => undefined);
   }
@@ -203,23 +236,35 @@ export class CloudSqlPostgresStateBackend implements DexCloudStateBackend {
   }
 
   async read<T>(reader: (state: DexCloudStateDocument) => T | Promise<T>): Promise<T> {
+    this.#assertOpen();
     return (await this.#backend).read(reader);
   }
 
   async ready(): Promise<void> {
+    this.#assertOpen();
     await (await this.#backend).ready();
   }
 
   async mutate<T>(mutation: (state: DexCloudStateDocument) => T | Promise<T>): Promise<T> {
+    this.#assertOpen();
     return (await this.#backend).mutate(mutation);
   }
 
-  async close(): Promise<void> {
-    try {
-      await (await this.#backend).close();
-    } finally {
-      this.#connector.close();
-    }
+  close(): Promise<void> {
+    if (this.#closePromise !== undefined) return this.#closePromise;
+    this.#closed = true;
+    this.#closePromise = (async () => {
+      try {
+        await (await this.#backend).close();
+      } finally {
+        this.#connector.close();
+      }
+    })();
+    return this.#closePromise;
+  }
+
+  #assertOpen(): void {
+    if (this.#closed) throw new Error("Dex cloud persistence backend is closed");
   }
 }
 
@@ -232,6 +277,8 @@ export class AtomicFileStateBackend implements DexCloudStateBackend {
   readonly #filePath: string;
   #tail: Promise<unknown> = Promise.resolve();
   #temporarySequence = 0;
+  #closePromise: Promise<void> | undefined;
+  #closed = false;
 
   constructor(options: AtomicFileStateBackendOptions) {
     if (!path.isAbsolute(options.filePath)) {
@@ -241,6 +288,7 @@ export class AtomicFileStateBackend implements DexCloudStateBackend {
   }
 
   read<T>(reader: (state: DexCloudStateDocument) => T | Promise<T>): Promise<T> {
+    this.#assertOpen();
     return this.#serialized(async () => reader(await this.#readState()));
   }
 
@@ -249,6 +297,7 @@ export class AtomicFileStateBackend implements DexCloudStateBackend {
   }
 
   mutate<T>(mutation: (state: DexCloudStateDocument) => T | Promise<T>): Promise<T> {
+    this.#assertOpen();
     return this.#serialized(async () => {
       const state = await this.#readState();
       const result = await mutation(state);
@@ -257,14 +306,21 @@ export class AtomicFileStateBackend implements DexCloudStateBackend {
     });
   }
 
-  async close(): Promise<void> {
-    await this.#tail.catch(() => undefined);
+  close(): Promise<void> {
+    if (this.#closePromise !== undefined) return this.#closePromise;
+    this.#closed = true;
+    this.#closePromise = this.#tail.then(() => undefined, () => undefined);
+    return this.#closePromise;
   }
 
   #serialized<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.#tail.then(operation, operation);
     this.#tail = result.catch(() => undefined);
     return result;
+  }
+
+  #assertOpen(): void {
+    if (this.#closed) throw new Error("Dex cloud persistence backend is closed");
   }
 
   async #readState(): Promise<DexCloudStateDocument> {

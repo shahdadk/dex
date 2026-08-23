@@ -1,4 +1,5 @@
-import { open, readFile, stat, unlink } from "node:fs/promises";
+import { constants } from "node:fs";
+import { mkdir, open, readFile, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
@@ -17,6 +18,16 @@ const ChatGptAuthSchema = z.object({
   }).passthrough(),
 }).passthrough();
 
+const CodexAuthLeaseSchema = z.object({
+  version: z.literal(1),
+  taskId: z.string().trim().min(1).max(512),
+}).strict();
+
+const ModalVolumeNameSchema = z.string().regex(
+  /^[a-z0-9](?:[a-z0-9._-]{0,62})$/,
+  "Modal Codex auth Volume name must be 1-63 lowercase letters, numbers, dots, underscores, or hyphens",
+);
+
 type Runner = (command: string, args: readonly string[]) => Promise<ExecResult>;
 
 export interface SeedModalCodexAuthOptions {
@@ -27,34 +38,59 @@ export interface SeedModalCodexAuthOptions {
 }
 
 export async function validateLocalCodexAuth(authPath = path.join(os.homedir(), ".codex", "auth.json")): Promise<void> {
-  const metadata = await stat(authPath);
-  if (!metadata.isFile()) throw new Error("Codex auth cache must be a regular file");
-  if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) {
-    throw new Error("Codex auth cache must be owned by the current user");
-  }
-  if ((metadata.mode & 0o077) !== 0) {
-    throw new Error("Codex auth cache permissions are too broad; run chmod 600 ~/.codex/auth.json");
-  }
-  let parsed: unknown;
+  let handle;
   try {
-    parsed = JSON.parse(await readFile(authPath, "utf8"));
+    handle = await open(authPath, constants.O_RDONLY | constants.O_NOFOLLOW);
   } catch (error) {
-    throw new Error("Codex auth cache is not valid JSON", { cause: error });
+    if ((error as NodeJS.ErrnoException).code === "ELOOP") {
+      throw new Error("Codex auth cache must be a regular file, not a symbolic link");
+    }
+    throw error;
   }
-  if (!ChatGptAuthSchema.safeParse(parsed).success) {
-    throw new Error("Codex auth cache is not a ChatGPT account login");
+
+  try {
+    const metadata = await handle.stat();
+    if (!metadata.isFile()) throw new Error("Codex auth cache must be a regular file");
+    if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) {
+      throw new Error("Codex auth cache must be owned by the current user");
+    }
+    if ((metadata.mode & 0o077) !== 0) {
+      throw new Error("Codex auth cache permissions are too broad; run chmod 600 ~/.codex/auth.json");
+    }
+    if (metadata.size < 2 || metadata.size > 1024 * 1024) {
+      throw new Error("Codex auth cache has an invalid size");
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await handle.readFile("utf8"));
+    } catch (error) {
+      throw new Error("Codex auth cache is not valid JSON", { cause: error });
+    }
+    if (!ChatGptAuthSchema.safeParse(parsed).success) {
+      throw new Error("Codex auth cache is not a ChatGPT account login");
+    }
+  } finally {
+    await handle.close();
   }
 }
 
 /** Seeds auth directly from the user's home directory; no credential enters the repository. */
 export async function seedModalCodexAuth(options: SeedModalCodexAuthOptions = {}): Promise<{ volumeName: string }> {
   const authPath = options.authPath ?? path.join(os.homedir(), ".codex", "auth.json");
-  const volumeName = options.volumeName ?? process.env.DEX_MODAL_CODEX_AUTH_VOLUME ?? DEFAULT_MODAL_CODEX_AUTH_VOLUME;
+  const volumeName = ModalVolumeNameSchema.parse(
+    options.volumeName ?? process.env.DEX_MODAL_CODEX_AUTH_VOLUME ?? DEFAULT_MODAL_CODEX_AUTH_VOLUME,
+  );
   await validateLocalCodexAuth(authPath);
   const runner = options.runner ?? execFile;
   const created = await runner("modal", ["volume", "create", volumeName]);
   if (created.exitCode !== 0 && !/already exists/i.test(`${created.stdout}\n${created.stderr}`)) {
     throw new Error("Could not create the private Modal Codex auth Volume");
+  }
+  const uploaded = await runner("modal", [
+    "volume", "put", "--force", volumeName, authPath, "auth.json",
+  ]);
+  if (uploaded.exitCode !== 0) {
+    throw new Error("Could not upload the Codex auth cache to the private Modal Volume");
   }
   const modal = options.modal ?? new ModalAdapter();
   let sandbox: Awaited<ReturnType<ModalAdapter["create"]>> | undefined;
@@ -70,38 +106,55 @@ export async function seedModalCodexAuth(options: SeedModalCodexAuthOptions = {}
       const process = await sandbox.exec(argv);
       if (await process.wait() !== 0) throw new Error("Could not secure the remote Codex home");
     }
-    await sandbox.copyFromLocal(authPath, path.join(MODAL_CODEX_HOME, "auth.json"));
     const permissions = await sandbox.exec(["chmod", "600", path.join(MODAL_CODEX_HOME, "auth.json")]);
     if (await permissions.wait() !== 0) throw new Error("Could not secure the remote Codex auth cache");
     const status = await sandbox.exec(["codex", "login", "status"], { env: { CODEX_HOME: MODAL_CODEX_HOME } });
     if (await status.wait() !== 0) throw new Error("Codex did not accept the seeded ChatGPT account login");
   } finally {
-    await sandbox?.terminate().catch(() => undefined);
-    await modal.close();
+    try {
+      await sandbox?.terminate({ wait: true });
+    } finally {
+      await modal.close();
+    }
   }
   return { volumeName };
 }
 
 export async function acquireCodexAuthLease(leasePath: string, taskId: string): Promise<void> {
+  const lease = CodexAuthLeaseSchema.parse({ version: 1, taskId });
+  await mkdir(path.dirname(leasePath), { recursive: true, mode: 0o700 });
+  let handle;
   try {
-    const handle = await open(leasePath, "wx", 0o600);
-    try { await handle.writeFile(`${JSON.stringify({ version: 1, taskId })}\n`, "utf8"); } finally { await handle.close(); }
+    handle = await open(leasePath, "wx", 0o600);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EEXIST") {
       throw new Error("Another Modal Codex worker holds the shared account-auth lease");
     }
     throw error;
   }
+  try {
+    await handle.writeFile(`${JSON.stringify(lease)}\n`, "utf8");
+    await handle.sync();
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    await unlink(leasePath).catch(() => undefined);
+    throw error;
+  }
+  await handle.close();
 }
 
 export async function releaseCodexAuthLease(leasePath: string, taskId: string): Promise<void> {
-  let lease: unknown;
-  try { lease = JSON.parse(await readFile(leasePath, "utf8")); } catch (error) {
+  let lease;
+  try {
+    lease = CodexAuthLeaseSchema.parse(JSON.parse(await readFile(leasePath, "utf8")));
+  } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw new Error("Refusing to release an unreadable Codex auth lease", { cause: error });
   }
-  if (!lease || typeof lease !== "object" || (lease as { taskId?: unknown }).taskId !== taskId) {
+  if (lease.taskId !== taskId) {
     throw new Error("Refusing to release a Codex auth lease owned by another task");
   }
-  await unlink(leasePath);
+  await unlink(leasePath).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "ENOENT") throw error;
+  });
 }

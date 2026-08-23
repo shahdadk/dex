@@ -529,6 +529,7 @@ describe("Dex golden path", () => {
       events,
       battery,
       power,
+      codexAuthLeasePath: path.join(paths.handoffs, ".codex-account-auth.lease"),
     });
 
     const engineeringWebhook = inbound("engineering-golden", ENGINEERING_MESSAGE);

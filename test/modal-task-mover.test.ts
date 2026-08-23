@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -189,8 +189,9 @@ function createModalHarness(
       },
     },
     sandboxes: {
-      create: async () => {
+      create: async (_app, _image, params) => {
         calls.push("create");
+        calls.push(`sandbox-name:${String(params?.name)}`);
         return rawSandbox;
       },
       fromId: async () => rawSandbox,
@@ -288,8 +289,15 @@ describe("ModalTaskMover", () => {
       workerHistory: ["worker-local", workerId],
     });
     expect(harness.calls.indexOf("monitor")).toBeLessThan(harness.calls.indexOf("detach"));
+    expect(harness.calls).toContain("volume:dex-codex-auth:false");
+    expect(harness.calls).toContain("secret:dex-workers:DEX_HANDOFF_SIGNING_KEY");
+    expect(harness.calls).toContain("sandbox-name:dex-codex-account-worker");
     expect(harness.calls).toContain("close");
     expect(harness.calls).not.toContain("terminate");
+    expect(JSON.parse(await readFile(
+      path.join(fixture.handoffsRoot, ".codex-account-auth.lease"),
+      "utf8",
+    ))).toEqual({ version: 1, taskId: fixture.task.id });
   });
 
   it("terminates the sandbox and does not detach or schedule when startup context is incomplete", async () => {
@@ -325,6 +333,9 @@ describe("ModalTaskMover", () => {
     expect(harness.calls).not.toContain("detach");
     expect(harness.calls).not.toContain("monitor");
     expect(scheduleMonitor).not.toHaveBeenCalled();
+    await expect(access(
+      path.join(fixture.handoffsRoot, ".codex-account-auth.lease"),
+    )).rejects.toMatchObject({ code: "ENOENT" });
     const state = await new DexStateStore(fixture.stateFile).read();
     expect(Object.values(state.workers).some((worker) => worker.target.kind === "modal")).toBe(false);
   });
