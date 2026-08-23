@@ -15,6 +15,12 @@ export const DEFAULT_CONTROL_PLANE_BODY_LIMIT = 64 * 1024;
 export interface DexControlPlaneHandlerOptions {
   service: DexControlPlaneService;
   maxBodyBytes?: number;
+  monitorTask?: {
+    verify(headers: Headers, body: unknown): Promise<unknown>;
+    run(body: unknown): Promise<unknown>;
+  };
+  onMonitorRegistered?: () => Promise<void>;
+  readiness?: () => Promise<void>;
 }
 
 function jsonResponse(
@@ -88,12 +94,24 @@ export function createDexControlPlaneFetchHandler(
 ): (request: Request) => Promise<Response> {
   const limit = validBodyLimit(options.maxBodyBytes ?? DEFAULT_CONTROL_PLANE_BODY_LIMIT);
   const service = options.service;
+  const readiness = options.readiness ?? (() => Promise.resolve());
 
   return async (request: Request): Promise<Response> => {
     try {
       const url = new URL(request.url);
-      if (request.method === "GET" && url.pathname === "/healthz") {
+      if (request.method === "GET" && url.pathname === "/livez") {
         return jsonResponse(200, { status: "ok" });
+      }
+      if (
+        request.method === "GET" &&
+        (url.pathname === "/readyz" || url.pathname === "/healthz")
+      ) {
+        try {
+          await readiness();
+          return jsonResponse(200, { status: "ok" });
+        } catch {
+          return jsonResponse(503, { status: "unavailable" });
+        }
       }
       if (request.method !== "POST") {
         return jsonResponse(405, { code: "method_not_allowed" }, { allow: "POST" });
@@ -128,12 +146,19 @@ export function createDexControlPlaneFetchHandler(
       if (url.pathname === "/v1/modal/monitors") {
         service.verifyInternalRequest(request.headers);
         const body = await boundedBody(request, limit);
-        return jsonResponse(200, await service.registerModalMonitor(parseJson(body)));
+        const result = await service.registerModalMonitor(parseJson(body));
+        await options.onMonitorRegistered?.();
+        return jsonResponse(200, result);
       }
       if (url.pathname === "/v1/modal/results") {
         service.verifyInternalRequest(request.headers);
         const body = await boundedBody(request, limit);
         return jsonResponse(200, await service.handleModalTerminal(parseJson(body)));
+      }
+      if (url.pathname === "/internal/modal/monitor" && options.monitorTask) {
+        const body = parseJson(await boundedBody(request, limit));
+        const verified = await options.monitorTask.verify(request.headers, body);
+        return jsonResponse(200, await options.monitorTask.run(verified));
       }
       return jsonResponse(404, { code: "not_found" });
     } catch (error) {

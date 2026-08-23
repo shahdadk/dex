@@ -18,6 +18,7 @@ import { ModalAdapter } from "./cloud/modal/adapter.js";
 import { detectMacName, pairMac } from "./setup/onboarding.js";
 import { sendControlCommand } from "./local/daemon/control-socket.js";
 import { hydrateRuntimeSecrets, persistRuntimeSecrets } from "./local/pairing/secrets.js";
+import { DEFAULT_MODAL_CODEX_AUTH_VOLUME, seedModalCodexAuth } from "./setup/modal-auth.js";
 import {
   discoverClaudeMem,
   extractObservationIds,
@@ -73,6 +74,9 @@ program
     if (!process.env.GEMINI_API_KEY) {
       throw new Error("GEMINI_API_KEY is required for Dex's ambiguous routing lane");
     }
+    const auth = await seedModalCodexAuth();
+    process.env.DEX_MODAL_CODEX_AUTH_VOLUME = auth.volumeName;
+    console.log(`✓ Codex ChatGPT account auth seeded in private Modal Volume ${auth.volumeName}`);
     if (!options.skipModalSmoke) {
       const smoke = await modalSmokeTest();
       console.log(`✓ Modal create/execute/detach/reconnect: ${smoke.id} (${smoke.version})`);
@@ -328,26 +332,22 @@ async function modalSmokeTest(): Promise<{ id: string; version: string }> {
   const modal = new ModalAdapter();
   const signingKey = process.env.DEX_HANDOFF_SIGNING_KEY;
   if (!signingKey) throw new Error("DEX_HANDOFF_SIGNING_KEY is required for the Modal worker check");
-  const inlineWorkerSecrets = process.env.OPENAI_API_KEY
-    ? {
-        OPENAI_API_KEY: process.env.OPENAI_API_KEY,
-        DEX_HANDOFF_SIGNING_KEY: signingKey,
-      }
-    : undefined;
+  const codexAuthVolumeName = process.env.DEX_MODAL_CODEX_AUTH_VOLUME ?? DEFAULT_MODAL_CODEX_AUTH_VOLUME;
   const sandbox = await modal.create({
-    ...(inlineWorkerSecrets
-      ? { secretValues: inlineWorkerSecrets }
-      : {
-          secretNames: [process.env.DEX_MODAL_SECRET_NAME ?? "dex-workers"],
-          requiredSecretKeys: ["OPENAI_API_KEY", "DEX_HANDOFF_SIGNING_KEY"],
-        }),
-    params: { timeoutMs: 120_000, command: ["sleep", "120"] },
+    secretNames: [process.env.DEX_MODAL_SECRET_NAME ?? "dex-workers"],
+    requiredSecretKeys: ["DEX_HANDOFF_SIGNING_KEY"],
+    volumeNames: { "/codex-home": codexAuthVolumeName },
+    params: {
+      timeoutMs: 120_000,
+      env: { CODEX_HOME: "/codex-home" },
+      command: ["sleep", "120"],
+    },
   });
   try {
     const process = await sandbox.exec([
       "node",
       "-e",
-      "if (!process.env.OPENAI_API_KEY || !process.env.DEX_HANDOFF_SIGNING_KEY) process.exit(9); process.stdout.write(process.version)",
+      "const fs=require('node:fs'); if (!fs.existsSync('/codex-home/auth.json') || !process.env.DEX_HANDOFF_SIGNING_KEY) process.exit(9); process.stdout.write(process.version)",
     ]);
     const [exitCode, output] = await Promise.all([process.wait(), process.stdout.readText()]);
     if (exitCode !== 0) throw new Error(`Modal command exited ${exitCode}: ${await process.stderr.readText()}`);

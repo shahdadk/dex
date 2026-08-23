@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { access, open, readFile, rename } from "node:fs/promises";
+import { access, chmod, open, readFile, rename, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
@@ -40,6 +40,8 @@ export async function runCloudWorker(): Promise<void> {
     if (await exists(path.join(project, "package-lock.json"))) {
       await run("npm", ["ci", "--ignore-scripts", "--no-audit", "--no-fund"], project);
     }
+    await verifyCodexAuthentication();
+    await run("codex", ["login", "status"], project);
 
     const worker = spawn("codex", [
       "-C",
@@ -298,10 +300,22 @@ function codexEnvironment(): NodeJS.ProcessEnv {
     ...nonSecretEnvironment(),
     NO_COLOR: "1",
   };
-  if (process.env.OPENAI_API_KEY) {
-    environment.OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-  }
   return environment;
+}
+
+async function verifyCodexAuthentication(): Promise<void> {
+  const codexHome = process.env.CODEX_HOME;
+  if (!codexHome) {
+    throw new Error("Codex requires a persistent CODEX_HOME account login");
+  }
+  const authPath = path.join(codexHome, "auth.json");
+  if (!(await exists(authPath))) {
+    throw new Error("Codex account authentication is missing from the configured CODEX_HOME");
+  }
+  const metadata = await stat(authPath);
+  if (!metadata.isFile()) throw new Error("Codex account authentication cache is not a regular file");
+  await chmod(codexHome, 0o700);
+  await chmod(authPath, 0o600);
 }
 
 function redactText(value: string): string {

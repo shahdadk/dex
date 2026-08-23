@@ -175,7 +175,7 @@ function nonSecretEnvironment(): NodeJS.ProcessEnv {
 function providerEnvironment(provider: AgentProvider): NodeJS.ProcessEnv {
   const environment = nonSecretEnvironment();
   const allowed = provider === "codex"
-    ? ["OPENAI_API_KEY"]
+    ? ["CODEX_API_KEY"]
     : ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
   for (const name of allowed) {
     const value = process.env[name];

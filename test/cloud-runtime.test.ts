@@ -91,6 +91,28 @@ describe("Dex Cloud environment and verified ownership", () => {
       publicKey: key.publicKey,
     });
     expect(loaded.signingKey.privateKey).not.toBe("");
+
+    const cloudSql = await loadDexCloudConfig({
+      ...base,
+      DEX_CLOUD_SQL_INSTANCE: "appfi-dev-80693:northamerica-northeast1:ai-employee-pg",
+      DEX_CLOUD_SQL_DATABASE: "ai_employee",
+      DEX_CLOUD_SQL_IAM_USER: "dex-cloud@appfi-dev-80693.iam",
+    });
+    expect(cloudSql.persistence).toEqual({
+      kind: "cloud-sql",
+      instanceConnectionName: "appfi-dev-80693:northamerica-northeast1:ai-employee-pg",
+      database: "ai_employee",
+      user: "dex-cloud@appfi-dev-80693.iam",
+      ipType: "PUBLIC",
+    });
+
+    await expect(loadDexCloudConfig({
+      ...base,
+      DEX_DATABASE_URL: "postgresql://dex:password@db.example.test/dex",
+      DEX_CLOUD_SQL_INSTANCE: "appfi-dev-80693:northamerica-northeast1:ai-employee-pg",
+      DEX_CLOUD_SQL_DATABASE: "ai_employee",
+      DEX_CLOUD_SQL_IAM_USER: "dex-cloud@appfi-dev-80693.iam",
+    })).rejects.toThrow("Set only one");
   });
 
   it("accepts the existing Appfi Sendblue secret names without copying credentials", async () => {

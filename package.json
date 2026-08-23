@@ -27,8 +27,11 @@
     "prepack": "npm run build"
   },
   "dependencies": {
+    "@google-cloud/cloud-sql-connector": "1.10.0",
+    "@google-cloud/tasks": "^7.0.0",
     "commander": "^14.0.0",
     "execa": "^9.6.0",
+    "google-auth-library": "^11.0.2",
     "modal": "^0.9.0",
     "pg": "^8.23.0",
     "zod": "^4.1.0"

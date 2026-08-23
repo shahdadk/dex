@@ -6,7 +6,7 @@ Dex is a personal engineering operator for iMessage. Send it a task, let a fresh
 
 Dex is designed around one product promise: after a one-time setup in Terminal, the everyday interface is iMessage.
 
-> **Implementation status:** the complete Dex runtime, cloud service, setup flow, and deterministic golden path are implemented and green in automated acceptance. Real Gemini, Claude-Mem, Claude CLI, and Codex CLI smoke checks have also passed on this Mac. Live Sendblue pairing, credentialed Modal continuation, and physical sleep still require the deployment credentials described below; those external steps are not simulated or claimed as complete.
+> **Implementation status:** the complete Dex runtime, cloud service, setup flow, and deterministic golden path are implemented and green in automated acceptance. Real Gemini, Claude-Mem, Claude CLI, Codex CLI, and Modal create/execute/detach/reconnect smoke checks have passed on this Mac. Live Sendblue pairing, a full Codex/Modal continuation, and physical sleep still require the deployment configuration described below; those external steps are not simulated or claimed as complete.
 
 ## Set up once
 
@@ -34,9 +34,11 @@ The full local and cloud configuration is listed in [`.env.example`](.env.exampl
 | `DEX_CLOUD_SERVER_KEYS_JSON` | JSON array of pinned Dex Cloud Ed25519 public keys | Required for setup and signed-command verification |
 | `DEX_SENDBLUE_LINE` or `SENDBLUE_NUMBER` | Dex's iMessage phone number | Required so setup can show where to send `PAIR …`; the second name reuses the existing Appfi convention |
 | `GEMINI_API_KEY` | Gemini router credential | Model-assisted natural-language routing; deterministic routes still work without it |
-| `MODAL_TOKEN_ID` | Modal account token ID | Real Modal sandbox operations |
-| `MODAL_TOKEN_SECRET` | Modal account token secret | Real Modal sandbox operations |
+| `MODAL_TOKEN_ID` | Modal account token ID | Optional locally when an authenticated `~/.modal.toml` profile exists; required for headless cloud monitoring |
+| `MODAL_TOKEN_SECRET` | Modal account token secret | Optional locally when an authenticated `~/.modal.toml` profile exists; required for headless cloud monitoring |
 | `DEX_MODAL_SECRET_NAME` | Name of the Modal secret attached to cloud workers | Optional; defaults to `dex-workers` |
+| `DEX_MODAL_CODEX_AUTH_VOLUME` | Private Modal Volume containing a ChatGPT-backed `auth.json` | Preferred for cloud Codex; mount is used as persistent `CODEX_HOME` |
+| `CODEX_API_KEY` | Scoped Codex automation credential | Optional API-billed alternative to account auth |
 | `DEX_HANDOFF_SIGNING_KEY` | HMAC key for local-to-cloud handoff integrity | Required for cloud continuation; keep secret |
 | `DEX_HOME` | Override for Dex's local data directory | Optional; defaults to `~/.dex` |
 | `CLAUDE_MEM_URL` | Claude-Mem health endpoint override used by diagnostics | Optional; defaults to the local service |
@@ -44,7 +46,7 @@ The full local and cloud configuration is listed in [`.env.example`](.env.exampl
 
 The cloud runtime also accepts the existing `SENDBLUE_API_SECRET` and `SENDBLUE_WEBHOOK_SECRET` names as aliases for Dex's canonical names. This lets a deployment reference the same managed secrets without copying their values.
 
-Setup stores the local runtime credentials in macOS Keychain and the LaunchAgent hydrates them at startup. Cloud Codex receives only its OpenAI credential and the handoff-verification key through Modal's secret boundary; the spawned coding process cannot see Modal control credentials or the signing key after verification.
+Setup stores Dex runtime credentials in macOS Keychain and the LaunchAgent hydrates them at startup. Modal may authenticate locally through its active `~/.modal.toml` profile; headless Dex Cloud receives the same API-token pair through its deployment secret boundary. By default, cloud Codex uses the user's ChatGPT-backed login from a private persistent Modal Volume; `CODEX_API_KEY` remains an optional automation fallback. The spawned coding process cannot see Modal control credentials or the signing key after verification.
 
 ## The iMessage experience
 

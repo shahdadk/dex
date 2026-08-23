@@ -2,12 +2,20 @@ import { createRequire } from "node:module";
 import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import {
+  AuthTypes,
+  Connector,
+  IpAddressTypes,
+  type DriverOptions,
+} from "@google-cloud/cloud-sql-connector";
+import {
   emptyDexCloudState,
   parseDexCloudState,
   type DexCloudStateDocument,
 } from "./state.js";
 
 export interface DexCloudStateBackend {
+  /** Proves initialization completed and persisted state can be read without mutation. */
+  ready(): Promise<void>;
   read<T>(reader: (state: DexCloudStateDocument) => T | Promise<T>): Promise<T>;
   mutate<T>(mutation: (state: DexCloudStateDocument) => T | Promise<T>): Promise<T>;
   close(): Promise<void>;
@@ -33,7 +41,8 @@ interface PgPoolConstructor {
 }
 
 export interface PostgresStateBackendOptions {
-  databaseUrl: string;
+  databaseUrl?: string;
+  poolOptions?: DriverOptions & { user: string; database: string };
   rowId?: string;
   maxConnections?: number;
   ssl?: boolean | { rejectUnauthorized: boolean };
@@ -52,14 +61,19 @@ export class PostgresStateBackend implements DexCloudStateBackend {
   readonly #ready: Promise<void>;
 
   constructor(options: PostgresStateBackendOptions) {
-    let url: URL;
-    try {
-      url = new URL(options.databaseUrl);
-    } catch {
-      throw new TypeError("DEX_DATABASE_URL must be a valid PostgreSQL URL");
+    if ((options.databaseUrl === undefined) === (options.poolOptions === undefined)) {
+      throw new TypeError("Exactly one PostgreSQL connection source is required");
     }
-    if (url.protocol !== "postgres:" && url.protocol !== "postgresql:") {
-      throw new TypeError("DEX_DATABASE_URL must use postgres:// or postgresql://");
+    if (options.databaseUrl !== undefined) {
+      let url: URL;
+      try {
+        url = new URL(options.databaseUrl);
+      } catch {
+        throw new TypeError("DEX_DATABASE_URL must be a valid PostgreSQL URL");
+      }
+      if (url.protocol !== "postgres:" && url.protocol !== "postgresql:") {
+        throw new TypeError("DEX_DATABASE_URL must use postgres:// or postgresql://");
+      }
     }
     const max = options.maxConnections ?? 4;
     if (!Number.isSafeInteger(max) || max < 1 || max > 32) {
@@ -67,15 +81,20 @@ export class PostgresStateBackend implements DexCloudStateBackend {
     }
     const module = require("pg") as { Pool: PgPoolConstructor };
     this.#pool = new module.Pool({
-      connectionString: options.databaseUrl,
+      ...(options.databaseUrl === undefined
+        ? options.poolOptions
+        : { connectionString: options.databaseUrl }),
       max,
-      ...(options.ssl === undefined ? {} : { ssl: options.ssl }),
+      ...(options.databaseUrl === undefined || options.ssl === undefined
+        ? {}
+        : { ssl: options.ssl }),
     });
     this.#rowId = options.rowId ?? "default";
     if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(this.#rowId)) {
       throw new TypeError("Dex cloud state row ID is invalid");
     }
     this.#ready = this.#initialize();
+    void this.#ready.catch(() => undefined);
   }
 
   async #initialize(): Promise<void> {
@@ -104,6 +123,10 @@ export class PostgresStateBackend implements DexCloudStateBackend {
     const row = result.rows[0];
     if (!row) throw new Error("Dex cloud persistence state row is unavailable");
     return reader(parseDexCloudState(row.state));
+  }
+
+  async ready(): Promise<void> {
+    await this.read(() => undefined);
   }
 
   async mutate<T>(mutation: (state: DexCloudStateDocument) => T | Promise<T>): Promise<T> {
@@ -140,6 +163,66 @@ export class PostgresStateBackend implements DexCloudStateBackend {
   }
 }
 
+export interface CloudSqlPostgresStateBackendOptions {
+  instanceConnectionName: string;
+  database: string;
+  user: string;
+  ipType?: "PUBLIC" | "PRIVATE";
+  rowId?: string;
+  maxConnections?: number;
+}
+
+/** Cloud SQL durability using ADC and automatic IAM database authentication. */
+export class CloudSqlPostgresStateBackend implements DexCloudStateBackend {
+  readonly #connector = new Connector();
+  readonly #backend: Promise<PostgresStateBackend>;
+
+  constructor(options: CloudSqlPostgresStateBackendOptions) {
+    if (!options.instanceConnectionName || !options.database || !options.user) {
+      throw new TypeError("Cloud SQL instance, database, and IAM user are required");
+    }
+    this.#backend = this.#connect(options);
+    void this.#backend.catch(() => undefined);
+  }
+
+  async #connect(options: CloudSqlPostgresStateBackendOptions): Promise<PostgresStateBackend> {
+    const driver = await this.#connector.getOptions({
+      instanceConnectionName: options.instanceConnectionName,
+      authType: AuthTypes.IAM,
+      ipType: options.ipType === "PRIVATE" ? IpAddressTypes.PRIVATE : IpAddressTypes.PUBLIC,
+    });
+    return new PostgresStateBackend({
+      poolOptions: {
+        ...driver,
+        user: options.user,
+        database: options.database,
+      },
+      ...(options.rowId === undefined ? {} : { rowId: options.rowId }),
+      ...(options.maxConnections === undefined ? {} : { maxConnections: options.maxConnections }),
+    });
+  }
+
+  async read<T>(reader: (state: DexCloudStateDocument) => T | Promise<T>): Promise<T> {
+    return (await this.#backend).read(reader);
+  }
+
+  async ready(): Promise<void> {
+    await (await this.#backend).ready();
+  }
+
+  async mutate<T>(mutation: (state: DexCloudStateDocument) => T | Promise<T>): Promise<T> {
+    return (await this.#backend).mutate(mutation);
+  }
+
+  async close(): Promise<void> {
+    try {
+      await (await this.#backend).close();
+    } finally {
+      this.#connector.close();
+    }
+  }
+}
+
 export interface AtomicFileStateBackendOptions {
   filePath: string;
 }
@@ -159,6 +242,10 @@ export class AtomicFileStateBackend implements DexCloudStateBackend {
 
   read<T>(reader: (state: DexCloudStateDocument) => T | Promise<T>): Promise<T> {
     return this.#serialized(async () => reader(await this.#readState()));
+  }
+
+  async ready(): Promise<void> {
+    await this.read(() => undefined);
   }
 
   mutate<T>(mutation: (state: DexCloudStateDocument) => T | Promise<T>): Promise<T> {

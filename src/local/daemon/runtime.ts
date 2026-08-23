@@ -19,6 +19,8 @@ import { DexPairingService, MacOSDexKeychain } from "../pairing/index.js";
 import { simulatedBatteryReading } from "../power/battery.js";
 import { DexCloudBridge } from "./cloud-bridge.js";
 import { DexPowerController } from "./power-controller.js";
+import { releaseCodexAuthLease } from "../../setup/modal-auth.js";
+import path from "node:path";
 
 const MessagePayloadSchema = z.object({
   text: z.string().min(1).max(20_000),
@@ -60,6 +62,7 @@ export class DexDaemonRuntime {
   readonly #events: EventLog;
   readonly #battery: BatteryMonitor;
   readonly #power: DexPowerController;
+  readonly #codexAuthLeasePath: string;
   #stopped = false;
 
   constructor(options: {
@@ -70,6 +73,7 @@ export class DexDaemonRuntime {
     events: EventLog;
     battery: BatteryMonitor;
     power: DexPowerController;
+    codexAuthLeasePath: string;
   }) {
     this.#bridge = options.bridge;
     this.#router = options.router;
@@ -78,6 +82,7 @@ export class DexDaemonRuntime {
     this.#events = options.events;
     this.#battery = options.battery;
     this.#power = options.power;
+    this.#codexAuthLeasePath = options.codexAuthLeasePath;
   }
 
   async run(signal?: AbortSignal): Promise<void> {
@@ -178,6 +183,7 @@ export class DexDaemonRuntime {
           taskId: completion.taskId,
           payload: { status: completion.status, summary: completion.summary, source: "modal-monitor" },
         });
+        await releaseCodexAuthLease(this.#codexAuthLeasePath, completion.taskId);
       } else {
         throw new Error(`Unsupported Dex command: ${type}`);
       }
@@ -265,7 +271,7 @@ export async function createDaemonRuntime(options: DexDaemonRuntimeOptions): Pro
     events,
     tasks,
     handoffsRoot: options.paths.handoffs,
-    ...(process.env.OPENAI_API_KEY ? { openAiApiKey: process.env.OPENAI_API_KEY } : {}),
+    codexAuthLeasePath: path.join(options.paths.handoffs, ".codex-account-auth.lease"),
     taskKnowledge: (taskId) => memory.getTaskKnowledge(taskId),
     scheduleMonitor: async (registration: ModalMonitorRegistration) => {
       await bridge.publish({
@@ -326,6 +332,7 @@ export async function createDaemonRuntime(options: DexDaemonRuntimeOptions): Pro
     events,
     battery,
     power,
+    codexAuthLeasePath: path.join(options.paths.handoffs, ".codex-account-auth.lease"),
   });
 }
 

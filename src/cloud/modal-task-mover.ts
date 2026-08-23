@@ -12,6 +12,7 @@ import { workerId } from "../utils/ids.js";
 import { ModalAdapter } from "./modal/adapter.js";
 import { ModalStartupAcknowledgementSchema, type ModalStartupAcknowledgement } from "./modal/schemas.js";
 import type { TaskKnowledge } from "../memory/index.js";
+import { acquireCodexAuthLease, DEFAULT_MODAL_CODEX_AUTH_VOLUME, releaseCodexAuthLease } from "../setup/modal-auth.js";
 
 export interface ModalMonitorRegistration {
   taskId: string;
@@ -29,7 +30,8 @@ export interface ModalTaskMoverOptions {
   handoffsRoot: string;
   modal?: ModalAdapter;
   modalSecretName?: string;
-  openAiApiKey?: string;
+  codexAuthVolumeName?: string;
+  codexAuthLeasePath?: string;
   signingKey?: string;
   workerScriptPath?: string;
   taskKnowledge?(taskId: string): TaskKnowledge | Promise<TaskKnowledge>;
@@ -105,12 +107,10 @@ export class ModalTaskMover implements TaskMover {
     });
 
     const modal = this.#options.modal ?? new ModalAdapter();
-    const inlineWorkerSecrets = this.#options.openAiApiKey
-      ? {
-          OPENAI_API_KEY: this.#options.openAiApiKey,
-          DEX_HANDOFF_SIGNING_KEY: signingKey,
-        }
-      : undefined;
+    const codexAuthVolumeName = this.#options.codexAuthVolumeName
+      ?? process.env.DEX_MODAL_CODEX_AUTH_VOLUME ?? DEFAULT_MODAL_CODEX_AUTH_VOLUME;
+    const leasePath = this.#options.codexAuthLeasePath ?? path.join(this.#options.handoffsRoot, ".codex-account-auth.lease");
+    await acquireCodexAuthLease(leasePath, task.id);
     let sandbox: Awaited<ReturnType<ModalAdapter["create"]>> | undefined;
     try {
     sandbox = await modal.create({
@@ -120,15 +120,13 @@ export class ModalTaskMover implements TaskMover {
         "RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*",
         "RUN npm install --global @openai/codex@0.149.0",
       ],
-      ...(inlineWorkerSecrets
-        ? { secretValues: inlineWorkerSecrets }
-        : {
-            secretNames: [this.#options.modalSecretName ?? process.env.DEX_MODAL_SECRET_NAME ?? "dex-workers"],
-            requiredSecretKeys: ["OPENAI_API_KEY", "DEX_HANDOFF_SIGNING_KEY"],
-          }),
+      secretNames: [this.#options.modalSecretName ?? process.env.DEX_MODAL_SECRET_NAME ?? "dex-workers"],
+      requiredSecretKeys: ["DEX_HANDOFF_SIGNING_KEY"],
+      volumeNames: { "/codex-home": codexAuthVolumeName },
       params: {
         timeoutMs: 25 * 60_000,
         workdir: "/workspace",
+        env: { CODEX_HOME: "/codex-home" },
         command: ["/bin/sh", "-c", "while [ ! -f /dex/ready ]; do sleep 0.2; done; exec node /dex/cloud-worker.js"],
         tags: { product: "dex", task: task.id },
       },
@@ -200,6 +198,7 @@ export class ModalTaskMover implements TaskMover {
     await startedSandbox.detach();
     } catch (error) {
       await sandbox?.terminate().catch(() => undefined);
+      await releaseCodexAuthLease(leasePath, task.id).catch(() => undefined);
       throw error;
     } finally {
       await modal.close();

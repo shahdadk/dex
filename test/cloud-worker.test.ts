@@ -118,13 +118,17 @@ async function installFakeCodex(directory: string): Promise<string> {
     binaryPath,
     `#!/usr/bin/env node
 const fs = require("node:fs");
+if (process.argv[2] === "login" && process.argv[3] === "status") {
+  process.stdout.write("Logged in using ChatGPT\\n");
+  process.exit(0);
+}
 let prompt = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => { prompt += chunk; });
 process.stdin.on("end", () => {
   fs.writeFileSync(process.env.FAKE_CODEX_PROMPT_PATH, prompt, "utf8");
   fs.writeFileSync(process.env.FAKE_CODEX_ENV_PATH, JSON.stringify({
-    openAiApiKey: process.env.OPENAI_API_KEY,
+    codexHome: process.env.CODEX_HOME,
     handoffSigningKey: process.env.DEX_HANDOFF_SIGNING_KEY,
     modalToken: process.env.MODAL_TOKEN_SECRET,
   }), "utf8");
@@ -141,6 +145,9 @@ process.stdin.on("end", () => {
 
 async function runWorker(fixture: WorkerFixture) {
   const binaryDirectory = await installFakeCodex(fixture.directory);
+  const codexHome = path.join(fixture.directory, "codex-home");
+  await mkdir(codexHome, { mode: 0o700 });
+  await writeFile(path.join(codexHome, "auth.json"), JSON.stringify({ auth_mode: "chatgpt", tokens: {} }), { mode: 0o600 });
   return execFile(process.execPath, ["--import", "tsx", CLOUD_WORKER], {
     cwd: REPOSITORY_ROOT,
     env: {
@@ -150,7 +157,7 @@ async function runWorker(fixture: WorkerFixture) {
       DEX_CLOUD_PROJECT: fixture.projectPath,
       DEX_HANDOFF_SIGNING_KEY: SIGNING_KEY,
       MODAL_TOKEN_SECRET: "modal-test-secret",
-      OPENAI_API_KEY: "openai-test-key",
+      CODEX_HOME: codexHome,
       FAKE_CODEX_PROMPT_PATH: fixture.promptPath,
       FAKE_CODEX_ENV_PATH: fixture.environmentPath,
     },
@@ -210,7 +217,7 @@ describe("Modal cloud worker", () => {
 
     const execution = await runWorker(fixture);
 
-    expect(execution).toMatchObject({ exitCode: 0 });
+    expect(execution, execution.stderr).toMatchObject({ exitCode: 0 });
     const startup = JSON.parse(
       await readFile(path.join(fixture.cloudRoot, "startup.json"), "utf8"),
     ) as Record<string, unknown>;
@@ -228,7 +235,7 @@ describe("Modal cloud worker", () => {
     expect(prompt).toContain("Durable continuation fact 1");
     expect(prompt).toContain("DO NOT REPEAT: Poll the provider directly");
     expect(JSON.parse(await readFile(fixture.environmentPath, "utf8"))).toEqual({
-      openAiApiKey: "openai-test-key",
+      codexHome: path.join(fixture.directory, "codex-home"),
     });
     expect(JSON.parse(await readFile(path.join(fixture.cloudRoot, "result.json"), "utf8"))).toMatchObject({
       status: "succeeded",

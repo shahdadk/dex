@@ -2,12 +2,14 @@ import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
 import {
   DexControlPlaneService,
+  MonitorJobOutbox,
   createDexControlPlaneFetchHandler,
   createDexControlPlaneServer,
 } from "../control-plane/index.js";
 import { ModalAdapter } from "../modal/index.js";
 import {
   AtomicFileStateBackend,
+  CloudSqlPostgresStateBackend,
   DurableDexCloudRepository,
   DurableModalMonitorOnce,
   PostgresStateBackend,
@@ -21,6 +23,12 @@ import {
 } from "../providers/index.js";
 import { ConfiguredAssociationVerifier } from "./association.js";
 import type { DexCloudConfig } from "./config.js";
+import {
+  CloudTasksModalMonitor,
+  CloudTasksMonitorDispatcher,
+  CloudTasksRequestAuthenticator,
+  type CloudTasksMonitorBody,
+} from "./cloud-tasks.js";
 import {
   DeterministicMonitorRunner,
   type MonitorDrainResult,
@@ -49,6 +57,7 @@ export class DexCloudRuntime {
   readonly server: Server;
   readonly fetchHandler: (request: Request) => Promise<Response>;
   readonly #monitorRunner: DeterministicMonitorRunner;
+  readonly #cloudTasksOutbox: MonitorJobOutbox | undefined = undefined;
   readonly #sendblueDispatcher: SendblueOutboxDispatcher;
   readonly #onBackgroundError: (error: unknown) => void;
   #timer: ReturnType<typeof setInterval> | undefined;
@@ -73,9 +82,6 @@ export class DexCloudRuntime {
       internalSecret: options.config.internalSecret,
       now,
     });
-    this.fetchHandler = createDexControlPlaneFetchHandler({ service: this.service });
-    this.server = createDexControlPlaneServer({ service: this.service });
-
     const once = new DurableModalMonitorOnce({
       backend: this.backend,
       workerId: options.config.workerId,
@@ -88,6 +94,41 @@ export class DexCloudRuntime {
       now,
       onTerminal: this.service.modalTerminalHandler(),
     });
+    let monitorTask: {
+      verify(headers: Headers, body: unknown): Promise<CloudTasksMonitorBody>;
+      run(body: unknown): Promise<unknown>;
+    } | undefined;
+    if (options.config.cloudTasks !== undefined) {
+      const dispatcher = new CloudTasksMonitorDispatcher(options.config.cloudTasks);
+      const authenticator = new CloudTasksRequestAuthenticator(options.config.cloudTasks);
+      const cloudMonitor = new CloudTasksModalMonitor({
+        modal: this.modal,
+        once,
+        dispatcher,
+        onTerminal: this.service.modalTerminalHandler(),
+        now,
+      });
+      this.#cloudTasksOutbox = new MonitorJobOutbox({
+        repository: this.repository,
+        dispatcher,
+        now,
+      });
+      monitorTask = {
+        verify: (headers, body) => authenticator.verify(headers, body),
+        run: (body) => cloudMonitor.run((body as CloudTasksMonitorBody).request),
+      };
+    }
+    const readiness = (): Promise<void> => this.backend.ready();
+    const handlerOptions = {
+      service: this.service,
+      readiness,
+      ...(monitorTask === undefined ? {} : {
+        monitorTask,
+        onMonitorRegistered: async () => { await this.#cloudTasksOutbox!.dispatchPending(); },
+      }),
+    };
+    this.fetchHandler = createDexControlPlaneFetchHandler(handlerOptions);
+    this.server = createDexControlPlaneServer(handlerOptions);
     const sendblueClient = new SendblueClient({
       apiKeyId: options.config.sendblue.apiKeyId,
       apiSecretKey: options.config.sendblue.apiSecretKey,
@@ -116,7 +157,19 @@ export class DexCloudRuntime {
     const operation = this.#cycleTail.then(async () => {
       // Monitoring only observes Modal state and validates result artifacts; it
       // never invokes a model. Terminal effects enqueue through the repository.
-      const monitors = await this.#monitorRunner.drain(monitorLimit);
+      let monitors: MonitorDrainResult;
+      if (this.#cloudTasksOutbox === undefined) {
+        monitors = await this.#monitorRunner.drain(monitorLimit);
+      } else {
+        const dispatched = await this.#cloudTasksOutbox.dispatchPending(monitorLimit);
+        monitors = {
+          initialAttempted: dispatched.attempted,
+          initialCompleted: dispatched.dispatched,
+          scheduledAttempted: 0,
+          scheduledCompleted: 0,
+          outcomes: [],
+        };
+      }
       const sendblue: SendblueDispatchResult[] = [];
       for (let index = 0; index < sendblueLimit; index += 1) {
         const result = await this.#sendblueDispatcher.dispatchNext();
@@ -160,6 +213,10 @@ export class DexCloudRuntime {
     const tick = (): void => {
       void this.runCycle().catch(this.#onBackgroundError);
     };
+    if (this.config.cloudTasks !== undefined) {
+      tick();
+      return;
+    }
     this.#timer = setInterval(tick, this.config.pollIntervalMs);
     this.#timer.unref?.();
     tick();
@@ -184,12 +241,21 @@ export class DexCloudRuntime {
 }
 
 export function createStateBackend(config: DexCloudConfig): DexCloudStateBackend {
-  return config.persistence.kind === "postgres"
-    ? new PostgresStateBackend({
+  if (config.persistence.kind === "postgres") {
+    return new PostgresStateBackend({
         databaseUrl: config.persistence.databaseUrl,
         ...(config.persistence.ssl === undefined ? {} : { ssl: config.persistence.ssl }),
-      })
-    : new AtomicFileStateBackend({ filePath: config.persistence.filePath });
+      });
+  }
+  if (config.persistence.kind === "cloud-sql") {
+    return new CloudSqlPostgresStateBackend({
+      instanceConnectionName: config.persistence.instanceConnectionName,
+      database: config.persistence.database,
+      user: config.persistence.user,
+      ipType: config.persistence.ipType,
+    });
+  }
+  return new AtomicFileStateBackend({ filePath: config.persistence.filePath });
 }
 
 export function createDexCloudRuntime(options: DexCloudRuntimeOptions): DexCloudRuntime {

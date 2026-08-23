@@ -83,7 +83,7 @@ afterEach(() => {
 
 describe("CodexAgentAdapter", () => {
   it("passes only the Codex credential and strips unrelated daemon secrets", async () => {
-    vi.stubEnv("OPENAI_API_KEY", "openai-test-key");
+    vi.stubEnv("CODEX_API_KEY", "codex-test-key");
     vi.stubEnv("GEMINI_API_KEY", "gemini-test-key");
     vi.stubEnv("MODAL_TOKEN_SECRET", "modal-test-secret");
     vi.stubEnv("DEX_HANDOFF_SIGNING_KEY", "handoff-test-key");
@@ -96,7 +96,7 @@ describe("CodexAgentAdapter", () => {
     process.finish(0);
     await handle.result;
 
-    expect(calls[0]?.options.env.OPENAI_API_KEY).toBe("openai-test-key");
+    expect(calls[0]?.options.env.CODEX_API_KEY).toBe("codex-test-key");
     expect(calls[0]?.options.env.GEMINI_API_KEY).toBeUndefined();
     expect(calls[0]?.options.env.MODAL_TOKEN_SECRET).toBeUndefined();
     expect(calls[0]?.options.env.DEX_HANDOFF_SIGNING_KEY).toBeUndefined();

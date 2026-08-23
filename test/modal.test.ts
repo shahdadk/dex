@@ -164,17 +164,48 @@ describe("ModalAdapter", () => {
 
     await modal.create({
       secretValues: {
-        OPENAI_API_KEY: "test-openai-key",
+        MODEL_CREDENTIAL: "test-model-credential",
         DEX_HANDOFF_SIGNING_KEY: "test-handoff-key",
       },
     });
 
     expect(observed).toEqual([
-      { keys: ["DEX_HANDOFF_SIGNING_KEY", "OPENAI_API_KEY"] },
+      { keys: ["DEX_HANDOFF_SIGNING_KEY", "MODEL_CREDENTIAL"] },
       { keys: [], secretCount: 1 },
     ]);
-    expect(JSON.stringify(observed)).not.toContain("test-openai-key");
+    expect(JSON.stringify(observed)).not.toContain("test-model-credential");
     expect(JSON.stringify(observed)).not.toContain("test-handoff-key");
+  });
+
+  it("mounts a named persistent Volume without creating it implicitly", async () => {
+    const rawSandbox = sandbox(null);
+    const observed: Array<Record<string, unknown>> = [];
+    const volume = { volumeId: "vo-auth" };
+    const client: ModalClientLike = {
+      apps: { fromName: async () => ({ appId: "ap-1" }) },
+      images: { fromRegistry: () => ({}) },
+      sandboxes: {
+        create: async (_app, _image, params) => {
+          observed.push({ mounted: params?.volumes });
+          return rawSandbox;
+        },
+        fromId: async () => rawSandbox,
+      },
+      volumes: {
+        fromName: async (name, params) => {
+          observed.push({ name, createIfMissing: params?.createIfMissing });
+          return volume;
+        },
+      },
+    };
+    const modal = new ModalAdapter({ client });
+
+    await modal.create({ volumeNames: { "/codex-home": "dex-codex-auth" } });
+
+    expect(observed).toEqual([
+      { name: "dex-codex-auth", createIfMissing: false },
+      { mounted: { "/codex-home": volume } },
+    ]);
   });
 });
 

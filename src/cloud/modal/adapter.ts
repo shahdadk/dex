@@ -27,6 +27,8 @@ export interface ModalFilesystemLike {
 
 export interface ModalSecretLike {}
 
+export interface ModalVolumeLike {}
+
 export type ModalSandboxCreateParams = Record<string, unknown>;
 export type ModalSandboxExecParams = Record<string, unknown>;
 
@@ -70,6 +72,12 @@ export interface ModalClientLike {
       params?: { environment?: string },
     ): Promise<ModalSecretLike>;
   };
+  readonly volumes?: {
+    fromName(
+      name: string,
+      params?: { environment?: string; createIfMissing?: boolean },
+    ): Promise<ModalVolumeLike>;
+  };
   close?(): void;
 }
 
@@ -98,6 +106,9 @@ export interface CreateModalSandboxOptions {
   /** Ephemeral Modal secret values sent directly to the worker, never written into handoff files. */
   secretValues?: Record<string, string>;
   requiredSecretKeys?: string[];
+  /** Named Modal Volumes keyed by their absolute Sandbox mount path. */
+  volumeNames?: Record<string, string>;
+  createVolumesIfMissing?: boolean;
   params?: ModalSandboxCreateParams;
 }
 
@@ -282,6 +293,21 @@ export class ModalAdapter {
         ...(options.environment === undefined ? {} : { environment: options.environment }),
       })];
     }
+    const namedVolumes: Record<string, ModalVolumeLike> = {};
+    if (options.volumeNames && Object.keys(options.volumeNames).length > 0) {
+      if (!client.volumes) {
+        throw new TypeError("The installed Modal SDK cannot mount named Volumes");
+      }
+      for (const [mountPath, name] of Object.entries(options.volumeNames)) {
+        if (!mountPath.startsWith("/") || !name.trim()) {
+          throw new TypeError("Modal Volume mounts require an absolute path and non-empty name");
+        }
+        namedVolumes[mountPath] = await client.volumes.fromName(name, {
+          ...(options.environment === undefined ? {} : { environment: options.environment }),
+          createIfMissing: options.createVolumesIfMissing ?? false,
+        });
+      }
+    }
     const params = {
       ...(options.params ?? {}),
       ...(namedSecrets.length + inlineSecrets.length > 0
@@ -291,6 +317,14 @@ export class ModalAdapter {
               ...namedSecrets,
               ...inlineSecrets,
             ],
+          }
+        : {}),
+      ...(Object.keys(namedVolumes).length > 0
+        ? {
+            volumes: {
+              ...(((options.params?.volumes as Record<string, ModalVolumeLike> | undefined) ?? {})),
+              ...namedVolumes,
+            },
           }
         : {}),
     };

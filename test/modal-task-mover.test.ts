@@ -201,6 +201,12 @@ function createModalHarness(
         return {};
       },
     },
+    volumes: {
+      fromName: async (name, options) => {
+        calls.push(`volume:${name}:${String(options?.createIfMissing)}`);
+        return {};
+      },
+    },
     close: () => {
       calls.push("close");
     },

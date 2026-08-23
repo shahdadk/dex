@@ -6,7 +6,6 @@ const RuntimeSecretsSchema = z.object({
   GEMINI_API_KEY: z.string().min(1).optional(),
   MODAL_TOKEN_ID: z.string().min(1).optional(),
   MODAL_TOKEN_SECRET: z.string().min(1).optional(),
-  OPENAI_API_KEY: z.string().min(1).optional(),
   DEX_HANDOFF_SIGNING_KEY: z.string().min(1).optional(),
 }).strict();
 
@@ -58,7 +57,6 @@ export async function persistRuntimeSecrets(): Promise<void> {
     ...(process.env.GEMINI_API_KEY ? { GEMINI_API_KEY: process.env.GEMINI_API_KEY } : {}),
     ...(process.env.MODAL_TOKEN_ID ? { MODAL_TOKEN_ID: process.env.MODAL_TOKEN_ID } : {}),
     ...(process.env.MODAL_TOKEN_SECRET ? { MODAL_TOKEN_SECRET: process.env.MODAL_TOKEN_SECRET } : {}),
-    ...(process.env.OPENAI_API_KEY ? { OPENAI_API_KEY: process.env.OPENAI_API_KEY } : {}),
     ...(process.env.DEX_HANDOFF_SIGNING_KEY ? { DEX_HANDOFF_SIGNING_KEY: process.env.DEX_HANDOFF_SIGNING_KEY } : {}),
   };
   await new MacOSDexRuntimeSecrets().save(values);

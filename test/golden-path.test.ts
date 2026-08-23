@@ -264,6 +264,7 @@ function modalBoundary(): ModalBoundary {
       fromId: async () => sandbox,
     },
     secrets: { fromName: async () => ({}) },
+    volumes: { fromName: async () => ({}) },
     close: () => {
       calls.push("close");
     },

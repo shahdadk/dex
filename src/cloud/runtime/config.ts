@@ -24,6 +24,13 @@ export interface DexCloudConfig {
   environment: "production" | "development" | "test";
   persistence:
     | { kind: "postgres"; databaseUrl: string; ssl?: boolean | { rejectUnauthorized: boolean } }
+    | {
+        kind: "cloud-sql";
+        instanceConnectionName: string;
+        database: string;
+        user: string;
+        ipType: "PUBLIC" | "PRIVATE";
+      }
     | { kind: "file"; filePath: string };
   signingKey: DexDeviceKeyPair;
   ownerAssociations: ConfiguredOwnerAssociation[];
@@ -39,6 +46,14 @@ export interface DexCloudConfig {
   port: number;
   workerId: string;
   pollIntervalMs: number;
+  cloudTasks?: {
+    project: string;
+    location: string;
+    queue: string;
+    serviceUrl: string;
+    audience: string;
+    serviceAccountEmail: string;
+  };
 }
 
 function required(env: NodeJS.ProcessEnv, name: string, minimum = 1): string {
@@ -138,6 +153,10 @@ function persistence(
   environment: DexCloudConfig["environment"],
 ): DexCloudConfig["persistence"] {
   const databaseUrl = env.DEX_DATABASE_URL;
+  const cloudSqlInstance = env.DEX_CLOUD_SQL_INSTANCE;
+  if (databaseUrl && cloudSqlInstance) {
+    throw new TypeError("Set only one of DEX_DATABASE_URL or DEX_CLOUD_SQL_INSTANCE");
+  }
   if (databaseUrl) {
     const sslMode = env.DEX_DATABASE_SSL_MODE ?? "disable";
     if (!(["disable", "require", "verify-full"] as const).includes(
@@ -153,8 +172,23 @@ function persistence(
         : { ssl: sslMode === "verify-full" ? true : { rejectUnauthorized: false } }),
     };
   }
+  if (cloudSqlInstance) {
+    const ipType = env.DEX_CLOUD_SQL_IP_TYPE ?? "PUBLIC";
+    if (ipType !== "PUBLIC" && ipType !== "PRIVATE") {
+      throw new TypeError("DEX_CLOUD_SQL_IP_TYPE must be PUBLIC or PRIVATE");
+    }
+    return {
+      kind: "cloud-sql",
+      instanceConnectionName: required(env, "DEX_CLOUD_SQL_INSTANCE"),
+      database: required(env, "DEX_CLOUD_SQL_DATABASE"),
+      user: required(env, "DEX_CLOUD_SQL_IAM_USER"),
+      ipType,
+    };
+  }
   if (environment === "production") {
-    throw new TypeError("DEX_DATABASE_URL is required in production");
+    throw new TypeError(
+      "DEX_DATABASE_URL or DEX_CLOUD_SQL_INSTANCE is required in production",
+    );
   }
   return {
     kind: "file",
@@ -186,6 +220,35 @@ export async function loadDexCloudConfig(
   if (!host || /[\u0000\r\n]/.test(host)) throw new TypeError("DEX_CLOUD_HOST is invalid");
   const workerId = env.DEX_CLOUD_WORKER_ID ?? `dex-cloud-${process.pid}`;
   if (!IdentifierSchema.safeParse(workerId).success) throw new TypeError("DEX_CLOUD_WORKER_ID is invalid");
+  const cloudTasksProject = env.DEX_CLOUD_TASKS_PROJECT;
+  const cloudTaskNames = [
+    "DEX_CLOUD_TASKS_PROJECT", "DEX_CLOUD_TASKS_LOCATION", "DEX_CLOUD_TASKS_QUEUE",
+    "DEX_CLOUD_TASKS_SERVICE_URL", "DEX_CLOUD_TASKS_AUDIENCE",
+    "DEX_CLOUD_TASKS_SERVICE_ACCOUNT",
+  ];
+  if (cloudTasksProject === undefined && cloudTaskNames.some((name) => env[name] !== undefined)) {
+    throw new TypeError("DEX_CLOUD_TASKS_PROJECT is required when Cloud Tasks is configured");
+  }
+  let cloudTasks: DexCloudConfig["cloudTasks"];
+  if (cloudTasksProject !== undefined) {
+    const serviceUrl = required(env, "DEX_CLOUD_TASKS_SERVICE_URL");
+    const audience = required(env, "DEX_CLOUD_TASKS_AUDIENCE");
+    for (const [name, value] of [
+      ["DEX_CLOUD_TASKS_SERVICE_URL", serviceUrl],
+      ["DEX_CLOUD_TASKS_AUDIENCE", audience],
+    ] as const) {
+      const url = new URL(value);
+      if (url.protocol !== "https:" || url.username || url.password) throw new TypeError(`${name} must be an HTTPS URL`);
+    }
+    cloudTasks = {
+      project: required(env, "DEX_CLOUD_TASKS_PROJECT"),
+      location: required(env, "DEX_CLOUD_TASKS_LOCATION"),
+      queue: required(env, "DEX_CLOUD_TASKS_QUEUE"),
+      serviceUrl,
+      audience,
+      serviceAccountEmail: required(env, "DEX_CLOUD_TASKS_SERVICE_ACCOUNT"),
+    };
+  }
   return {
     environment,
     persistence: persistence(env, environment),
@@ -203,5 +266,6 @@ export async function loadDexCloudConfig(
     port: integer(env, "DEX_CLOUD_PORT", 8080, 1, 65_535),
     workerId,
     pollIntervalMs: integer(env, "DEX_CLOUD_POLL_INTERVAL_MS", 1_000, 250, 60_000),
+    ...(cloudTasks === undefined ? {} : { cloudTasks }),
   };
 }

@@ -236,6 +236,10 @@ describe("setup command", () => {
       hydrateRuntimeSecrets: vi.fn(),
       persistRuntimeSecrets,
     }));
+    vi.doMock("../src/setup/modal-auth.js", () => ({
+      DEFAULT_MODAL_CODEX_AUTH_VOLUME: "dex-codex-auth",
+      seedModalCodexAuth: vi.fn(async () => ({ volumeName: "dex-codex-auth" })),
+    }));
 
     vi.stubEnv("DEX_HANDOFF_SIGNING_KEY", "handoff-signing-key");
     vi.stubEnv("GEMINI_API_KEY", "gemini-key");

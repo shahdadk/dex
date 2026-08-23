@@ -818,8 +818,31 @@ describe("bounded HTTP surface", () => {
     expect(health.status).toBe(200);
     expect(await health.json()).toEqual({ status: "ok" });
 
+    const live = await handler(new Request("https://cloud.dex.test/livez"));
+    expect(live.status).toBe(200);
+    expect(await live.json()).toEqual({ status: "ok" });
+
+    const ready = await handler(new Request("https://cloud.dex.test/readyz"));
+    expect(ready.status).toBe(200);
+    expect(await ready.json()).toEqual({ status: "ok" });
+
     const server = createDexControlPlaneServer({ service: state.service });
     expect(server.listening).toBe(false);
+  });
+
+  it("keeps liveness up while readiness and health report persistence failure", async () => {
+    const state = fixture();
+    const handler = createDexControlPlaneFetchHandler({
+      service: state.service,
+      readiness: async () => { throw new Error("database unavailable"); },
+    });
+
+    for (const path of ["/readyz", "/healthz"]) {
+      const response = await handler(new Request(`https://cloud.dex.test${path}`));
+      expect(response.status).toBe(503);
+      expect(await response.json()).toEqual({ status: "unavailable" });
+    }
+    expect((await handler(new Request("https://cloud.dex.test/livez"))).status).toBe(200);
   });
 
   it("returns safe errors without echoing configured secrets", async () => {
