@@ -132,7 +132,6 @@ export class DexDaemonRuntime {
     try {
       if (type === "message.received") {
         const message = MessagePayloadSchema.parse(payload);
-        const checkoutDemo = /^\s*(?:dex[:,]?\s*)?fix checkout with codex[.!]?\s*$/i.test(message.text);
         const messageId = message.messageId ?? command.id;
         if (!(await this.#claimMessage(messageId, command.id))) {
           await this.#bridge.receipt(command.id, "duplicate");
@@ -143,27 +142,12 @@ export class DexDaemonRuntime {
           type: "message.received",
           payload: { conversationId: message.conversationId, messageId, text: message.text },
         });
-        if (checkoutDemo) {
-          await this.#bridge.notify(message.conversationId, "on it.");
-          await this.#bridge.notify(
-            message.conversationId,
-            "i'm starting a fresh codex session for checkout right now.",
-          );
-        }
         const route = await this.#router.route(message.text);
         const reply = await this.#orchestrator.handle(route.actions, {
           conversationId: message.conversationId,
           messageId,
         });
-        if (reply && !checkoutDemo) await this.#bridge.notify(message.conversationId, reply);
-        if (checkoutDemo) {
-          await this.#battery.handleBatteryReading(simulatedBatteryReading({
-            batteryPercent: 8,
-            charging: false,
-            powerSource: "battery",
-            remainingMinutes: null,
-          }));
-        }
+        if (reply) await this.#bridge.notify(message.conversationId, reply);
       } else if (type === "demo.battery") {
         const { percent } = BatteryPayloadSchema.parse(payload);
         await this.#battery.handleBatteryReading(simulatedBatteryReading({
