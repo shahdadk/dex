@@ -96,6 +96,9 @@ export class DexDaemonRuntime {
           const commands = await this.#bridge.syncOnce(25_000);
           for (const command of commands) await this.handleCommand(command);
           await this.#power.maybeSleepWhenReady();
+          // The cloud endpoint may return before the requested long-poll
+          // window when no command is queued. Avoid a hot network loop.
+          if (commands.length === 0) await delay(1_000, signal);
           backoffMs = 1_000;
         } catch (error) {
           if (signal?.aborted || this.#stopped) break;

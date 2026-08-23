@@ -131,7 +131,7 @@ async function dexCloudCheck(config: DexConfig): Promise<DoctorCheck> {
     };
   }
   try {
-    const health = new URL("/healthz", config.cloudUrl);
+    const health = new URL("/readyz", config.cloudUrl);
     const response = await fetch(health, { signal: AbortSignal.timeout(2_000) });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     return {
