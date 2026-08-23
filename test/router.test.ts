@@ -12,6 +12,13 @@ describe("MessageRouter", () => {
     });
   });
 
+  it("recognizes memory questions with a typographic apostrophe", async () => {
+    await expect(router.route("didn’t we hit this webhook issue before?")).resolves.toEqual({
+      actions: [{ type: "MEMORY_QUERY", query: "didn't we hit this webhook issue before?" }],
+      source: "deterministic",
+    });
+  });
+
   it("creates multiple independent tasks", async () => {
     const result = await router.route("fix signup, investigate checkout, add dark mode");
     expect(result.actions).toHaveLength(3);
@@ -24,6 +31,21 @@ describe("MessageRouter", () => {
       expect.objectContaining({ type: "CREATE_TASK", preferredAgent: "codex", description: "fix auth" }),
       expect.objectContaining({ type: "CREATE_TASK", preferredAgent: "claude", description: "investigate checkout" }),
     ]);
+  });
+
+  it("does not let Gemini reinterpret explicit agent assignments", async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+      candidates: [{ content: { parts: [{ text: JSON.stringify([
+        { type: "CREATE_TASK", description: "wrong model task" },
+      ]) }] } }],
+    }), { status: 200, headers: { "content-type": "application/json" } })) as unknown as typeof fetch;
+    const explicitRouter = new MessageRouter({ gemini: new GeminiRouter({ apiKey: "secret-key", fetchImpl }) });
+
+    await expect(explicitRouter.route("have claude investigate checkout")).resolves.toEqual({
+      actions: [{ type: "CREATE_TASK", description: "investigate checkout", preferredAgent: "claude" }],
+      source: "deterministic",
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it("routes cloud movement and sleep as typed actions", async () => {

@@ -21,7 +21,7 @@ const ALLOWED: Record<TaskStatus, ReadonlySet<TaskStatus>> = {
   waiting_user: new Set(["running", "cancelled", "failed"]),
   checkpointing: new Set(["handoff", "running", "failed", "cancelled"]),
   handoff: new Set(["running", "failed", "cancelled"]),
-  completed: new Set(),
+  completed: new Set(["checkpointing"]),
   failed: new Set(["preparing", "cancelled"]),
   cancelled: new Set(["preparing"]),
 };
