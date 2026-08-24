@@ -9,6 +9,7 @@ const MAX_RESPONSE_BYTES = 512 * 1024;
 const MAX_IDENTIFIER_LENGTH = 512;
 const MAX_TIMEOUT_MS = 120_000;
 const MAX_RECONCILIATION_PAGES = 100;
+const MAX_RETRY_AFTER_MS = 60 * 60_000;
 const E164_PATTERN = /^\+[1-9]\d{6,14}$/;
 
 const ProviderStatusSchema = z.enum([
@@ -96,6 +97,7 @@ interface ProviderErrorOptions {
   httpStatus?: number;
   retryable: boolean;
   ambiguous: boolean;
+  retryAfterMs?: number;
 }
 
 /**
@@ -108,6 +110,7 @@ export class SendblueProviderError extends Error {
   readonly httpStatus: number | undefined;
   readonly retryable: boolean;
   readonly ambiguous: boolean;
+  readonly retryAfterMs: number | undefined;
 
   constructor(options: ProviderErrorOptions) {
     super(options.message);
@@ -117,6 +120,7 @@ export class SendblueProviderError extends Error {
     this.httpStatus = options.httpStatus;
     this.retryable = options.retryable;
     this.ambiguous = options.ambiguous;
+    this.retryAfterMs = options.retryAfterMs;
   }
 }
 
@@ -185,6 +189,7 @@ interface RawProviderResponse {
   ok: boolean;
   status: number;
   text: string;
+  retryAfterMs?: number;
 }
 
 class ResponseReadFailure extends Error {}
@@ -232,7 +237,7 @@ function ambiguousFailure(
   });
 }
 
-function rejectedFailure(status: number): SendblueProviderError {
+function rejectedFailure(status: number, retryAfterMs?: number): SendblueProviderError {
   return new SendblueProviderError({
     code: "request_rejected",
     operation: "send",
@@ -240,10 +245,11 @@ function rejectedFailure(status: number): SendblueProviderError {
     httpStatus: status,
     retryable: status === 429,
     ambiguous: false,
+    ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
   });
 }
 
-function reconcileHttpFailure(status: number): SendblueProviderError {
+function reconcileHttpFailure(status: number, retryAfter?: number): SendblueProviderError {
   return new SendblueProviderError({
     code: "request_rejected",
     operation: "reconcile",
@@ -251,7 +257,19 @@ function reconcileHttpFailure(status: number): SendblueProviderError {
     httpStatus: status,
     retryable: status >= 500 || status === 429,
     ambiguous: false,
+    ...(retryAfter === undefined ? {} : { retryAfterMs: retryAfter }),
   });
+}
+
+function retryAfterMs(value: string | null): number | undefined {
+  if (value === null) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(MAX_RETRY_AFTER_MS, Math.ceil(seconds * 1_000));
+  }
+  const date = Date.parse(value);
+  if (!Number.isFinite(date)) return undefined;
+  return Math.min(MAX_RETRY_AFTER_MS, Math.max(0, date - Date.now()));
 }
 
 function validateCallbackUrl(value: string): boolean {
@@ -412,7 +430,7 @@ export class SendblueClient {
       if (response.status >= 500) {
         throw ambiguousFailure("server_uncertain", response.status);
       }
-      throw rejectedFailure(response.status);
+      throw rejectedFailure(response.status, response.retryAfterMs);
     }
 
     let parsed: z.infer<typeof SendResponseSchema>;
@@ -458,7 +476,7 @@ export class SendblueClient {
       url.searchParams.set("created_at_lte", input.windowEnd);
 
       const response = await this.#request("reconcile", url, { method: "GET" });
-      if (!response.ok) throw reconcileHttpFailure(response.status);
+      if (!response.ok) throw reconcileHttpFailure(response.status, response.retryAfterMs);
 
       let parsed: z.infer<typeof MessageListResponseSchema>;
       try {
@@ -549,7 +567,13 @@ export class SendblueClient {
       });
       if (!response.ok) {
         void response.body?.cancel().catch(() => undefined);
-        return { ok: false, status: response.status, text: "" };
+        const retry = retryAfterMs(response.headers.get("retry-after"));
+        return {
+          ok: false,
+          status: response.status,
+          text: "",
+          ...(retry === undefined ? {} : { retryAfterMs: retry }),
+        };
       }
       return {
         ok: true,
@@ -584,6 +608,8 @@ export interface SendblueOutboxClaim {
   item: SendblueOutboxItem;
   action: "send" | "reconcile";
   attemptStartedAt: string;
+  sendAttempt?: number;
+  reconciliationAttempt?: number;
 }
 
 export interface SendblueOutboxClaimInput {
@@ -616,6 +642,7 @@ export interface SendblueRejectedSettlement {
   reason: SendblueProviderErrorCode;
   httpStatus?: number;
   retryable: boolean;
+  retryAfterMs?: number;
 }
 
 export interface SendblueReconciliationPendingSettlement {
@@ -625,6 +652,7 @@ export interface SendblueReconciliationPendingSettlement {
   reason: "not_found" | "multiple_matches" | "lookup_failed";
   errorCode?: SendblueProviderErrorCode;
   candidateHandles?: readonly string[];
+  retryAfterMs?: number;
 }
 
 /**
@@ -655,6 +683,8 @@ export interface SendblueOutboxDispatcherOptions {
   claimLeaseMs?: number;
   reconciliationLookbackMs?: number;
   reconciliationLookaheadMs?: number;
+  maxSendAttempts?: number;
+  maxReconciliationAttempts?: number;
 }
 
 export type SendblueDispatchResult =
@@ -671,6 +701,12 @@ export type SendblueDispatchResult =
     outboxId: string;
     reason: SendblueProviderErrorCode;
     httpStatus?: number;
+  }
+  | {
+    kind: "retry_scheduled";
+    outboxId: string;
+    reason: SendblueProviderErrorCode;
+    retryAfterMs?: number;
   }
   | {
     kind: "reconciliation_pending";
@@ -697,11 +733,15 @@ export class SendblueOutboxDispatcher {
   readonly #claimLeaseMs: number;
   readonly #reconciliationLookbackMs: number;
   readonly #reconciliationLookaheadMs: number;
+  readonly #maxSendAttempts: number;
+  readonly #maxReconciliationAttempts: number;
 
   constructor(options: SendblueOutboxDispatcherOptions) {
     const claimLeaseMs = options.claimLeaseMs ?? 30_000;
     const lookbackMs = options.reconciliationLookbackMs ?? 30_000;
     const lookaheadMs = options.reconciliationLookaheadMs ?? 5 * 60_000;
+    const maxSendAttempts = options.maxSendAttempts ?? 5;
+    const maxReconciliationAttempts = options.maxReconciliationAttempts ?? 30;
     if (
       !isE164(options.fromNumber) ||
       options.workerId.trim().length === 0 ||
@@ -711,6 +751,9 @@ export class SendblueOutboxDispatcher {
       !positiveDuration(lookbackMs, SENDBLUE_MAX_RECONCILIATION_WINDOW_MS) ||
       !positiveDuration(lookaheadMs, SENDBLUE_MAX_RECONCILIATION_WINDOW_MS) ||
       lookbackMs + lookaheadMs > SENDBLUE_MAX_RECONCILIATION_WINDOW_MS
+      || !Number.isSafeInteger(maxSendAttempts) || maxSendAttempts < 1 || maxSendAttempts > 100
+      || !Number.isSafeInteger(maxReconciliationAttempts) ||
+        maxReconciliationAttempts < 1 || maxReconciliationAttempts > 1_000
     ) {
       throw new TypeError("Invalid Sendblue dispatcher configuration");
     }
@@ -723,6 +766,8 @@ export class SendblueOutboxDispatcher {
     this.#claimLeaseMs = claimLeaseMs;
     this.#reconciliationLookbackMs = lookbackMs;
     this.#reconciliationLookaheadMs = lookaheadMs;
+    this.#maxSendAttempts = maxSendAttempts;
+    this.#maxReconciliationAttempts = maxReconciliationAttempts;
   }
 
   async dispatchNext(): Promise<SendblueDispatchResult> {
@@ -784,15 +829,26 @@ export class SendblueOutboxDispatcher {
         });
         return { kind: "ambiguous", outboxId: claim.item.id, reason: error.code };
       }
+      const retryable = error.retryable &&
+        (claim.sendAttempt ?? 1) < this.#maxSendAttempts;
       const settlement: SendblueRejectedSettlement = {
         outboxId: claim.item.id,
         claimToken: claim.claimToken,
         rejectedAt: isoTimestamp(this.#now()),
         reason: error.code,
-        retryable: error.retryable,
+        retryable,
         ...(error.httpStatus === undefined ? {} : { httpStatus: error.httpStatus }),
+        ...(error.retryAfterMs === undefined ? {} : { retryAfterMs: error.retryAfterMs }),
       };
       await this.#store.recordRejected(settlement);
+      if (retryable) {
+        return {
+          kind: "retry_scheduled",
+          outboxId: claim.item.id,
+          reason: error.code,
+          ...(error.retryAfterMs === undefined ? {} : { retryAfterMs: error.retryAfterMs }),
+        };
+      }
       return {
         kind: "rejected",
         outboxId: claim.item.id,
@@ -817,12 +873,30 @@ export class SendblueOutboxDispatcher {
       });
     } catch (error) {
       if (!(error instanceof SendblueProviderError)) throw error;
+      if (!error.retryable ||
+        (claim.reconciliationAttempt ?? 1) >= this.#maxReconciliationAttempts) {
+        await this.#store.recordRejected({
+          outboxId: claim.item.id,
+          claimToken: claim.claimToken,
+          rejectedAt: isoTimestamp(this.#now()),
+          reason: error.code,
+          retryable: false,
+          ...(error.httpStatus === undefined ? {} : { httpStatus: error.httpStatus }),
+        });
+        return {
+          kind: "rejected",
+          outboxId: claim.item.id,
+          reason: error.code,
+          ...(error.httpStatus === undefined ? {} : { httpStatus: error.httpStatus }),
+        };
+      }
       await this.#store.recordReconciliationPending({
         outboxId: claim.item.id,
         claimToken: claim.claimToken,
         checkedAt: isoTimestamp(this.#now()),
         reason: "lookup_failed",
         errorCode: error.code,
+        ...(error.retryAfterMs === undefined ? {} : { retryAfterMs: error.retryAfterMs }),
       });
       return {
         kind: "reconciliation_pending",
@@ -845,6 +919,21 @@ export class SendblueOutboxDispatcher {
         outboxId: claim.item.id,
         providerHandle: result.message.messageHandle,
         reconciled: true,
+      };
+    }
+
+    if ((claim.reconciliationAttempt ?? 1) >= this.#maxReconciliationAttempts) {
+      await this.#store.recordRejected({
+        outboxId: claim.item.id,
+        claimToken: claim.claimToken,
+        rejectedAt: isoTimestamp(this.#now()),
+        reason: "reconciliation_too_broad",
+        retryable: false,
+      });
+      return {
+        kind: "rejected",
+        outboxId: claim.item.id,
+        reason: "reconciliation_too_broad",
       };
     }
 

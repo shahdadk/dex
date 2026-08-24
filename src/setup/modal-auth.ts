@@ -40,6 +40,12 @@ export interface SeedModalCodexAuthOptions {
   volumeName?: string;
   runner?: Runner;
   modal?: ModalAdapter;
+  report?(result: SeedModalCodexAuthResult): void;
+}
+
+export interface SeedModalCodexAuthResult {
+  volumeName: string;
+  disposition: "seeded" | "reused";
 }
 
 export async function validateLocalCodexAuth(authPath = path.join(os.homedir(), ".codex", "auth.json")): Promise<void> {
@@ -80,7 +86,7 @@ export async function validateLocalCodexAuth(authPath = path.join(os.homedir(), 
 }
 
 /** Seeds auth directly from the user's home directory only when absent; no credential enters the repository. */
-export async function seedModalCodexAuth(options: SeedModalCodexAuthOptions = {}): Promise<{ volumeName: string }> {
+export async function seedModalCodexAuth(options: SeedModalCodexAuthOptions = {}): Promise<SeedModalCodexAuthResult> {
   const authPath = options.authPath ?? path.join(os.homedir(), ".codex", "auth.json");
   const volumeName = ModalVolumeNameSchema.parse(
     options.volumeName ?? process.env.DEX_MODAL_CODEX_AUTH_VOLUME ?? DEFAULT_MODAL_CODEX_AUTH_VOLUME,
@@ -142,8 +148,26 @@ export async function seedModalCodexAuth(options: SeedModalCodexAuthOptions = {}
       "if (process.env.OPENAI_API_KEY || process.env.CODEX_API_KEY) process.exit(1)",
     ], { env: accountEnvironment });
     if (await keyCheck.wait() !== 0) throw new Error("Modal Codex account verification exposed an API key");
+    const modeCheck = await sandbox.exec([
+      "node",
+      "-e",
+      [
+        "const fs = require('node:fs');",
+        "let auth;",
+        "try { auth = JSON.parse(fs.readFileSync(process.argv[1], 'utf8')); } catch { process.exit(1); }",
+        "const tokens = auth && auth.tokens;",
+        "if (auth.auth_mode !== 'chatgpt' || !tokens ||",
+        "    typeof tokens.access_token !== 'string' || !tokens.access_token ||",
+        "    typeof tokens.refresh_token !== 'string' || !tokens.refresh_token ||",
+        "    typeof tokens.id_token !== 'string' || !tokens.id_token) process.exit(1);",
+      ].join(" "),
+      path.join(MODAL_CODEX_HOME, "auth.json"),
+    ], { env: accountEnvironment });
+    if (await modeCheck.wait() !== 0) {
+      throw new Error("Modal Codex auth cache is not a ChatGPT account login");
+    }
     const status = await sandbox.exec(["codex", "login", "status"], { env: accountEnvironment });
-    if (await status.wait() !== 0) throw new Error("Codex did not accept the seeded ChatGPT account login");
+    if (await status.wait() !== 0) throw new Error("Codex did not accept the Modal ChatGPT account login");
   } finally {
     try {
       await sandbox?.terminate({ wait: true });
@@ -151,7 +175,14 @@ export async function seedModalCodexAuth(options: SeedModalCodexAuthOptions = {}
       await modal.close();
     }
   }
-  return { volumeName };
+  const result = { volumeName } as SeedModalCodexAuthResult;
+  // Keep the legacy enumerable shape ({ volumeName }) while exposing an idempotency report to callers.
+  Object.defineProperty(result, "disposition", {
+    value: hasRemoteAuth ? "reused" : "seeded",
+    enumerable: false,
+  });
+  options.report?.(result);
+  return result;
 }
 
 export async function acquireCodexAuthLease(leasePath: string, taskId: string): Promise<void> {

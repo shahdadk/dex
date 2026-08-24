@@ -335,12 +335,17 @@ describe("ModalMonitor", () => {
     })).resolves.toMatchObject({
       kind: "terminal",
       callbackInvoked: true,
-      event: { status: "succeeded", reason: "result", exitCode: 0 },
+      event: {
+        status: "succeeded",
+        reason: "result",
+        exitCode: 0,
+        sandboxRetentionExpiresAt: new Date(STARTED_AT_MS + 20_000 + 5 * 60_000).toISOString(),
+      },
     });
 
     expect(callbacks).toHaveLength(1);
-    expect(calls).toContain("terminate");
-    expect(calls).not.toContain("detach");
+    expect(calls).toContain("detach");
+    expect(calls).not.toContain("terminate");
   });
 
   it("keeps a readable result alive when durable terminal delivery fails", async () => {
@@ -373,7 +378,8 @@ describe("ModalMonitor", () => {
       event: { status: "succeeded", reason: "result" },
     });
     expect(attempts).toBe(2);
-    expect(calls).toContain("terminate");
+    expect(calls).toContain("detach");
+    expect(calls).not.toContain("terminate");
   });
 
   it("fails closed on invalid results and enforces the 25 minute deadline", async () => {

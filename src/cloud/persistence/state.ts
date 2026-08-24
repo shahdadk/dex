@@ -1,4 +1,5 @@
 import type {
+  CloudTaskCompletionRecord,
   DeviceCommandOutboxRecord,
   DeviceSyncCommitInput,
   ModalMonitorRegistration,
@@ -44,6 +45,8 @@ export type ControlPlaneOperation =
       summary: string;
       message: SendblueOutboxRecord;
       now: string;
+      command?: DeviceCommandOutboxRecord;
+      completion?: CloudTaskCompletionRecord;
     }
   | {
       kind: "commit_device_sync";
@@ -63,13 +66,15 @@ export interface SendblueDeliveryState {
   outboxId: string;
   attemptStartedAt: string;
   claimCount: number;
+  sendAttempts?: number;
+  reconciliationAttempts?: number;
   claimTokens: string[];
   claimToken?: string;
   claimedBy?: string;
   claimedAt?: string;
   claimExpiresAt?: string;
   nextAttemptAt?: string;
-  state: "claimed" | "ambiguous" | "reconciling" | "delivered" | "rejected";
+  state: "claimed" | "ambiguous" | "reconciling" | "retrying" | "delivered" | "rejected";
   providerHandle?: string;
   providerStatus?: SendblueProviderStatus;
   resolvedAt?: string;

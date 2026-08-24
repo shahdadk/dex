@@ -6,6 +6,7 @@ import { DexStateStore } from "./state/store.js";
 import { createDaemonRuntime } from "./local/daemon/runtime.js";
 import { startControlSocket } from "./local/daemon/control-socket.js";
 import { hydrateRuntimeSecrets } from "./local/pairing/secrets.js";
+import type { DexState } from "./state/schemas.js";
 
 export interface DaemonOptions {
   signal?: AbortSignal;
@@ -26,25 +27,22 @@ export async function runDaemon(options: DaemonOptions = {}): Promise<void> {
     const config = await loadConfig(paths);
     const store = new DexStateStore(paths.state);
     await store.updateState((state) => {
-    if (config.deviceId) {
-      state.machine = {
-        id: config.deviceId,
-        hostname: config.deviceName ?? hostname(),
-        sleepPreventionActive: state.machine?.sleepPreventionActive ?? false,
-        aggressiveLidModeActive: false,
-        batteryAlertThresholds: state.machine?.batteryAlertThresholds ?? [],
-        updatedAt: new Date().toISOString(),
-      };
-    }
-    for (const worker of Object.values(state.workers)) {
-      if (worker.target.kind === "local" && (worker.status === "starting" || worker.status === "running")) {
-        worker.status = "stopped";
-        worker.endedAt = new Date().toISOString();
-        worker.lastMessage = "daemon restarted; task remains durable";
+      if (config.deviceId) {
+        state.machine = {
+          id: config.deviceId,
+          hostname: config.deviceName ?? hostname(),
+          // A new daemon owns no prior caffeinate process. Durable intent is
+          // re-established by DexPowerController.reconcileStartup().
+          sleepPreventionActive: false,
+          aggressiveLidModeActive: false,
+          batteryAlertThresholds: state.machine?.batteryAlertThresholds ?? [],
+          updatedAt: new Date().toISOString(),
+        };
       }
-    }
+      markInterruptedLocalWorkers(state);
     });
     runtime = await createDaemonRuntime({ paths, config, store, signal: controller.signal });
+    await runtime.recoverInterruptedTasks();
     const activeRuntime = runtime;
     control = await startControlSocket(paths.controlSocket, async (command) => {
       if (command.type === "demo.battery") await activeRuntime.injectDemoBattery(command.percent);
@@ -58,4 +56,26 @@ export async function runDaemon(options: DaemonOptions = {}): Promise<void> {
     await control?.close().catch(() => undefined);
     await lock.release();
   }
+}
+
+export function markInterruptedLocalWorkers(state: DexState, now = new Date().toISOString()): string[] {
+  const interruptedTaskIds = new Set<string>();
+  for (const worker of Object.values(state.workers)) {
+    if (worker.target.kind !== "local" || (worker.status !== "starting" && worker.status !== "running")) continue;
+    worker.status = "stopped";
+    worker.endedAt = now;
+    worker.lastMessage = "daemon restarted; task remains durable";
+    interruptedTaskIds.add(worker.taskId);
+  }
+  for (const taskId of interruptedTaskIds) {
+    const task = state.tasks[taskId];
+    if (!task || ["completed", "failed", "cancelled"].includes(task.status)) continue;
+    task.status = "failed";
+    task.stage = "failed";
+    task.blockedReason = "local worker was interrupted when the Dex daemon restarted";
+    task.latestSummary = "recovering the interrupted local worker from durable context";
+    task.metadata.interruptedByDaemonRestart = true;
+    task.updatedAt = now;
+  }
+  return [...interruptedTaskIds];
 }

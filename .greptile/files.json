@@ -1,0 +1,8 @@
+{
+  "files": [
+    {
+      "path": "docs/architecture.md",
+      "description": "Authoritative Dex architecture, trust boundaries, lifecycle gates, idempotency requirements, and prohibited autonomous behavior."
+    }
+  ]
+}

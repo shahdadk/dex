@@ -53,6 +53,15 @@ const Demo = () => {
         <span style={{ width: 12, height: 12, borderRadius: 99, background: "#34c759" }} />
         DEX · LIVE
       </div>
+      {frame >= 500 && frame < 830 ? (
+        <div style={{
+          position: "absolute", left: 110, top: 150, padding: "9px 14px", borderRadius: 999,
+          border: "1px solid rgba(255,255,255,.16)", background: "rgba(255,255,255,.06)",
+          color: "#aeb5c2", font: "600 15px ui-monospace, SFMono-Regular, Menlo, monospace", letterSpacing: 0.8,
+        }}>
+          CONTROLLED SENSOR INPUT · PRODUCTION POLICY PATH
+        </div>
+      ) : null}
       {statements.map(([from, to, first, second]) => <Statement key={first} from={from} to={to} first={first} second={second} />)}
       <div style={{ position: "absolute", left: 112, bottom: 86, font: "500 19px ui-monospace, SFMono-Regular, Menlo, monospace", color: "#8f96a5", letterSpacing: 1 }}>
         iMESSAGE → CODEX / LOCAL → CODEX / MODAL
@@ -78,6 +87,9 @@ const Continuity = () => {
   return (
     <AbsoluteFill style={{ background: "#080a0f", color: "white", fontFamily: "Inter, Geist, SF Pro Display, Helvetica Neue, Arial, sans-serif" }}>
       <div style={{ position: "absolute", left: 110, top: 85, fontSize: 25, fontWeight: 680 }}>DEX · CONTINUITY</div>
+      <div style={{ position: "absolute", right: 110, top: 88, font: "600 18px ui-monospace, SFMono-Regular, Menlo, monospace", color: "#8f96a5", letterSpacing: 0.8 }}>
+        CLAUDE-MEM → CODEX / MODAL
+      </div>
       <div style={{ position: "absolute", left: 110, top: 325, opacity: enter, transform: `translateY(${20 * (1 - enter)}px)` }}>
         <div style={{ fontSize: 84, lineHeight: 1.02, letterSpacing: -4.5, fontWeight: 720 }}>The session changed.</div>
         <div style={{ fontSize: 84, lineHeight: 1.02, letterSpacing: -4.5, fontWeight: 720, color: BLUE, marginTop: 8 }}>The task didn’t.</div>

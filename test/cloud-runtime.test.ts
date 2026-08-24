@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { generateDexDeviceKeyPair } from "../src/cloud/messaging/index.js";
 import type { ModalAdapter, ModalSandbox } from "../src/cloud/modal/index.js";
+import { ModalMonitorLeaseBusyError } from "../src/cloud/modal-monitor/index.js";
 import {
   AtomicFileStateBackend,
   CloudSqlPostgresStateBackend,
@@ -82,10 +83,25 @@ describe("Dex Cloud environment and verified ownership", () => {
     };
     await expect(loadDexCloudConfig(base)).rejects.toThrow("DEX_DATABASE_URL");
 
+    await expect(loadDexCloudConfig({
+      ...base,
+      DEX_DATABASE_URL: "postgresql://dex:password@db.example.test/dex",
+    })).rejects.toThrow("Cloud Tasks configuration is required");
+
+    const cloudTasksEnv = {
+      DEX_CLOUD_TASKS_PROJECT: "dex-project",
+      DEX_CLOUD_TASKS_LOCATION: "northamerica-northeast1",
+      DEX_CLOUD_TASKS_QUEUE: "modal-monitors",
+      DEX_CLOUD_TASKS_SERVICE_URL: "https://dex.example.test",
+      DEX_CLOUD_TASKS_AUDIENCE: "https://dex.example.test",
+      DEX_CLOUD_TASKS_SERVICE_ACCOUNT: "tasks@dex-project.iam.gserviceaccount.com",
+    };
+
     const loaded = await loadDexCloudConfig({
       ...base,
       DEX_DATABASE_URL: "postgresql://dex:password@db.example.test/dex",
       DEX_DATABASE_SSL_MODE: "verify-full",
+      ...cloudTasksEnv,
     });
     expect(loaded.persistence).toMatchObject({ kind: "postgres", ssl: true });
     expect(loaded.signingKey).toMatchObject({
@@ -98,12 +114,7 @@ describe("Dex Cloud environment and verified ownership", () => {
     const withCloudTasks = await loadDexCloudConfig({
       ...base,
       DEX_DATABASE_URL: "postgresql://dex:password@db.example.test/dex",
-      DEX_CLOUD_TASKS_PROJECT: "dex-project",
-      DEX_CLOUD_TASKS_LOCATION: "northamerica-northeast1",
-      DEX_CLOUD_TASKS_QUEUE: "modal-monitors",
-      DEX_CLOUD_TASKS_SERVICE_URL: "https://dex.example.test",
-      DEX_CLOUD_TASKS_AUDIENCE: "https://dex.example.test",
-      DEX_CLOUD_TASKS_SERVICE_ACCOUNT: "tasks@dex-project.iam.gserviceaccount.com",
+      ...cloudTasksEnv,
     });
     expect(withCloudTasks.cloudTasks).toEqual({
       project: "dex-project",
@@ -134,6 +145,7 @@ describe("Dex Cloud environment and verified ownership", () => {
       DEX_CLOUD_SQL_INSTANCE: "appfi-dev-80693:northamerica-northeast1:ai-employee-pg",
       DEX_CLOUD_SQL_DATABASE: "ai_employee",
       DEX_CLOUD_SQL_IAM_USER: "dex-cloud@appfi-dev-80693.iam",
+      ...cloudTasksEnv,
     });
     expect(cloudSql.persistence).toEqual({
       kind: "cloud-sql",
@@ -315,6 +327,90 @@ describe("durable outbox and monitor execution", () => {
     await secondBackend.close();
   });
 
+  it("retries a definitive 429 as a new bounded send attempt", async () => {
+    const backend = new AtomicFileStateBackend({ filePath: await stateFile() });
+    const repository = new DurableDexCloudRepository({
+      backend,
+      sendblueRetryMs: 1_000,
+    });
+    await repository.commitUnpairedMessage("rate-limited-inbound", {
+      id: "rate-limited-outbox",
+      dedupeKey: "sendblue:rate-limited-inbound",
+      ownerId: "owner-1",
+      conversationId: "conversation-1",
+      toPhone: PHONE,
+      text: "Retry this confirmed non-delivery.",
+      createdAt: NOW_ISO,
+    });
+    const first = await repository.claimNext({
+      workerId: "worker-a",
+      claimedAt: NOW_ISO,
+      leaseMs: 1_000,
+    });
+    expect(first).toMatchObject({ action: "send", sendAttempt: 1 });
+    await repository.recordRejected({
+      outboxId: "rate-limited-outbox",
+      claimToken: first!.claimToken,
+      rejectedAt: NOW_ISO,
+      reason: "request_rejected",
+      httpStatus: 429,
+      retryable: true,
+      retryAfterMs: 2_000,
+    });
+    await expect(repository.claimNext({
+      workerId: "worker-b",
+      claimedAt: "2026-08-23T18:00:01.999Z",
+      leaseMs: 1_000,
+    })).resolves.toBeNull();
+    await expect(repository.claimNext({
+      workerId: "worker-b",
+      claimedAt: "2026-08-23T18:00:02.000Z",
+      leaseMs: 1_000,
+    })).resolves.toMatchObject({
+      action: "send",
+      sendAttempt: 2,
+      attemptStartedAt: "2026-08-23T18:00:02.000Z",
+    });
+    await backend.close();
+  });
+
+  it("does not acknowledge a duplicate while another durable monitor effect owns the lease", async () => {
+    const backend = new AtomicFileStateBackend({ filePath: await stateFile() });
+    let release!: () => void;
+    let started!: () => void;
+    const effectStarted = new Promise<void>((resolve) => { started = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const first = new DurableModalMonitorOnce({
+      backend,
+      workerId: "monitor-a",
+      now: () => NOW,
+      leaseMs: 10_000,
+    });
+    const duplicate = new DurableModalMonitorOnce({
+      backend,
+      workerId: "monitor-b",
+      now: () => NOW + 1_000,
+      leaseMs: 10_000,
+    });
+    const execution = first.runOnce("modal-monitor:task-1:terminal", async () => {
+      started();
+      await gate;
+    });
+    await effectStarted;
+
+    await expect(duplicate.runOnce(
+      "modal-monitor:task-1:terminal",
+      async () => undefined,
+    )).rejects.toBeInstanceOf(ModalMonitorLeaseBusyError);
+    release();
+    await expect(execution).resolves.toBe(true);
+    await expect(duplicate.runOnce(
+      "modal-monitor:task-1:terminal",
+      async () => undefined,
+    )).resolves.toBe(false);
+    await backend.close();
+  });
+
   it("executes due monitor jobs in stable order and durably schedules deterministic retries", async () => {
     const backend = new AtomicFileStateBackend({ filePath: await stateFile() });
     const repository = new DurableDexCloudRepository({ backend });
@@ -447,7 +543,7 @@ describe("runnable cloud composition", () => {
     await expect(backend.ready()).rejects.toThrow("backend is closed");
   });
 
-  it("drains outboxes from requests without a timer when Cloud Tasks owns monitoring", async () => {
+  it("keeps Sendblue retries live while Cloud Tasks owns Modal monitoring", async () => {
     const calls: string[] = [];
     const sendblueFetch = vi.fn(async (input: string | URL | Request) => {
       calls.push(String(input));
@@ -485,7 +581,7 @@ describe("runnable cloud composition", () => {
     const interval = vi.spyOn(globalThis, "setInterval");
 
     runtime.startBackgroundWork();
-    expect(interval).not.toHaveBeenCalled();
+    expect(interval).toHaveBeenCalledWith(expect.any(Function), cloudConfig.pollIntervalMs);
     await runtime.runCycle();
 
     const webhook = await runtime.fetchHandler(new Request(

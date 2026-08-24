@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import os from "node:os";
 import type { EventLog } from "../state/events.js";
 import type { DexStateStore } from "../state/store.js";
@@ -5,13 +6,24 @@ import type { BatteryReading } from "./power/battery.js";
 import { MacMachineController } from "./machine/mac-machine.js";
 
 const THRESHOLDS = [20, 10, 5] as const;
+const DEFAULT_PROMPT_TTL_MS = 15 * 60_000;
+const ACTIVE_TASK_STATUSES = new Set([
+  "preparing",
+  "running",
+  "waiting_user",
+  "checkpointing",
+  "handoff",
+]);
 
 export interface BatteryMonitorOptions {
   store: DexStateStore;
   events: EventLog;
   machine?: Pick<MacMachineController, "readBattery">;
   deviceId?: string;
+  conversationId?: string;
   pollMs?: number;
+  promptTtlMs?: number;
+  now?: () => Date;
   notify(text: string): Promise<void>;
 }
 
@@ -27,6 +39,13 @@ export class BatteryMonitor {
     let shouldAlert = false;
     let crossed: number | undefined;
     let activeTitles: string[] = [];
+    let activeTaskIds: string[] = [];
+    const now = this.#options.now?.() ?? new Date();
+    const nowIso = now.toISOString();
+    const promptTtlMs = this.#options.promptTtlMs ?? DEFAULT_PROMPT_TTL_MS;
+    if (!Number.isFinite(promptTtlMs) || promptTtlMs <= 0) {
+      throw new RangeError("promptTtlMs must be positive");
+    }
     await this.#options.store.updateState((state) => {
       const previous = state.machine;
       const alerts = reading.charging || reading.powerSource !== "battery"
@@ -40,21 +59,39 @@ export class BatteryMonitor {
         id: previous?.id ?? this.#options.deviceId ?? "local-mac",
         hostname: previous?.hostname ?? os.hostname(),
         batteryPercent: reading.batteryPercent,
+        batteryReadingSimulated: reading.simulated,
         charging: reading.charging,
         powerSource: reading.powerSource === "ac" ? "ac" : "battery",
         sleepPreventionActive: previous?.sleepPreventionActive ?? false,
         aggressiveLidModeActive: false,
         batteryAlertThresholds: alerts,
-        updatedAt: new Date().toISOString(),
+        updatedAt: nowIso,
       };
-      activeTitles = Object.values(state.tasks)
-        .filter((task) => ["preparing", "running", "waiting_user", "checkpointing", "handoff"].includes(task.status))
+      const activeLocalTasks = Object.values(state.tasks)
+        .filter((task) => ACTIVE_TASK_STATUSES.has(task.status))
         .filter((task) => {
           const worker = task.currentWorkerId ? state.workers[task.currentWorkerId] : undefined;
           return worker?.target.kind === "local";
-        })
-        .map((task) => task.title);
+        });
+      activeTitles = activeLocalTasks.map((task) => task.title);
+      activeTaskIds = activeLocalTasks.map((task) => task.id);
       shouldAlert = crossed !== undefined && activeTitles.length > 0;
+      state.pendingConversationPrompts = state.pendingConversationPrompts.filter(
+        (prompt) => Date.parse(prompt.expiresAt) > now.getTime(),
+      );
+      if (shouldAlert && this.#options.conversationId) {
+        state.pendingConversationPrompts = state.pendingConversationPrompts.filter(
+          (prompt) => !(prompt.type === "battery.low" && prompt.conversationId === this.#options.conversationId),
+        );
+        state.pendingConversationPrompts.push({
+          id: randomUUID(),
+          type: "battery.low",
+          conversationId: this.#options.conversationId,
+          taskIds: activeTaskIds,
+          createdAt: nowIso,
+          expiresAt: new Date(now.getTime() + promptTtlMs).toISOString(),
+        });
+      }
     });
     if (crossed !== undefined) {
       await this.#options.events.append({
@@ -72,7 +109,7 @@ export class BatteryMonitor {
     if (shouldAlert) {
       const taskText = activeTitles.length === 1 ? activeTitles[0] : `${activeTitles.length} tasks`;
       await this.#options.notify(
-        `your mac is at ${reading.batteryPercent}%${reading.simulated ? " (demo reading)" : ""}. ${taskText} ${activeTitles.length === 1 ? "is" : "are"} still running locally. want me to keep the mac awake or move the work to the cloud?`,
+        `your mac is at ${reading.batteryPercent}%${reading.simulated ? " (demo reading)" : ""}. ${taskText} ${activeTitles.length === 1 ? "is" : "are"} still running locally. move ${activeTitles.length === 1 ? "it" : "them"} to Codex in Modal? reply yes to move ${activeTitles.length === 1 ? "it" : "them"}, or no to leave ${activeTitles.length === 1 ? "it" : "them"} local.`,
       );
     }
     return shouldAlert;

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { DiscoveredSession } from "../src/agents/session-discovery.js";
 import { GeminiRouter, normalizeGeminiActions } from "../src/dex/gemini.js";
 import { MessageRouter } from "../src/dex/router.js";
 
@@ -8,6 +9,88 @@ describe("MessageRouter", () => {
   it("routes exact status without a model", async () => {
     await expect(router.route("status?")).resolves.toEqual({
       actions: [{ type: "STATUS" }],
+      source: "deterministic",
+    });
+  });
+
+  it("lists recent sessions without turning the request into a task", async () => {
+    await expect(router.route("what sessions do I have?")).resolves.toEqual({
+      actions: [{ type: "LIST_SESSIONS" }],
+      source: "deterministic",
+    });
+    await expect(router.route("show my recent Claude sessions")).resolves.toEqual({
+      actions: [{ type: "LIST_SESSIONS", provider: "claude" }],
+      source: "deterministic",
+    });
+  });
+
+  it("resolves a discovered session before emitting an adoption request", async () => {
+    const sessions: DiscoveredSession[] = [
+      {
+        provider: "claude",
+        sessionId: "claude-auth-new",
+        cwd: "/repo/auth",
+        updatedAt: "2026-08-23T13:00:00.000Z",
+        summary: "New auth work",
+        active: false,
+        sourcePath: "/transcripts/new.jsonl",
+      },
+      {
+        provider: "claude",
+        sessionId: "claude-auth-old",
+        cwd: "/repo/auth",
+        updatedAt: "2026-08-20T13:00:00.000Z",
+        summary: "Old auth work",
+        active: false,
+        sourcePath: "/transcripts/old.jsonl",
+      },
+    ];
+    const sessionDiscovery = vi.fn(async () => sessions);
+    const adoptionRouter = new MessageRouter({
+      gemini: new GeminiRouter({ apiKey: "" }),
+      sessionDiscovery,
+    });
+
+    await expect(adoptionRouter.route("continue that old auth session with claude")).resolves.toEqual({
+      actions: [{
+        type: "ADOPT_SESSION",
+        provider: "claude",
+        sessionId: "claude-auth-old",
+        cwd: "/repo/auth",
+        updatedAt: "2026-08-20T13:00:00.000Z",
+        summary: "Old auth work",
+        active: false,
+      }],
+      source: "deterministic",
+    });
+    expect(sessionDiscovery).toHaveBeenCalledWith("claude");
+  });
+
+  it("validates an explicit provider/session ID against discovery", async () => {
+    const sessionDiscovery = vi.fn(async () => [{
+      provider: "codex" as const,
+      sessionId: "codex-thread-9",
+      cwd: "/repo/checkout",
+      updatedAt: "2026-08-23T13:00:00.000Z",
+      active: false,
+      sourcePath: "/transcripts/codex.jsonl",
+    }]);
+    const adoptionRouter = new MessageRouter({
+      gemini: new GeminiRouter({ apiKey: "" }),
+      sessionDiscovery,
+    });
+
+    const result = await adoptionRouter.route("continue codex session codex-thread-9");
+    expect(result.actions).toEqual([expect.objectContaining({
+      type: "ADOPT_SESSION",
+      provider: "codex",
+      sessionId: "codex-thread-9",
+    })]);
+  });
+
+  it("preserves exact Dex task continuation routing", async () => {
+    await expect(router.route("continue checkout")).resolves.toEqual({
+      actions: [{ type: "RESUME_TASK", taskQuery: "checkout" }],
       source: "deterministic",
     });
   });
@@ -46,6 +129,13 @@ describe("MessageRouter", () => {
       source: "deterministic",
     });
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("changes the worker without creating a duplicate task", async () => {
+    await expect(router.route("use claude for checkout")).resolves.toEqual({
+      actions: [{ type: "CHANGE_AGENT", taskQuery: "checkout", agent: "claude" }],
+      source: "deterministic",
+    });
   });
 
   it("routes cloud movement and sleep as typed actions", async () => {

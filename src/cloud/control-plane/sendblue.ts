@@ -56,12 +56,12 @@ export function parseInboundMessage(text: string): ParsedInboundMessage {
   if (/^pair$/i.test(withoutAddress)) return { kind: "pair" };
   const pairing = /^pair\s+(\S+)$/i.exec(withoutAddress);
   if (pairing) {
-    const setupCode = pairing[1]!;
-    if (!/^[A-Z0-9_-]{16,128}$/.test(setupCode)) {
+    const setupCode = pairing[1]!.toUpperCase();
+    if (!/^[A-HJ-NP-Z2-9]{6}$/.test(setupCode)) {
       throw new ControlPlaneError(
         400,
         "invalid_pairing_code_format",
-        "Pairing setup code is not in the expected high-entropy format",
+        "Pairing setup code must be the six characters shown by dex setup",
       );
     }
     return { kind: "pair", setupCode };

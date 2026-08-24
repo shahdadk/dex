@@ -1,29 +1,47 @@
 import { DexActionsSchema, type DexAction, type RouteResult } from "./actions.js";
+import {
+  defaultSessionDiscovery,
+  parseSessionAdoptionIntent,
+  resolveSessionAdoption,
+  type SessionDiscoveryLoader,
+} from "../agents/session-adoption.js";
 import { GeminiRouter } from "./gemini.js";
 
 const STATUS = /^(?:dex[:,]?\s*)?(?:status\??|what(?:'s| is) (?:running|going on)|what are you working on)\s*$/i;
+const LIST_SESSIONS = /^(?:(?:what|which)\s+(?:(?:recent|old)\s+)?(?:(?:claude|codex)\s+)?sessions?\s+(?:do\s+)?(?:i|we)\s+have|(?:show|list)(?:\s+me)?\s+(?:my\s+)?(?:(?:recent|old)\s+)?(?:(?:claude|codex)\s+)?sessions?)\??$/i;
 const MEMORY = /^(?:dex[:,]?\s*)?(?:didn't we|did we|what did we|what happened with|do you remember)\b/i;
 const KEEP_AWAKE = /\bkeep (?:this|my|the)?\s*mac awake(?: until (?:everything|all tasks) (?:is|are) (?:done|finished))?/i;
 const SLEEP = /\bsleep (?:this|my|the)?\s*mac\b|\bwhen (?:everything|all tasks) (?:is|are) (?:done|finished),? sleep/i;
 const MOVE = /\bmove\s+(.+?)\s+to\s+(?:the\s+)?(cloud|local)(?:\s+and\s+use\s+(claude|codex))?/i;
 const CHANGE = /\b(?:give|have|use)\s+(?:the\s+)?(.+?)\s+(?:to|with|use)\s+(claude|codex)\b|\b(?:claude|codex)\s+(?:take over|handle)\s+(.+)/i;
+const CHANGE_AGENT_FIRST = /\b(?:use|switch to)\s+(claude|codex)\s+(?:for|on)\s+(.+)/i;
 const STOP = /^(?:dex[:,]?\s*)?(?:stop|cancel|pause)\s+(.+)$/i;
 const RESUME = /^(?:dex[:,]?\s*)?(?:resume|continue)\s+(.+)$/i;
 
 export interface MessageRouterOptions {
   gemini?: GeminiRouter;
+  sessionDiscovery?: SessionDiscoveryLoader;
 }
 
 export class MessageRouter {
   readonly #gemini: GeminiRouter;
+  readonly #sessionDiscovery: SessionDiscoveryLoader;
 
   constructor(options: MessageRouterOptions = {}) {
     this.#gemini = options.gemini ?? new GeminiRouter();
+    this.#sessionDiscovery = options.sessionDiscovery ?? defaultSessionDiscovery;
   }
 
   async route(rawMessage: string): Promise<RouteResult> {
     const message = rawMessage.trim().replace(/[‘’]/g, "'").replace(/^dex[:,]?\s*/i, "");
     if (!message) throw new Error("Dex received an empty message");
+
+    const adoptionIntent = parseSessionAdoptionIntent(message);
+    if (adoptionIntent) {
+      const sessions = await this.#sessionDiscovery(adoptionIntent.provider);
+      const action = resolveSessionAdoption(sessions, adoptionIntent);
+      return { actions: DexActionsSchema.parse([action]), source: "deterministic" };
+    }
 
     const exact = deterministicActions(message);
     if (exact.length > 0) return { actions: DexActionsSchema.parse(exact), source: "deterministic" };
@@ -36,7 +54,15 @@ export class MessageRouter {
     if (this.#gemini.available) {
       try {
         const actions = await this.#gemini.route(message, ambiguous ? "brain" : "fast");
-        return { actions, source: ambiguous ? "flash" : "flash-lite" };
+        const resolved = await Promise.all(actions.map(async (action) => {
+          if (action.type !== "ADOPT_SESSION") return action;
+          const sessions = await this.#sessionDiscovery(action.provider);
+          return resolveSessionAdoption(sessions, {
+            provider: action.provider,
+            sessionId: action.sessionId,
+          });
+        }));
+        return { actions: DexActionsSchema.parse(resolved), source: ambiguous ? "flash" : "flash-lite" };
       } catch {
         // A model outage must not prevent obvious engineering work from becoming a task.
       }
@@ -51,6 +77,10 @@ export class MessageRouter {
 
 export function deterministicActions(message: string): DexAction[] {
   if (STATUS.test(message)) return [{ type: "STATUS" }];
+  if (LIST_SESSIONS.test(message)) {
+    const provider = message.match(/\b(claude|codex)\b/i)?.[1]?.toLowerCase() as "claude" | "codex" | undefined;
+    return [{ type: "LIST_SESSIONS", ...(provider ? { provider } : {}) }];
+  }
   if (MEMORY.test(message)) return [{ type: "MEMORY_QUERY", query: message }];
 
   const actions: DexAction[] = [];
@@ -65,9 +95,10 @@ export function deterministicActions(message: string): DexAction[] {
   }
 
   const change = message.match(CHANGE);
-  if (change) {
-    const taskQuery = change[1] ?? change[3];
-    const explicitAgent = change[2] ?? message.match(/\b(claude|codex)\b/i)?.[1];
+  const agentFirstChange = message.match(CHANGE_AGENT_FIRST);
+  if (change || agentFirstChange) {
+    const taskQuery = agentFirstChange?.[2] ?? change?.[1] ?? change?.[3];
+    const explicitAgent = agentFirstChange?.[1] ?? change?.[2] ?? message.match(/\b(claude|codex)\b/i)?.[1];
     if (taskQuery && explicitAgent && !move) {
       actions.push({
         type: "CHANGE_AGENT",

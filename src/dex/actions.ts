@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { SessionAdoptionRequestSchema } from "../agents/session-adoption.js";
 import { AgentKindSchema } from "../state/schemas.js";
 
 const CreateTaskActionSchema = z.object({
@@ -8,9 +9,23 @@ const CreateTaskActionSchema = z.object({
   executionPreference: z.enum(["local", "cloud"]).optional(),
 });
 
+/**
+ * Orchestrator contract: discover normalized sessions, filter by provider, and
+ * return at most `limit` (10 when omitted). A user-facing listing may expose
+ * provider/sessionId/cwd/updatedAt/summary/active, but never sourcePath, PID,
+ * command, shell, or TTY data.
+ */
+export const ListSessionsActionSchema = z.object({
+  type: z.literal("LIST_SESSIONS"),
+  provider: AgentKindSchema.optional(),
+  limit: z.number().int().min(1).max(50).optional(),
+}).strict();
+
 export const DexActionSchema = z.discriminatedUnion("type", [
   CreateTaskActionSchema,
   z.object({ type: z.literal("STATUS"), taskQuery: z.string().min(1).optional() }),
+  ListSessionsActionSchema,
+  SessionAdoptionRequestSchema,
   z.object({ type: z.literal("MEMORY_QUERY"), query: z.string().min(1) }),
   z.object({
     type: z.literal("MOVE_TASK"),

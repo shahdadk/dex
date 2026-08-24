@@ -121,7 +121,7 @@ async function claudeMemCheck(): Promise<DoctorCheck> {
       };
 }
 
-async function dexCloudCheck(config: DexConfig): Promise<DoctorCheck> {
+export async function dexCloudCheck(config: DexConfig): Promise<DoctorCheck> {
   if (!config.cloudUrl || !config.deviceId || config.serverKeys.length === 0) {
     return {
       name: "Dex Cloud",
@@ -137,7 +137,7 @@ async function dexCloudCheck(config: DexConfig): Promise<DoctorCheck> {
     return {
       name: "Dex Cloud",
       status: "pass",
-      detail: `${config.deviceId} paired; cloud messaging survives host sleep`,
+      detail: `${config.deviceId} paired; cloud /readyz is reachable (host-sleep continuity is not verified)`,
     };
   } catch {
     return {

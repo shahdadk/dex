@@ -1,4 +1,5 @@
 import type {
+  CloudTaskCompletionRecord,
   CloudTaskRecord,
   DeviceCommandOutboxRecord,
   DeviceRecord,
@@ -59,10 +60,13 @@ export interface DurableTaskRepository {
     summary: string,
     message: SendblueOutboxRecord,
     now: string,
+    command?: DeviceCommandOutboxRecord,
+    completion?: CloudTaskCompletionRecord,
   ): Promise<{
     task: CloudTaskRecord;
     transitioned: boolean;
     enqueued: boolean;
+    commandEnqueued: boolean;
   }>;
 }
 
@@ -411,10 +415,13 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     summary: string,
     message: SendblueOutboxRecord,
     now: string,
+    command?: DeviceCommandOutboxRecord,
+    completion?: CloudTaskCompletionRecord,
   ): Promise<{
     task: CloudTaskRecord;
     transitioned: boolean;
     enqueued: boolean;
+    commandEnqueued: boolean;
   }> {
     return this.#locked(() => {
       const task = this.#tasks.get(taskId);
@@ -426,18 +433,26 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
         if (task.status !== status) {
           throw new RepositoryConflictError("Task already completed with another status");
         }
-        return { task: copy(task), transitioned: false, enqueued: false };
+        const enqueued = this.#enqueueSendblue(message);
+        const commandEnqueued = command === undefined
+          ? false
+          : this.#enqueueDeviceCommand(command);
+        return { task: copy(task), transitioned: false, enqueued, commandEnqueued };
       }
       const updated: CloudTaskRecord = {
         ...task,
         status,
         completionKey,
         summary,
+        ...(completion === undefined ? {} : { completion: copy(completion) }),
         updatedAt: now,
       };
       this.#tasks.set(taskId, updated);
       const enqueued = this.#enqueueSendblue(message);
-      return { task: copy(updated), transitioned: true, enqueued };
+      const commandEnqueued = command === undefined
+        ? false
+        : this.#enqueueDeviceCommand(command);
+      return { task: copy(updated), transitioned: true, enqueued, commandEnqueued };
     });
   }
 
@@ -483,7 +498,52 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
               "task.created does not match the paired conversation",
             );
           }
-          const existing = tasks.get(event.taskId);
+          let existing = tasks.get(event.taskId);
+          if (existing === undefined) {
+            const direct = payload.data.cloudTaskId === undefined
+              ? undefined
+              : tasks.get(payload.data.cloudTaskId);
+            const candidates = direct === undefined
+              ? [...tasks.values()].filter((candidate) =>
+                candidate.id !== event.taskId &&
+                candidate.origin === "cloud_ingress" &&
+                candidate.status === "queued" &&
+                candidate.monitor === undefined &&
+                candidate.ownerId === device.ownerId &&
+                candidate.conversationId === device.conversationId &&
+                candidate.phoneE164 === device.phoneE164 &&
+                candidate.request === payload.data.originalRequest &&
+                (payload.data.sourceMessageId === undefined ||
+                  candidate.sourceMessageId === payload.data.sourceMessageId))
+              : [direct];
+            if (payload.data.cloudTaskId !== undefined && direct === undefined) {
+              throw new InvalidTransportEventError(
+                event.id,
+                "task.created references an unknown cloud ingress task",
+              );
+            }
+            if (candidates.length === 1) {
+              const ingress = candidates[0]!;
+              if (
+                ingress.origin !== "cloud_ingress" ||
+                ingress.ownerId !== device.ownerId ||
+                ingress.conversationId !== device.conversationId ||
+                ingress.phoneE164 !== device.phoneE164 ||
+                ingress.request !== payload.data.originalRequest
+              ) {
+                throw new InvalidTransportEventError(
+                  event.id,
+                  "task.created cloud ingress identity conflicts with the paired owner",
+                );
+              }
+              tasks.delete(ingress.id);
+              existing = {
+                ...ingress,
+                id: event.taskId,
+                cloudIngressTaskId: ingress.id,
+              };
+            }
+          }
           if (
             existing !== undefined &&
             (existing.ownerId !== device.ownerId ||
@@ -505,6 +565,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
               status: "queued" as const,
               createdAt: event.occurredAt,
             }),
+            origin: "device",
             title: payload.data.title,
             request: payload.data.originalRequest,
             updatedAt: event.occurredAt,
@@ -689,6 +750,14 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     if (this.#sendblueDedupe.has(message.dedupeKey)) return false;
     this.#sendblueDedupe.set(message.dedupeKey, message.id);
     this.#sendblueOutbox.set(message.id, copy(message));
+    return true;
+  }
+
+  #enqueueDeviceCommand(command: DeviceCommandOutboxRecord): boolean {
+    if ([...this.#deviceCommands.values()].some(
+      (record) => record.dedupeKey === command.dedupeKey,
+    )) return false;
+    this.#deviceCommands.set(command.id, copy(command));
     return true;
   }
 }

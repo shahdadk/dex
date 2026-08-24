@@ -5,7 +5,7 @@ import type {
   VerifiedConversationAssociation,
 } from "./models.js";
 
-const SETUP_CODE_PATTERN = /^[A-Z0-9_-]{16,128}$/;
+const SETUP_CODE_PATTERN = /^[A-HJ-NP-Z2-9]{6}$/;
 
 export interface SetupCodePairingChallengeOptions {
   /** Server-side pepper; never persisted with challenge rows. */

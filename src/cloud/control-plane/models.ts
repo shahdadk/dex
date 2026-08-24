@@ -122,9 +122,28 @@ export interface CloudTaskRecord {
   status: CloudTaskStatus;
   createdAt: string;
   updatedAt: string;
+  origin?: "cloud_ingress" | "device";
+  cloudIngressTaskId?: string;
   monitor?: ModalMonitorRegistration;
   completionKey?: string;
   summary?: string;
+  completion?: CloudTaskCompletionRecord;
+}
+
+export interface CloudTaskCompletionRecord {
+  sandboxId: string;
+  resultPath: string;
+  handoffSha256: string;
+  status: "succeeded" | "failed" | "cancelled";
+  reason: "result" | "nonzero_exit" | "invalid_result" | "deadline_exceeded";
+  exitCode: number | null;
+  completedAt: string;
+  sandboxRetentionExpiresAt?: string;
+  result?: z.infer<typeof ModalResultArtifactSchema>;
+  bundle?: {
+    path: string;
+    sha256?: string;
+  };
 }
 
 export interface DeviceCommandOutboxRecord {
@@ -163,6 +182,8 @@ export const TaskCreatedTransportPayloadSchema = z.object({
   originalRequest: z.string().trim().min(1).max(20_000),
   conversationId: IdentifierSchema,
   projectId: IdentifierSchema.optional(),
+  cloudTaskId: IdentifierSchema.optional(),
+  sourceMessageId: IdentifierSchema.optional(),
 }).passthrough();
 
 export const MessageSentTransportPayloadSchema = z.object({
@@ -180,6 +201,7 @@ export const ModalTerminalInputSchema = z.object({
   reason: z.enum(["result", "nonzero_exit", "invalid_result", "deadline_exceeded"]),
   exitCode: z.number().int().nullable(),
   result: ModalResultArtifactSchema.optional(),
+  sandboxRetentionExpiresAt: TimestampSchema.optional(),
   error: z.string().max(2_000).optional(),
 }).strict();
 export type ModalTerminalInput = z.infer<typeof ModalTerminalInputSchema>;

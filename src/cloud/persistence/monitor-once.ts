@@ -1,5 +1,8 @@
 import { sha256Hex } from "../messaging/index.js";
-import type { ModalMonitorOnce } from "../modal-monitor/index.js";
+import {
+  ModalMonitorLeaseBusyError,
+  type ModalMonitorOnce,
+} from "../modal-monitor/index.js";
 import type { DexCloudStateBackend } from "./backend.js";
 
 export interface DurableModalMonitorOnceOptions {
@@ -36,22 +39,30 @@ export class DurableModalMonitorOnce implements ModalMonitorOnce {
     const claimToken = `monitor_effect_${sha256Hex(
       `${key}:${this.#workerId}:${startedAt}`,
     ).slice(0, 32)}`;
-    const claimed = await this.#backend.mutate((state) => {
+    const claim = await this.#backend.mutate((state) => {
       const existing = state.monitorEffects[key];
-      if (existing?.state === "completed") return false;
+      if (existing?.state === "completed") return { kind: "completed" as const };
       if (
         existing?.state === "running" &&
         Date.parse(existing.claimExpiresAt) > startedAtMs
-      ) return false;
+      ) {
+        return {
+          kind: "busy" as const,
+          retryAfterMs: Math.max(1_000, Date.parse(existing.claimExpiresAt) - startedAtMs),
+        };
+      }
       state.monitorEffects[key] = {
         state: "running",
         claimToken,
         claimedAt: startedAt,
         claimExpiresAt: new Date(startedAtMs + this.#leaseMs).toISOString(),
       };
-      return true;
+      return { kind: "claimed" as const };
     });
-    if (!claimed) return false;
+    if (claim.kind === "completed") return false;
+    if (claim.kind === "busy") {
+      throw new ModalMonitorLeaseBusyError(key, claim.retryAfterMs);
+    }
 
     try {
       await effect();

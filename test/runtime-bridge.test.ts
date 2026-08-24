@@ -1,6 +1,8 @@
+import { execFile } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DexCloudMessagingClient, DexVerifiedCommand } from "../src/cloud/messaging/index.js";
 import { startControlSocket, sendControlCommand } from "../src/local/daemon/control-socket.js";
@@ -9,6 +11,7 @@ import { EventLog } from "../src/state/events.js";
 import { DexStateStore } from "../src/state/store.js";
 
 const directories: string[] = [];
+const runFile = promisify(execFile);
 
 afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
@@ -79,5 +82,57 @@ describe("local diagnostic control socket", () => {
     } finally {
       await server.close();
     }
+  });
+
+  it("delivers power restore to the running daemon", async () => {
+    const { directory } = await fixture();
+    const socket = path.join(directory, "control.sock");
+    const received: unknown[] = [];
+    const server = await startControlSocket(socket, async (command) => { received.push(command); });
+    try {
+      await sendControlCommand(socket, { type: "power.restore" });
+      expect(received).toEqual([{ type: "power.restore" }]);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("routes dex power restore through the live daemon control socket", async () => {
+    const { directory } = await fixture();
+    const socket = path.join(directory, "runtime", "control.sock");
+    const received: unknown[] = [];
+    const server = await startControlSocket(socket, async (command) => { received.push(command); });
+    try {
+      const result = await runFile(process.execPath, ["--import", "tsx", "src/cli.ts", "power", "restore"], {
+        cwd: process.cwd(),
+        env: { ...process.env, DEX_HOME: directory },
+      });
+      expect(received).toEqual([{ type: "power.restore" }]);
+      expect(result.stdout).toContain("told the running Dex daemon");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("discloses simulated battery provenance in dex watch", async () => {
+    const { directory, store } = await fixture();
+    await store.updateState((state) => {
+      state.machine = {
+        id: "device-1",
+        hostname: "test-mac",
+        batteryPercent: 8,
+        batteryReadingSimulated: true,
+        sleepPreventionActive: false,
+        aggressiveLidModeActive: false,
+        batteryAlertThresholds: [10],
+        updatedAt: new Date().toISOString(),
+      };
+    });
+
+    const result = await runFile(process.execPath, ["--import", "tsx", "src/cli.ts", "watch", "--once"], {
+      cwd: process.cwd(),
+      env: { ...process.env, DEX_HOME: directory },
+    });
+    expect(result.stdout).toContain("battery      8% (simulated)");
   });
 });

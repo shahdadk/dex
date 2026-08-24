@@ -220,6 +220,7 @@ export async function loadDexCloudConfig(
   if (!host || /[\u0000\r\n]/.test(host)) throw new TypeError("DEX_CLOUD_HOST is invalid");
   const workerId = env.DEX_CLOUD_WORKER_ID ?? `dex-cloud-${process.pid}`;
   if (!IdentifierSchema.safeParse(workerId).success) throw new TypeError("DEX_CLOUD_WORKER_ID is invalid");
+  const configuredPersistence = persistence(env, environment);
   const cloudTasksProject = env.DEX_CLOUD_TASKS_PROJECT;
   const cloudTaskNames = [
     "DEX_CLOUD_TASKS_PROJECT", "DEX_CLOUD_TASKS_LOCATION", "DEX_CLOUD_TASKS_QUEUE",
@@ -249,9 +250,14 @@ export async function loadDexCloudConfig(
       serviceAccountEmail: required(env, "DEX_CLOUD_TASKS_SERVICE_ACCOUNT"),
     };
   }
+  if (environment === "production" && cloudTasks === undefined) {
+    throw new TypeError(
+      "Cloud Tasks configuration is required in production for Modal continuity",
+    );
+  }
   return {
     environment,
-    persistence: persistence(env, environment),
+    persistence: configuredPersistence,
     signingKey: await loadSigningKey(env),
     ownerAssociations: parseAssociations(env),
     sendblue: {

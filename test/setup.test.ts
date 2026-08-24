@@ -1,3 +1,5 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -32,6 +34,7 @@ afterEach(() => {
   Object.defineProperty(process, "platform", originalPlatform);
   vi.useRealTimers();
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   vi.restoreAllMocks();
   for (const module of mockedModules) vi.doUnmock(module);
   vi.resetModules();
@@ -56,6 +59,14 @@ function config() {
 }
 
 describe("phone onboarding", () => {
+  it("generates short, unambiguous human pairing codes", async () => {
+    const { generatePairingCode, PAIRING_CODE_LENGTH } = await import("../src/setup/onboarding.js");
+    const codes = Array.from({ length: 100 }, () => generatePairingCode());
+
+    expect(PAIRING_CODE_LENGTH).toBe(6);
+    expect(codes).toEqual(codes.map((code) => expect.stringMatching(/^[A-HJ-NP-Z2-9]{6}$/)));
+  });
+
   it("retries with fake time and returns a verified pairing without real sleeps", async () => {
     vi.useFakeTimers();
     const identity = {
@@ -64,7 +75,11 @@ describe("phone onboarding", () => {
       ownerId: "owner-1",
       pairedConversationId: "conversation-1",
     };
-    const loadIdentity = vi.fn(async () => null);
+    const events: string[] = [];
+    const loadIdentity = vi.fn(async () => {
+      events.push("identity");
+      return null;
+    });
     const pair = vi.fn()
       .mockRejectedValueOnce(new Error("not paired yet"))
       .mockResolvedValueOnce(identity);
@@ -90,6 +105,7 @@ describe("phone onboarding", () => {
       timeoutMs: 50,
       pollMs: 10,
       print: (line) => lines.push(line),
+      preflight: async () => { events.push("preflight"); },
     });
     await vi.advanceTimersByTimeAsync(10);
 
@@ -101,6 +117,7 @@ describe("phone onboarding", () => {
     expect(pair).toHaveBeenCalledTimes(2);
     expect(lines.join("\n")).toContain("PAIR ABC234");
     expect(lines.join("\n")).toContain("+15555550123");
+    expect(events.slice(0, 2)).toEqual(["preflight", "identity"]);
     expect(constructorOptions).toEqual([expect.objectContaining({
       baseUrl: "https://dex.example.test",
       pinnedServerKeys: config().serverKeys,
@@ -126,6 +143,7 @@ describe("phone onboarding", () => {
       timeoutMs: 25,
       pollMs: 10,
       print: () => undefined,
+      preflight: async () => undefined,
     });
     const rejected = expect(pending).rejects.toMatchObject({
       message: expect.stringContaining("Phone pairing timed out"),
@@ -135,6 +153,145 @@ describe("phone onboarding", () => {
     await vi.advanceTimersByTimeAsync(30);
     await rejected;
     expect(pair).toHaveBeenCalledTimes(3);
+  });
+
+  it("fails preflight before loading or consuming a pairing", async () => {
+    const loadIdentity = vi.fn(async () => null);
+    const pair = vi.fn();
+    vi.doMock("../src/local/pairing/index.js", () => ({
+      MacOSDexKeychain: class FakeKeychain {},
+      DexPairingService: class FakePairingService {
+        loadIdentity = loadIdentity;
+        pair = pair;
+      },
+    }));
+    const { pairMac } = await import("../src/setup/onboarding.js");
+
+    await expect(pairMac({
+      config: config(),
+      pairingCode: "ABC234",
+      deviceName: "Test Mac",
+      preflight: async () => { throw new Error("missing prerequisite"); },
+    })).rejects.toThrow("missing prerequisite");
+    expect(loadIdentity).not.toHaveBeenCalled();
+    expect(pair).not.toHaveBeenCalled();
+  });
+
+  it("requires credentials, healthy tools, Modal, and ChatGPT auth in setup preflight", async () => {
+    const doctor = vi.fn(async () => [
+      { name: "Node", status: "pass" as const, detail: "Node 22" },
+      { name: "Modal", status: "pass" as const, detail: "authenticated" },
+    ]);
+    const validateCodexAuth = vi.fn(async () => undefined);
+    const { runSetupPreflight } = await import("../src/setup/onboarding.js");
+
+    await expect(runSetupPreflight(config(), {
+      env: { DEX_HANDOFF_SIGNING_KEY: "handoff", GEMINI_API_KEY: "gemini" },
+      doctor,
+      validateCodexAuth,
+    })).resolves.toHaveLength(2);
+    expect(doctor).toHaveBeenCalledOnce();
+    expect(validateCodexAuth).toHaveBeenCalledOnce();
+
+    await expect(runSetupPreflight(config(), {
+      env: {},
+      doctor,
+      validateCodexAuth,
+    })).rejects.toThrow("DEX_HANDOFF_SIGNING_KEY and GEMINI_API_KEY");
+    expect(doctor).toHaveBeenCalledOnce();
+    expect(validateCodexAuth).toHaveBeenCalledOnce();
+  });
+});
+
+describe("Modal Codex auth setup", () => {
+  async function authFixture(): Promise<{ directory: string; authPath: string }> {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "dex-setup-auth-"));
+    const authPath = path.join(directory, "auth.json");
+    await writeFile(authPath, JSON.stringify({
+      auth_mode: "chatgpt",
+      tokens: { access_token: "access", refresh_token: "refresh", id_token: "id" },
+    }), { mode: 0o600 });
+    return { directory, authPath };
+  }
+
+  function fakeModal(modeExitCode = 0) {
+    const executions: string[][] = [];
+    const sandbox = {
+      exec: vi.fn(async (argv: string[]) => {
+        executions.push(argv);
+        const isModeCheck = argv[0] === "node" && argv.some((part) => part.includes("auth.auth_mode"));
+        return {
+          stdout: { readText: async () => "" },
+          stderr: { readText: async () => "" },
+          wait: async () => isModeCheck ? modeExitCode : 0,
+        };
+      }),
+      terminate: vi.fn(async () => undefined),
+    };
+    return {
+      executions,
+      modal: {
+        create: vi.fn(async () => sandbox),
+        close: vi.fn(async () => undefined),
+      },
+    };
+  }
+
+  it.each([
+    { remote: false, disposition: "seeded" as const },
+    { remote: true, disposition: "reused" as const },
+  ])("reports $disposition account auth idempotently", async ({ remote, disposition }) => {
+    const fixture = await authFixture();
+    try {
+      const report = vi.fn();
+      const runner = vi.fn(async (_command: string, args: readonly string[]) => {
+        if (args[1] === "ls") {
+          return remote
+            ? { stdout: JSON.stringify([{ filename: "auth.json", type: "file" }]), stderr: "", exitCode: 0 }
+            : { stdout: "", stderr: "No such file or directory", exitCode: 1 };
+        }
+        return { stdout: "", stderr: "", exitCode: 0 };
+      });
+      const fake = fakeModal();
+      const { seedModalCodexAuth } = await import("../src/setup/modal-auth.js");
+
+      const result = await seedModalCodexAuth({
+        authPath: fixture.authPath,
+        volumeName: "private-auth",
+        runner,
+        modal: fake.modal as never,
+        report,
+      });
+
+      expect(result).toEqual({ volumeName: "private-auth" });
+      expect(result.disposition).toBe(disposition);
+      expect(report).toHaveBeenCalledWith(result);
+      expect(runner.mock.calls.some(([, args]) => args.includes("put"))).toBe(!remote);
+      expect(fake.executions.some((argv) => argv.some((part) => part.includes("auth.auth_mode")))).toBe(true);
+    } finally {
+      await rm(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects reused remote auth unless its cache is structurally ChatGPT mode", async () => {
+    const fixture = await authFixture();
+    try {
+      const runner = vi.fn(async (_command: string, args: readonly string[]) => args[1] === "ls"
+        ? { stdout: JSON.stringify([{ filename: "auth.json", type: "file" }]), stderr: "", exitCode: 0 }
+        : { stdout: "", stderr: "", exitCode: 0 });
+      const fake = fakeModal(1);
+      const { seedModalCodexAuth } = await import("../src/setup/modal-auth.js");
+
+      await expect(seedModalCodexAuth({
+        authPath: fixture.authPath,
+        volumeName: "private-auth",
+        runner,
+        modal: fake.modal as never,
+      })).rejects.toThrow("not a ChatGPT account login");
+      expect(runner.mock.calls.some(([, args]) => args.includes("put"))).toBe(false);
+    } finally {
+      await rm(fixture.directory, { recursive: true, force: true });
+    }
   });
 });
 
@@ -369,6 +526,7 @@ describe("runtime and LaunchAgent installation", () => {
       "package.json",
       "README.md",
       "docs",
+      ".env.example",
     ]);
     expect(execFile).toHaveBeenCalledWith(
       "npm",
@@ -379,10 +537,15 @@ describe("runtime and LaunchAgent installation", () => {
 
   it("writes an escaped plist and uses the expected launchctl lifecycle", async () => {
     vi.stubEnv("PATH", '/opt/Dex & Tools/"bin"/<current>');
+    vi.stubEnv("DEX_DEVICE_KEY_ID", "device-key-custom");
+    vi.stubEnv("DEX_MODAL_CODEX_AUTH_VOLUME", "auth-volume-custom");
+    vi.stubEnv("DEX_MODAL_SECRET_NAME", "worker-secret-custom");
+    vi.stubEnv("CLAUDE_MEM_WORKER_URL", "http://127.0.0.1:47777/a&b");
     const { installLaunchAgent, mkdir, writeFile, execFile } = await mockServiceDependencies();
     const runtime = "/Users/tester/Dex & Runtime/current";
+    const probeControlSocket = vi.fn(async () => undefined);
 
-    await expect(installLaunchAgent(runtime, paths)).resolves.toBe(
+    await expect(installLaunchAgent(runtime, paths, { probeControlSocket })).resolves.toBe(
       "/Users/tester/Library/LaunchAgents/com.dex.daemon.plist",
     );
     expect(mkdir).toHaveBeenCalledWith("/Users/tester/Library/LaunchAgents", {
@@ -397,7 +560,12 @@ describe("runtime and LaunchAgent installation", () => {
     expect(body).toContain("/Users/tester/.dex/logs/daemon &amp; errors.log");
     expect(body).toContain("/opt/Dex &amp; Tools/&quot;bin&quot;/&lt;current&gt;");
     expect(body).toContain("<key>DEX_HOME</key><string>/Users/tester/.dex</string>");
+    expect(body).toContain("<key>DEX_DEVICE_KEY_ID</key><string>device-key-custom</string>");
+    expect(body).toContain("<key>DEX_MODAL_CODEX_AUTH_VOLUME</key><string>auth-volume-custom</string>");
+    expect(body).toContain("<key>DEX_MODAL_SECRET_NAME</key><string>worker-secret-custom</string>");
+    expect(body).toContain("<key>CLAUDE_MEM_WORKER_URL</key><string>http://127.0.0.1:47777/a&amp;b</string>");
     expect(body).toContain("<string>daemon</string>");
+    expect(probeControlSocket).toHaveBeenCalledWith(paths.controlSocket);
     expect(execFile.mock.calls).toEqual([
       ["launchctl", [
         "bootout",
@@ -415,13 +583,15 @@ describe("runtime and LaunchAgent installation", () => {
 
   it("does not rewrite an identical plist and stops when bootstrap fails", async () => {
     const first = await mockServiceDependencies();
-    await first.installLaunchAgent("/runtime", paths);
+    await first.installLaunchAgent("/runtime", paths, { probeControlSocket: async () => undefined });
     const body = String(first.writeFile.mock.calls[0]![1]);
 
     vi.restoreAllMocks();
     vi.resetModules();
     const second = await mockServiceDependencies({ existingPlist: body, bootstrapExitCode: 5 });
-    await expect(second.installLaunchAgent("/runtime", paths)).rejects.toThrow(
+    await expect(second.installLaunchAgent("/runtime", paths, {
+      probeControlSocket: async () => undefined,
+    })).rejects.toThrow(
       "Could not start Dex background service: bootstrap failed",
     );
     expect(second.writeFile).not.toHaveBeenCalled();
@@ -442,5 +612,72 @@ describe("runtime and LaunchAgent installation", () => {
       "bootstrap",
       "kickstart",
     ]);
+  });
+
+  it("waits for the daemon control socket and fails if readiness never arrives", async () => {
+    const service = await mockServiceDependencies();
+    const wait = vi.fn(async () => undefined);
+    const eventuallyReady = vi.fn()
+      .mockRejectedValueOnce(new Error("ENOENT"))
+      .mockResolvedValueOnce(undefined);
+    await expect(service.installLaunchAgent("/runtime", paths, {
+      probeControlSocket: eventuallyReady,
+      wait,
+      readinessTimeoutMs: 1_000,
+    })).resolves.toContain("com.dex.daemon.plist");
+    expect(eventuallyReady).toHaveBeenCalledTimes(2);
+    expect(wait).toHaveBeenCalledOnce();
+
+    const neverReady = vi.fn(async () => { throw new Error("ECONNREFUSED"); });
+    await expect(service.installLaunchAgent("/runtime", paths, {
+      probeControlSocket: neverReady,
+      readinessTimeoutMs: 0,
+    })).rejects.toThrow("control socket did not become ready");
+  });
+});
+
+describe("persisted LaunchAgent runtime settings", () => {
+  it("stores custom Modal and Claude-Mem settings with the Modal token ID", async () => {
+    const saved: unknown[] = [];
+    const execFile = vi.fn(async (_command: string, args: readonly string[]) => {
+      saved.push(JSON.parse(args.at(-1)!));
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    vi.doMock("../src/utils/exec.js", () => ({ execFile }));
+    Object.defineProperty(process, "platform", { ...originalPlatform, value: "darwin" });
+    vi.stubEnv("MODAL_TOKEN_ID", "modal-key-id");
+    vi.stubEnv("MODAL_TOKEN_SECRET", "modal-secret");
+    vi.stubEnv("DEX_MODAL_SECRET_NAME", "workers-custom");
+    vi.stubEnv("DEX_MODAL_CODEX_AUTH_VOLUME", "auth-custom");
+    vi.stubEnv("CLAUDE_MEM_WORKER_URL", "http://127.0.0.1:48888");
+    vi.stubEnv("CLAUDE_MEM_DATA_DIR", "/Users/tester/claude-mem-custom");
+    const { persistRuntimeSecrets } = await import("../src/local/pairing/secrets.js");
+
+    await persistRuntimeSecrets();
+
+    expect(saved).toEqual([expect.objectContaining({
+      MODAL_TOKEN_ID: "modal-key-id",
+      MODAL_TOKEN_SECRET: "modal-secret",
+      DEX_MODAL_SECRET_NAME: "workers-custom",
+      DEX_MODAL_CODEX_AUTH_VOLUME: "auth-custom",
+      CLAUDE_MEM_WORKER_URL: "http://127.0.0.1:48888",
+      CLAUDE_MEM_DATA_DIR: "/Users/tester/claude-mem-custom",
+    })]);
+  });
+});
+
+describe("doctor cloud wording", () => {
+  it("does not claim that /readyz verifies host-sleep survival", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true })));
+    const { dexCloudCheck } = await import("../src/setup/doctor.js");
+    const check = await dexCloudCheck({
+      ...config(),
+      deviceId: "device-1",
+    });
+
+    expect(check.status).toBe("pass");
+    expect(check.detail).toContain("/readyz is reachable");
+    expect(check.detail).toContain("host-sleep continuity is not verified");
+    expect(check.detail).not.toContain("survives host sleep");
   });
 });

@@ -13,7 +13,6 @@ import { runDoctor, formatDoctor } from "./setup/doctor.js";
 import { installLaunchAgent, installRuntime } from "./setup/service.js";
 import { inspectRepository } from "./tasks/worktree.js";
 import { projectId } from "./utils/ids.js";
-import { MacMachineController } from "./local/machine/mac-machine.js";
 import { ModalAdapter } from "./cloud/modal/adapter.js";
 import { detectMacName, pairMac } from "./setup/onboarding.js";
 import { sendControlCommand } from "./local/daemon/control-socket.js";
@@ -39,9 +38,12 @@ program
   .option("--skip-modal-smoke", "skip the real Modal create/reconnect smoke test")
   .action(async (options: { service: boolean; project: string; pairingCode?: string; deviceName?: string; skipModalSmoke?: boolean }) => {
     assertNode22();
+    await hydrateRuntimeSecrets();
     const paths = resolveDexPaths();
     const store = new DexStateStore(paths.state);
-    const project = await registerProject(store, options.project);
+    // Validate the repository before creating a cloud pairing or mutating Dex
+    // state. registerProject performs the actual durable write after pairing.
+    await inspectRepository(options.project);
     let config = await loadConfig(paths);
     const deviceName = options.deviceName ?? await detectMacName();
     const identity = await pairMac({
@@ -49,6 +51,7 @@ program
       ...(options.pairingCode ? { pairingCode: options.pairingCode } : {}),
       deviceName,
     });
+    const project = await registerProject(store, options.project);
     config = DexConfigSchema.parse({
       ...config,
       deviceId: identity.deviceId,
@@ -76,7 +79,7 @@ program
     }
     const auth = await seedModalCodexAuth();
     process.env.DEX_MODAL_CODEX_AUTH_VOLUME = auth.volumeName;
-    console.log(`✓ Codex ChatGPT account auth seeded in private Modal Volume ${auth.volumeName}`);
+    console.log(`✓ Codex ChatGPT account auth ${auth.disposition} in private Modal Volume ${auth.volumeName}`);
     if (!options.skipModalSmoke) {
       const smoke = await modalSmokeTest();
       console.log(`✓ Modal create/execute/detach/reconnect: ${smoke.id} (${smoke.version})`);
@@ -207,9 +210,9 @@ program
   .description("Internal power recovery tools")
   .command("restore")
   .action(async () => {
-    await hydrateRuntimeSecrets();
-    const restored = await new MacMachineController().restore();
-    console.log(restored ? "✓ restored normal Mac sleep behavior" : "✓ no Dex sleep assertion was active");
+    const paths = resolveDexPaths();
+    await sendControlCommand(paths.controlSocket, { type: "power.restore" });
+    console.log("✓ told the running Dex daemon to restore normal Mac sleep behavior");
   });
 
 program
@@ -276,12 +279,13 @@ function renderWatch(state: Awaited<ReturnType<DexStateStore["read"]>>): string 
   }
   lines.push("", "MACHINE");
   if (state.machine) {
-    lines.push(`  ${state.machine.hostname}`, `  battery      ${state.machine.batteryPercent ?? "unknown"}%`, `  keep-awake   ${state.machine.sleepPreventionActive ? "ACTIVE" : "off"}`);
+    const battery = `${state.machine.batteryPercent ?? "unknown"}%${state.machine.batteryReadingSimulated ? " (simulated)" : ""}`;
+    lines.push(`  ${state.machine.hostname}`, `  battery      ${battery}`, `  keep-awake   ${state.machine.sleepPreventionActive ? "ACTIVE" : "off"}`);
   } else {
     lines.push("  not paired");
   }
   if (state.pendingMachineActions.length > 0) {
-    lines.push(`  pending      ${state.pendingMachineActions.map((action) => `sleep:${action.trigger}`).join(", ")}`);
+    lines.push(`  pending      ${state.pendingMachineActions.map((action) => `${action.type}:${action.trigger}`).join(", ")}`);
   }
   return lines.join("\n");
 }

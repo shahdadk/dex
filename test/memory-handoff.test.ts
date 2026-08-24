@@ -38,6 +38,31 @@ function jsonResponse(value: unknown, status = 200): Response {
 }
 
 describe("Claude-Mem integration", () => {
+  it("retries discovery after a temporary Claude-Mem outage", async () => {
+    let clock = 1_000;
+    let attempts = 0;
+    const recovered: MemoryClient = {
+      recordObservation: vi.fn(async () => ({ status: "stored" as const })),
+      summarizeSession: vi.fn(async () => ({ status: "stored" as const })),
+      search: vi.fn(async () => ({ content: [] })),
+      timeline: vi.fn(async () => ({ content: [] })),
+      getObservations: vi.fn(async () => []),
+    };
+    const continuity = new MemoryContinuity({
+      discover: async () => (++attempts === 1 ? null : recovered),
+      discoveryRetryMs: 100,
+      now: () => clock,
+    });
+
+    await expect(continuity.client()).resolves.toBeNull();
+    clock += 99;
+    await expect(continuity.client()).resolves.toBeNull();
+    expect(attempts).toBe(1);
+    clock += 1;
+    await expect(continuity.client()).resolves.toBe(recovered);
+    expect(attempts).toBe(2);
+  });
+
   it("persists fallback task knowledge before relying on Claude-Mem", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "dex-memory-state-"));
     const store = new DexStateStore(path.join(directory, "state.json"));

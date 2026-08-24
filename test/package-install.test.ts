@@ -81,11 +81,11 @@ describe("published package install", () => {
         "dist/cli.d.ts",
         "dist/index.js",
         "dist/index.d.ts",
+        ".env.example",
       ]));
       expect(files.some((file) => file.startsWith("src/"))).toBe(false);
       expect(files.some((file) => file.startsWith("test/"))).toBe(false);
       expect(files).not.toContain(".env");
-      expect(files).not.toContain(".env.example");
 
       const localPackage = `./${result.filename}`;
       const rootHelp = await run(

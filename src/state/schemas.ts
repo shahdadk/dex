@@ -112,6 +112,7 @@ export const MachineStateSchema = z.object({
   id: z.string().min(1),
   hostname: z.string().min(1),
   batteryPercent: z.number().min(0).max(100).optional(),
+  batteryReadingSimulated: z.boolean().optional(),
   charging: z.boolean().optional(),
   powerSource: z.enum(["battery", "ac"]).optional(),
   sleepPreventionActive: z.boolean().default(false),
@@ -121,12 +122,29 @@ export const MachineStateSchema = z.object({
 });
 export type MachineState = z.infer<typeof MachineStateSchema>;
 
-export const PendingMachineActionSchema = z.object({
-  type: z.literal("sleep"),
-  trigger: z.enum(["now", "all_tasks_complete"]),
-  requestedAt: z.string().datetime(),
-  conversationId: z.string().optional(),
+export const PendingMachineActionSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("sleep"),
+    trigger: z.enum(["now", "all_tasks_complete"]),
+    requestedAt: z.string().datetime(),
+    conversationId: z.string().optional(),
+  }),
+  z.object({
+    type: z.literal("restore"),
+    trigger: z.literal("all_tasks_complete"),
+    requestedAt: z.string().datetime(),
+  }),
+]);
+
+export const PendingConversationPromptSchema = z.object({
+  id: z.string().min(1),
+  type: z.literal("battery.low"),
+  conversationId: z.string().min(1),
+  taskIds: z.array(z.string().min(1)).min(1),
+  createdAt: z.string().datetime(),
+  expiresAt: z.string().datetime(),
 });
+export type PendingConversationPrompt = z.infer<typeof PendingConversationPromptSchema>;
 
 export const PendingTransportEventSchema = z.object({
   id: z.string().min(1),
@@ -152,6 +170,7 @@ export const DexStateSchema = z.object({
   workers: z.record(z.string(), WorkerSessionSchema),
   machine: MachineStateSchema.optional(),
   pendingMachineActions: z.array(PendingMachineActionSchema),
+  pendingConversationPrompts: z.array(PendingConversationPromptSchema).max(100).default([]),
   processedMessageIds: z.array(z.string()).max(5000),
   lastInboundCursor: z.string().optional(),
   pendingTransportEvents: z.array(PendingTransportEventSchema).max(5000).default([]),
@@ -167,6 +186,7 @@ export function emptyState(): DexState {
     tasks: {},
     workers: {},
     pendingMachineActions: [],
+    pendingConversationPrompts: [],
     processedMessageIds: [],
     pendingTransportEvents: [],
     pendingTransportReceipts: [],

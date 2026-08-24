@@ -68,7 +68,7 @@ const DEX_LINE = "+14165550999";
 const WEBHOOK_SECRET = "golden-sendblue-secret";
 const INTERNAL_SECRET = "golden-internal-secret";
 const HANDOFF_SECRET = "golden-handoff-signing-key";
-const SETUP_CODE = "ABCDEFGHJKLMNPQRST23";
+const SETUP_CODE = "K7D4Q9";
 const FAILED_APPROACH = "npm test -- --runInBand";
 const FAILED_REASON = "Serializing the retry test deadlocked and did not prove exactly-once delivery.";
 const ENGINEERING_MESSAGE =
@@ -713,7 +713,7 @@ describe("Dex golden path", () => {
       payload: expect.objectContaining({ cloudTasks: [cloudTask.id] }),
     }));
     expect((await repository.listSendblueOutbox()).some(
-      ({ text }) => text.includes("running in the cloud. sleeping this mac now"),
+      ({ text }) => text.includes("cloud ownership is confirmed, so i'm requesting sleep on this mac now"),
     )).toBe(true);
 
     const monitorEvents = (await readEvents(paths.events)).filter(
@@ -794,7 +794,11 @@ describe("Dex golden path", () => {
       service.handleModalTerminal(terminalEvent),
     ]);
     expect(callbackDeliveryRetries).toEqual(Array.from({ length: 3 }, () =>
-      expect.objectContaining({ transitioned: false, completionEnqueued: false })));
+      expect.objectContaining({
+        transitioned: false,
+        completionEnqueued: false,
+        deviceCommandEnqueued: false,
+      })));
 
     expect(await repository.getTask(cloudTask.id)).toMatchObject({
       status: "succeeded",
@@ -810,7 +814,20 @@ describe("Dex golden path", () => {
       toPhone: PHONE,
       text: expect.stringContaining(terminalArtifact.summary),
     })]);
-    expect(await repository.listPendingDeviceCommands(paired.deviceId, 500)).toEqual([]);
+    const completionCommands = await repository.listPendingDeviceCommands(paired.deviceId, 500);
+    expect(completionCommands).toEqual([expect.objectContaining({
+      command: expect.objectContaining({
+        command: expect.objectContaining({
+          type: "task.cloud.completed",
+          payload: expect.objectContaining({
+            taskId: cloudTask.id,
+            sandboxId: "sandbox-golden",
+            status: "succeeded",
+            result: terminalArtifact,
+          }),
+        }),
+      }),
+    })]);
     expect(agentBoundary.starts).toHaveLength(2);
     expect(modal.calls).not.toContain("terminate");
   }, 30_000);

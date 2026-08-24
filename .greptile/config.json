@@ -1,0 +1,37 @@
+{
+  "skipReview": "AUTOMATIC",
+  "triggerOnUpdates": false,
+  "strictness": 2,
+  "commentTypes": ["logic", "syntax"],
+  "statusCheck": false,
+  "autoApprove": {
+    "enabled": false
+  },
+  "ignorePatterns": "dist/**\nnode_modules/**\ncoverage/**",
+  "rules": [
+    {
+      "id": "protect-deterministic-boundaries",
+      "rule": "Preserve typed, validated, deterministic boundaries. Never allow model output or untrusted external data to directly authorize or execute control, power, Git, deployment, or messaging side effects.",
+      "scope": ["src/**"],
+      "severity": "high"
+    },
+    {
+      "id": "fail-closed-security-boundaries",
+      "rule": "Authentication, owner identity, signatures, repository identity, handoff integrity, and result validation must fail closed without leaking credentials or unredacted provider data.",
+      "scope": ["src/**"],
+      "severity": "high"
+    },
+    {
+      "id": "idempotent-external-effects",
+      "rule": "Every retryable external side effect must have durable idempotency or reconciliation. Do not blindly retry an operation whose outcome may already have committed.",
+      "scope": ["src/**"],
+      "severity": "high"
+    },
+    {
+      "id": "no-autonomous-release-actions",
+      "rule": "Repository automation and workers must not push, open or merge pull requests, deploy, bypass permissions, or broaden their authority unless an explicit typed workflow grants that exact action.",
+      "scope": ["src/**", "test/**", ".greptile/**"],
+      "severity": "high"
+    }
+  ]
+}

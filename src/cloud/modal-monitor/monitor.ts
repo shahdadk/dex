@@ -16,6 +16,7 @@ import {
 export const MODAL_MONITOR_INITIAL_DELAY_MS = 5_000;
 export const MODAL_MONITOR_RETRY_DELAY_MS = 10_000;
 export const MODAL_MONITOR_DEADLINE_MS = 25 * 60_000;
+export const MODAL_SUCCESS_RESULT_RETENTION_MS = 5 * 60_000;
 
 export interface ModalMonitorSchedule {
   request: ParsedModalMonitorRequest;
@@ -37,6 +38,7 @@ export interface ModalTerminalEvent {
   reason: ModalTerminalReason;
   exitCode: number | null;
   result?: ModalResultArtifact;
+  sandboxRetentionExpiresAt?: string;
   error?: string;
 }
 
@@ -47,6 +49,19 @@ export interface ModalTerminalEvent {
  */
 export interface ModalMonitorOnce {
   runOnce(key: string, effect: () => Promise<void>): Promise<boolean>;
+}
+
+/** Signals a live durable owner; callers must retry instead of acknowledging work. */
+export class ModalMonitorLeaseBusyError extends Error {
+  readonly key: string;
+  readonly retryAfterMs: number;
+
+  constructor(key: string, retryAfterMs: number) {
+    super("A durable Modal monitor effect is still in flight");
+    this.name = "ModalMonitorLeaseBusyError";
+    this.key = key;
+    this.retryAfterMs = retryAfterMs;
+  }
 }
 
 export class InMemoryModalMonitorOnce implements ModalMonitorOnce {
@@ -200,6 +215,9 @@ export class ModalMonitor {
         }
       }
       if (artifact) {
+        const sandboxRetentionExpiresAt = artifact.status === "succeeded"
+          ? new Date(now + MODAL_SUCCESS_RESULT_RETENTION_MS).toISOString()
+          : undefined;
         const outcome = await this.#deliverTerminal({
           taskId: request.taskId,
           sandboxId: request.sandboxId,
@@ -208,8 +226,15 @@ export class ModalMonitor {
           reason: "result",
           exitCode: artifact.status === "succeeded" ? 0 : 1,
           result: artifact,
+          ...(sandboxRetentionExpiresAt === undefined
+            ? {}
+            : { sandboxRetentionExpiresAt }),
         });
-        await sandbox.terminate().catch(() => undefined);
+        if (artifact.status === "succeeded") {
+          await sandbox.detach();
+        } else {
+          await sandbox.terminate().catch(() => undefined);
+        }
         return outcome;
       }
     }

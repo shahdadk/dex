@@ -45,7 +45,6 @@ export class GeminiRouter {
           generationConfig: {
             responseMimeType: "application/json",
             responseJsonSchema: GEMINI_ACTION_SCHEMA,
-            temperature: 0,
             thinkingConfig: { thinkingLevel },
           },
         }),
@@ -112,6 +111,30 @@ const GEMINI_ACTION_SCHEMA = {
       },
       {
         type: "object",
+        properties: {
+          type: { const: "LIST_SESSIONS" },
+          provider: { enum: ["claude", "codex"] },
+          limit: { type: "integer", minimum: 1, maximum: 50 },
+        },
+        required: ["type"],
+        additionalProperties: false,
+      },
+      {
+        type: "object",
+        properties: {
+          type: { const: "ADOPT_SESSION" },
+          provider: { enum: ["claude", "codex"] },
+          sessionId: { type: "string" },
+          cwd: { type: "string" },
+          updatedAt: { type: "string" },
+          summary: { type: "string" },
+          active: { type: "boolean" },
+        },
+        required: ["type", "provider", "sessionId"],
+        additionalProperties: false,
+      },
+      {
+        type: "object",
         properties: { type: { const: "MEMORY_QUERY" }, query: { type: "string" } },
         required: ["type", "query"],
         additionalProperties: false,
@@ -161,9 +184,12 @@ const GEMINI_ACTION_SCHEMA = {
 
 const ROUTER_PROMPT = `You route messages for Dex, a persistent software developer.
 Return only a JSON array of actions. Never return shell commands.
-Allowed action types: CREATE_TASK, STATUS, MEMORY_QUERY, MOVE_TASK, CHANGE_AGENT,
-STOP_TASK, RESUME_TASK, KEEP_AWAKE, SLEEP.
+Allowed action types: CREATE_TASK, STATUS, LIST_SESSIONS, ADOPT_SESSION, MEMORY_QUERY,
+MOVE_TASK, CHANGE_AGENT, STOP_TASK, RESUME_TASK, KEEP_AWAKE, SLEEP.
 Split independent engineering outcomes into separate CREATE_TASK actions.
 Use preferredAgent for explicit Claude/Codex choices and executionPreference for local/cloud choices.
+Use LIST_SESSIONS when the user asks what prior Claude/Codex sessions exist.
+Only use ADOPT_SESSION when the user supplies an exact provider and session ID;
+never invent session identity or any shell/TTY operation.
 The type field must use the exact uppercase enum value shown above.
 Use SLEEP with tasks_complete when the user says sleep when done.`;

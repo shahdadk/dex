@@ -3,6 +3,7 @@ import {
   InvalidTransportEventError,
   RepositoryConflictError,
   type CloudTaskRecord,
+  type CloudTaskCompletionRecord,
   type ControlPlaneRepository,
   type DeviceCommandOutboxRecord,
   type DeviceRecord,
@@ -87,6 +88,8 @@ async function applyOperation(
         operation.summary,
         operation.message,
         operation.now,
+        operation.command,
+        operation.completion,
       );
       return;
     case "commit_device_sync":
@@ -136,6 +139,7 @@ function append(state: DexCloudStateDocument, operation: ControlPlaneOperation):
 export interface DurableDexCloudRepositoryOptions {
   backend: DexCloudStateBackend;
   sendblueReconciliationRetryMs?: number;
+  sendblueRetryMs?: number;
 }
 
 export interface ScheduledMonitorClaim {
@@ -152,14 +156,20 @@ export class DurableDexCloudRepository
 implements ControlPlaneRepository, SendblueDeliveryStore {
   readonly #backend: DexCloudStateBackend;
   readonly #sendblueReconciliationRetryMs: number;
+  readonly #sendblueRetryMs: number;
 
   constructor(options: DurableDexCloudRepositoryOptions) {
     const retryMs = options.sendblueReconciliationRetryMs ?? 10_000;
+    const sendRetryMs = options.sendblueRetryMs ?? 10_000;
     if (!Number.isSafeInteger(retryMs) || retryMs < 1_000 || retryMs > 60 * 60_000) {
       throw new RangeError("Sendblue reconciliation retry must be between one second and one hour");
     }
+    if (!Number.isSafeInteger(sendRetryMs) || sendRetryMs < 1_000 || sendRetryMs > 60 * 60_000) {
+      throw new RangeError("Sendblue retry must be between one second and one hour");
+    }
     this.#backend = options.backend;
     this.#sendblueReconciliationRetryMs = retryMs;
+    this.#sendblueRetryMs = sendRetryMs;
   }
 
   hasProcessedInbound(providerMessageId: string): Promise<boolean> {
@@ -243,7 +253,14 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
     summary: string,
     message: SendblueOutboxRecord,
     now: string,
-  ): Promise<{ task: CloudTaskRecord; transitioned: boolean; enqueued: boolean }> {
+    command?: DeviceCommandOutboxRecord,
+    completion?: CloudTaskCompletionRecord,
+  ): Promise<{
+    task: CloudTaskRecord;
+    transitioned: boolean;
+    enqueued: boolean;
+    commandEnqueued: boolean;
+  }> {
     return this.#mutate(
       {
         kind: "complete_modal_task",
@@ -253,6 +270,8 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
         summary,
         message,
         now,
+        ...(command === undefined ? {} : { command }),
+        ...(completion === undefined ? {} : { completion }),
       },
       (repository) => repository.completeModalTaskAndEnqueue(
         taskId,
@@ -261,6 +280,8 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
         summary,
         message,
         now,
+        command,
+        completion,
       ),
     );
   }
@@ -352,11 +373,21 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
           Date.parse(current.nextAttemptAt) > claimedAtMs
         ) continue;
 
+        const action = current === undefined || current.state === "retrying"
+          ? "send" as const
+          : "reconcile" as const;
         const claimCount = (current?.claimCount ?? 0) + 1;
         const claimToken = `sendblue_claim_${sha256Hex(
           `${item.id}:${claimCount}:${input.workerId}:${input.claimedAt}`,
         ).slice(0, 32)}`;
-        const attemptStartedAt = current?.attemptStartedAt ?? input.claimedAt;
+        const attemptStartedAt = action === "send"
+          ? input.claimedAt
+          : current!.attemptStartedAt;
+        const sendAttempts = (current?.sendAttempts ?? (current === undefined ? 0 : 1)) +
+          (action === "send" ? 1 : 0);
+        const reconciliationAttempts = action === "reconcile"
+          ? (current?.reconciliationAttempts ?? 0) + 1
+          : 0;
         const delivery: SendblueDeliveryState = {
           ...(current ?? {
             outboxId: item.id,
@@ -366,12 +397,14 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
             state: "claimed" as const,
           }),
           claimCount,
+          sendAttempts,
+          reconciliationAttempts,
           claimTokens: [...(current?.claimTokens ?? []), claimToken].slice(-128),
           claimToken,
           claimedBy: input.workerId,
           claimedAt: input.claimedAt,
           claimExpiresAt: new Date(claimedAtMs + input.leaseMs).toISOString(),
-          state: current === undefined ? "claimed" : "reconciling",
+          state: action === "send" ? "claimed" : "reconciling",
         };
         delete delivery.nextAttemptAt;
         state.sendblueDeliveries[item.id] = delivery;
@@ -384,8 +417,10 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
             text: item.text,
             createdAt: item.createdAt,
           },
-          action: current === undefined ? "send" : "reconcile",
+          action,
           attemptStartedAt,
+          sendAttempt: sendAttempts,
+          reconciliationAttempt: reconciliationAttempts,
         };
       }
       return null;
@@ -437,11 +472,21 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
       if (delivery.state === "delivered") return;
       if (delivery.state === "rejected") return;
       if (delivery.claimToken !== input.claimToken) return;
-      delivery.state = "rejected";
       delivery.lastErrorCode = input.reason;
-      delivery.rejectedAt = input.rejectedAt;
       delivery.retryable = input.retryable;
       if (input.httpStatus !== undefined) delivery.httpStatus = input.httpStatus;
+      if (input.retryable) {
+        delivery.state = "retrying";
+        delivery.nextAttemptAt = new Date(
+          finiteTimestamp(input.rejectedAt, "Sendblue rejection time") +
+          (input.retryAfterMs ?? this.#sendblueRetryMs),
+        ).toISOString();
+        delete delivery.rejectedAt;
+      } else {
+        delivery.state = "rejected";
+        delivery.rejectedAt = input.rejectedAt;
+        delete delivery.nextAttemptAt;
+      }
       this.#clearClaim(delivery);
     });
   }
@@ -459,7 +504,7 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
       }
       delivery.nextAttemptAt = new Date(
         finiteTimestamp(input.checkedAt, "Sendblue reconciliation time") +
-        this.#sendblueReconciliationRetryMs,
+        (input.retryAfterMs ?? this.#sendblueReconciliationRetryMs),
       ).toISOString();
       this.#clearClaim(delivery);
     });

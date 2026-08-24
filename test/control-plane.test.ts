@@ -4,6 +4,7 @@ import {
   createDexPairingPayload,
   createDexSyncPayload,
   generateDexDeviceKeyPair,
+  verifyDexCommand,
   type DexDeviceKeyPair,
   type DexFetch,
 } from "../src/cloud/messaging/index.js";
@@ -31,7 +32,7 @@ const DEX_LINE = "+14165550999";
 const WEBHOOK_SECRET = "sendblue-test-secret";
 const INTERNAL_SECRET = "internal-test-secret";
 const HASH = "a".repeat(64);
-const SETUP_CODE = "ABCDEFGHJKLMNPQRST23";
+const SETUP_CODE = "K7D4Q9";
 
 function inbound(
   messageHandle: string,
@@ -187,7 +188,11 @@ describe("Sendblue ingress security and parsing", () => {
       kind: "pair",
       setupCode: SETUP_CODE,
     });
-    expect(() => parseInboundMessage("PAIR 1234")).toThrow("high-entropy format");
+    expect(parseInboundMessage("pair k7d4q9")).toEqual({
+      kind: "pair",
+      setupCode: SETUP_CODE,
+    });
+    expect(() => parseInboundMessage("PAIR 1234")).toThrow("six characters");
     expect(parseInboundMessage("DEX, fix parser; $(touch /tmp/not-executed) && rm -rf ./x"))
       .toEqual({
         kind: "engineering",
@@ -499,6 +504,58 @@ describe("deterministic device command protocol", () => {
 });
 
 describe("durable device transport events", () => {
+  it("adopts a unique cloud ingress task when the local task-created identity arrives", async () => {
+    const state = fixture();
+    const paired = await pairDevice(state);
+    const ingress = await state.service.processSendblueWebhook(
+      inbound("identity-ingress-1", "Fix checkout and add a regression test"),
+      sendblueHeaders(),
+    );
+    if (ingress.kind !== "engineering_command") throw new Error("Expected engineering command");
+    const client = new DexCloudMessagingClient({
+      baseUrl: "https://cloud.dex.test",
+      deviceId: paired.deviceId,
+      ownerId: OWNER,
+      keyPair: paired.deviceKey,
+      pinnedServerKeys: [{
+        algorithm: "ed25519",
+        keyId: state.signingKey.keyId,
+        publicKey: state.signingKey.publicKey,
+      }],
+      initialSequence: paired.nextSequence - 1,
+      fetch: localFetch(state.service),
+      now: () => state.now.value,
+      nonce: (sequence) => `identity-${sequence}`,
+    });
+
+    const synced = await client.sync(createDexSyncPayload({ events: [{
+      id: "local-identity-created-1",
+      timestamp: NOW_ISO,
+      type: "task.created",
+      taskId: "local-checkout-task",
+      payload: {
+        title: "Fix checkout and add a regression test",
+        originalRequest: "Fix checkout and add a regression test",
+        conversationId: CONVERSATION,
+      },
+    }] }));
+
+    expect(synced.commands).toEqual([expect.objectContaining({
+      command: expect.objectContaining({
+        type: "message.received",
+        payload: expect.objectContaining({ cloudTaskId: ingress.taskId }),
+      }),
+    })]);
+    expect(await state.repository.getTask(ingress.taskId)).toBeNull();
+    expect(await state.repository.getTask("local-checkout-task")).toMatchObject({
+      id: "local-checkout-task",
+      cloudIngressTaskId: ingress.taskId,
+      sourceMessageId: "identity-ingress-1",
+      origin: "device",
+      request: "Fix checkout and add a regression test",
+    });
+  });
+
   it("upserts local task identity and enqueues message.sent exactly once", async () => {
     const state = fixture();
     const paired = await pairDevice(state);
@@ -713,7 +770,7 @@ describe("durable device transport events", () => {
 describe("Modal task registration and exactly-once completion", () => {
   it("atomically transitions a task and enqueues one terminal Sendblue message", async () => {
     const state = fixture();
-    await pairDevice(state);
+    const paired = await pairDevice(state);
     const accepted = await state.service.processSendblueWebhook(
       inbound("modal-task-message", "implement durable retries"),
       sendblueHeaders(),
@@ -748,8 +805,14 @@ describe("Modal task registration and exactly-once completion", () => {
         status: "succeeded" as const,
         summary: "Implemented bounded retry state.",
         validation: { commands: ["npm test"], passed: true },
-        git: { branch: "dex/retries", commit: "abc123" },
+        git: {
+          branch: "dex/retries",
+          commit: "abc123",
+          bundlePath: "/dex/result.bundle",
+          bundleSha256: "b".repeat(64),
+        },
       },
+      sandboxRetentionExpiresAt: "2026-08-23T12:05:00.000Z",
     };
     const completions = await Promise.all(
       Array.from({ length: 10 }, () => state.service.handleModalTerminal(terminal)),
@@ -760,6 +823,12 @@ describe("Modal task registration and exactly-once completion", () => {
       status: "succeeded",
       completionKey: terminal.completionKey,
       summary: "Implemented bounded retry state.",
+      completion: expect.objectContaining({
+        sandboxId: "sandbox-1",
+        resultPath: "/dex/result.json",
+        sandboxRetentionExpiresAt: "2026-08-23T12:05:00.000Z",
+        bundle: { path: "/dex/result.bundle", sha256: "b".repeat(64) },
+      }),
     });
     const terminalMessages = (await state.repository.listSendblueOutbox())
       .filter((message) => message.taskId === accepted.taskId);
@@ -767,6 +836,31 @@ describe("Modal task registration and exactly-once completion", () => {
     expect(terminalMessages[0]).toMatchObject({
       dedupeKey: terminal.completionKey,
       toPhone: PHONE,
+    });
+    const completionCommands = (await state.repository.listPendingDeviceCommands(
+      paired.deviceId,
+      100,
+    )).filter((record) => record.command.command.type === "task.cloud.completed");
+    expect(completionCommands).toHaveLength(1);
+    const verified = verifyDexCommand(completionCommands[0]!.command, {
+      pinnedServerKeys: [{
+        algorithm: "ed25519",
+        keyId: state.signingKey.keyId,
+        publicKey: state.signingKey.publicKey,
+      }],
+      ownerId: OWNER,
+      now: () => NOW,
+    });
+    expect(verified.command).toMatchObject({
+      type: "task.cloud.completed",
+      payload: {
+        taskId: accepted.taskId,
+        sandboxId: "sandbox-1",
+        resultPath: "/dex/result.json",
+        sandboxRetentionExpiresAt: "2026-08-23T12:05:00.000Z",
+        bundle: { path: "/dex/result.bundle", sha256: "b".repeat(64) },
+        result: terminal.result,
+      },
     });
     await expect(state.service.handleModalTerminal({
       ...terminal,

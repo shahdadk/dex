@@ -15,18 +15,19 @@ import { taskId as makeTaskId } from "../utils/ids.js";
 import { createWorktree, inspectRepository } from "./worktree.js";
 
 const ALLOWED: Record<TaskStatus, ReadonlySet<TaskStatus>> = {
-  queued: new Set(["preparing", "cancelled", "failed"]),
-  preparing: new Set(["running", "failed", "cancelled"]),
-  running: new Set(["waiting_user", "checkpointing", "completed", "failed", "cancelled"]),
-  waiting_user: new Set(["running", "cancelled", "failed"]),
-  checkpointing: new Set(["handoff", "running", "failed", "cancelled"]),
-  handoff: new Set(["running", "failed", "cancelled"]),
+  queued: new Set(["preparing", "checkpointing", "cancelled", "failed"]),
+  preparing: new Set(["running", "checkpointing", "failed", "cancelled"]),
+  running: new Set(["preparing", "waiting_user", "checkpointing", "completed", "failed", "cancelled"]),
+  waiting_user: new Set(["preparing", "running", "checkpointing", "cancelled", "failed"]),
+  checkpointing: new Set(["preparing", "handoff", "running", "failed", "cancelled"]),
+  handoff: new Set(["preparing", "running", "failed", "cancelled"]),
   completed: new Set(["checkpointing"]),
-  failed: new Set(["preparing", "cancelled"]),
-  cancelled: new Set(["preparing"]),
+  failed: new Set(["preparing", "checkpointing", "cancelled"]),
+  cancelled: new Set(["preparing", "checkpointing"]),
 };
 
 export interface CreateTaskInput {
+  id?: string;
   description: string;
   project: DexProject;
   preferredAgent?: AgentKind;
@@ -53,7 +54,7 @@ export class TaskManager {
     if (inputs.length === 0) return [];
     const tasks: DexTask[] = [];
     for (const input of inputs) {
-      const id = makeTaskId(taskTitle(input.description));
+      const id = input.id === undefined ? makeTaskId(taskTitle(input.description)) : validatedTaskId(input.id);
       const repository = await inspectRepository(input.project.path);
       const worktree = input.createWorktree === false
         ? { branch: `dex/${id}`, path: path.join(this.#paths.worktrees, id) }
@@ -82,7 +83,10 @@ export class TaskManager {
       }));
     }
     await this.#store.updateState((state) => {
-      for (const task of tasks) state.tasks[task.id] = task;
+      for (const task of tasks) {
+        if (state.tasks[task.id]) throw new Error(`Dex task already exists: ${task.id}`);
+        state.tasks[task.id] = task;
+      }
     });
     await Promise.all(tasks.map((task) => this.#events.append({
       type: "task.created",
@@ -145,4 +149,12 @@ function taskTitle(description: string): string {
     .replace(/[.!?]+$/g, "")
     .trim()
     .slice(0, 72) || "engineering task";
+}
+
+function validatedTaskId(value: string): string {
+  const id = value.trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id)) {
+    throw new TypeError("Dex task ID must contain only letters, numbers, dots, underscores, and dashes");
+  }
+  return id;
 }

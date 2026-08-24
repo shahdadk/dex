@@ -226,6 +226,25 @@ describe("SendblueClient send-message adapter", () => {
     });
     expect(String(error)).not.toContain(API_SECRET);
   });
+
+  it("classifies 429 as a definitive retryable rejection and bounds Retry-After", async () => {
+    const client = clientWith(vi.fn(async () => jsonResponse({}, {
+      status: 429,
+      headers: { "retry-after": "2.5" },
+    })));
+
+    await expect(client.sendMessage({
+      number: TO,
+      fromNumber: FROM,
+      content: CONTENT,
+    })).rejects.toMatchObject({
+      code: "request_rejected",
+      httpStatus: 429,
+      ambiguous: false,
+      retryable: true,
+      retryAfterMs: 2_500,
+    });
+  });
 });
 
 describe("Sendblue deterministic reconciliation", () => {
@@ -442,6 +461,53 @@ describe("SendblueOutboxDispatcher", () => {
     }));
   });
 
+  it("schedules a safe 429 re-send but stops at the configured send bound", async () => {
+    const response = (): Response => jsonResponse({}, {
+      status: 429,
+      headers: { "retry-after": "2" },
+    });
+    const retryStore = fakeStore([{ ...outboxClaim("send", "claim-retry"), sendAttempt: 1 }]);
+    const retry = new SendblueOutboxDispatcher({
+      client: clientWith(vi.fn(async () => response())),
+      store: retryStore,
+      fromNumber: FROM,
+      workerId: "worker-rate-limit",
+      now: () => NOW,
+      maxSendAttempts: 2,
+    });
+    await expect(retry.dispatchNext()).resolves.toEqual({
+      kind: "retry_scheduled",
+      outboxId: "outbox-1",
+      reason: "request_rejected",
+      retryAfterMs: 2_000,
+    });
+    expect(retryStore.recordRejected).toHaveBeenCalledWith(expect.objectContaining({
+      retryable: true,
+      retryAfterMs: 2_000,
+      httpStatus: 429,
+    }));
+
+    const exhaustedStore = fakeStore([{
+      ...outboxClaim("send", "claim-exhausted"),
+      sendAttempt: 2,
+    }]);
+    const exhausted = new SendblueOutboxDispatcher({
+      client: clientWith(vi.fn(async () => response())),
+      store: exhaustedStore,
+      fromNumber: FROM,
+      workerId: "worker-rate-limit",
+      now: () => NOW,
+      maxSendAttempts: 2,
+    });
+    await expect(exhausted.dispatchNext()).resolves.toMatchObject({
+      kind: "rejected",
+      httpStatus: 429,
+    });
+    expect(exhaustedStore.recordRejected).toHaveBeenCalledWith(expect.objectContaining({
+      retryable: false,
+    }));
+  });
+
   it("keeps no-match and multiple-match reconciliation pending without another send", async () => {
     const responses = [
       jsonResponse({
@@ -488,5 +554,38 @@ describe("SendblueOutboxDispatcher", () => {
       reason: "multiple_matches",
       candidateHandles: ["candidate-1", "candidate-2"],
     });
+  });
+
+  it("terminally bounds reconciliation attempts without issuing another POST", async () => {
+    const fetch = vi.fn(async () => jsonResponse({
+      status: "OK",
+      data: [],
+      pagination: { limit: 100, offset: 0, total: 0, hasMore: false },
+    }));
+    const store = fakeStore([{
+      ...outboxClaim("reconcile", "claim-final-reconcile"),
+      reconciliationAttempt: 2,
+    }]);
+    const dispatcher = new SendblueOutboxDispatcher({
+      client: clientWith(fetch),
+      store,
+      fromNumber: FROM,
+      workerId: "worker-bounded-reconcile",
+      now: () => NOW,
+      maxReconciliationAttempts: 2,
+    });
+
+    await expect(dispatcher.dispatchNext()).resolves.toEqual({
+      kind: "rejected",
+      outboxId: "outbox-1",
+      reason: "reconciliation_too_broad",
+    });
+    expect(store.recordReconciliationPending).not.toHaveBeenCalled();
+    expect(store.recordRejected).toHaveBeenCalledWith(expect.objectContaining({
+      retryable: false,
+      reason: "reconciliation_too_broad",
+    }));
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(fetch.mock.calls[0]![1]).toMatchObject({ method: "GET" });
   });
 });

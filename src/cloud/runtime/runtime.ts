@@ -246,10 +246,6 @@ export class DexCloudRuntime {
           this.#backgroundCycleRunning = false;
         });
     };
-    if (this.config.cloudTasks !== undefined) {
-      tick();
-      return;
-    }
     this.#timer = setInterval(tick, this.config.pollIntervalMs);
     this.#timer.unref?.();
     tick();
@@ -297,6 +293,9 @@ export class DexCloudRuntime {
     if (this.#readinessCheck !== undefined) return this.#readinessCheck;
     const operation = Promise.resolve().then(async () => {
       if (this.#closed) throw new Error("Dex Cloud runtime is closed");
+      if (this.config.environment === "production" && this.config.cloudTasks === undefined) {
+        throw new Error("Cloud Tasks configuration is required for production Modal continuity");
+      }
       await this.backend.ready();
       if (this.#closed) throw new Error("Dex Cloud runtime is closed");
     });

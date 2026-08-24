@@ -60,6 +60,8 @@ export interface MemoryContinuityOptions {
   discover?: () => Promise<MemoryClient | null>;
   taskKnowledge?: TaskKnowledgeStore;
   store?: DexStateStore;
+  discoveryRetryMs?: number;
+  now?: () => number;
 }
 
 function hasKnowledge(knowledge: TaskKnowledge): boolean {
@@ -164,22 +166,40 @@ export class MemoryContinuity {
   readonly taskKnowledge: TaskKnowledgeStore;
   readonly #discover: () => Promise<MemoryClient | null>;
   readonly #store: DexStateStore | undefined;
+  readonly #discoveryEnabled: boolean;
+  readonly #discoveryRetryMs: number;
+  readonly #now: () => number;
   #client: MemoryClient | null | undefined;
   #clientPromise: Promise<MemoryClient | null> | undefined;
+  #nextDiscoveryAt = 0;
 
   constructor(options: MemoryContinuityOptions = {}) {
     this.#client = options.client;
+    this.#discoveryEnabled = options.client === undefined;
     this.#discover = options.discover ?? (() => discoverClaudeMemClient());
     this.taskKnowledge = options.taskKnowledge ?? new TaskKnowledgeStore();
     this.#store = options.store;
+    this.#discoveryRetryMs = options.discoveryRetryMs ?? 15_000;
+    this.#now = options.now ?? Date.now;
+    if (!Number.isFinite(this.#discoveryRetryMs) || this.#discoveryRetryMs < 0) {
+      throw new RangeError("Claude-Mem discoveryRetryMs must be a non-negative number");
+    }
   }
 
   async client(): Promise<MemoryClient | null> {
-    if (this.#client !== undefined) return this.#client;
-    this.#clientPromise ??= this.#discover().then((client) => {
-      this.#client = client;
-      return client;
-    });
+    if (!this.#discoveryEnabled) return this.#client ?? null;
+    if (this.#client) return this.#client;
+    if (this.#client === null && this.#now() < this.#nextDiscoveryAt) return null;
+    this.#clientPromise ??= this.#discover()
+      .catch(() => null)
+      .then((client) => {
+        this.#client = client;
+        this.#nextDiscoveryAt = client ? 0 : this.#now() + this.#discoveryRetryMs;
+        return client;
+      })
+      .finally(() => {
+        this.#clientPromise = undefined;
+      });
     return this.#clientPromise;
   }
 

@@ -130,9 +130,8 @@ export class ModalTaskMover implements TaskMover {
         workdir: "/workspace",
         env: { CODEX_HOME: "/codex-home" },
         name: MODAL_CODEX_WORKER_SANDBOX_NAME,
-        // Keep the Sandbox alive after the worker writes result.json so the
-        // detached cloud monitor can retrieve the artifact before terminating
-        // it. A bounded hold prevents an orphan from running indefinitely.
+        // Keep the Sandbox alive after result.json so the monitor and paired
+        // device have a bounded window to retrieve result.json/result.bundle.
         command: [
           "/bin/sh",
           "-c",

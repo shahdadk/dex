@@ -6,7 +6,14 @@ const RuntimeSecretsSchema = z.object({
   GEMINI_API_KEY: z.string().min(1).optional(),
   MODAL_TOKEN_ID: z.string().min(1).optional(),
   MODAL_TOKEN_SECRET: z.string().min(1).optional(),
+  DEX_MODAL_SECRET_NAME: z.string().min(1).optional(),
+  DEX_MODAL_CODEX_AUTH_VOLUME: z.string().min(1).optional(),
   DEX_HANDOFF_SIGNING_KEY: z.string().min(1).optional(),
+  CLAUDE_MEM_URL: z.string().min(1).optional(),
+  CLAUDE_MEM_WORKER_URL: z.string().min(1).optional(),
+  CLAUDE_MEM_WORKER_HOST: z.string().min(1).optional(),
+  CLAUDE_MEM_WORKER_PORT: z.string().min(1).optional(),
+  CLAUDE_MEM_DATA_DIR: z.string().min(1).optional(),
 }).strict();
 
 export type DexRuntimeSecrets = z.infer<typeof RuntimeSecretsSchema>;
@@ -57,7 +64,16 @@ export async function persistRuntimeSecrets(): Promise<void> {
     ...(process.env.GEMINI_API_KEY ? { GEMINI_API_KEY: process.env.GEMINI_API_KEY } : {}),
     ...(process.env.MODAL_TOKEN_ID ? { MODAL_TOKEN_ID: process.env.MODAL_TOKEN_ID } : {}),
     ...(process.env.MODAL_TOKEN_SECRET ? { MODAL_TOKEN_SECRET: process.env.MODAL_TOKEN_SECRET } : {}),
+    ...(process.env.DEX_MODAL_SECRET_NAME ? { DEX_MODAL_SECRET_NAME: process.env.DEX_MODAL_SECRET_NAME } : {}),
+    ...(process.env.DEX_MODAL_CODEX_AUTH_VOLUME
+      ? { DEX_MODAL_CODEX_AUTH_VOLUME: process.env.DEX_MODAL_CODEX_AUTH_VOLUME }
+      : {}),
     ...(process.env.DEX_HANDOFF_SIGNING_KEY ? { DEX_HANDOFF_SIGNING_KEY: process.env.DEX_HANDOFF_SIGNING_KEY } : {}),
+    ...(process.env.CLAUDE_MEM_URL ? { CLAUDE_MEM_URL: process.env.CLAUDE_MEM_URL } : {}),
+    ...(process.env.CLAUDE_MEM_WORKER_URL ? { CLAUDE_MEM_WORKER_URL: process.env.CLAUDE_MEM_WORKER_URL } : {}),
+    ...(process.env.CLAUDE_MEM_WORKER_HOST ? { CLAUDE_MEM_WORKER_HOST: process.env.CLAUDE_MEM_WORKER_HOST } : {}),
+    ...(process.env.CLAUDE_MEM_WORKER_PORT ? { CLAUDE_MEM_WORKER_PORT: process.env.CLAUDE_MEM_WORKER_PORT } : {}),
+    ...(process.env.CLAUDE_MEM_DATA_DIR ? { CLAUDE_MEM_DATA_DIR: process.env.CLAUDE_MEM_DATA_DIR } : {}),
   };
   await new MacOSDexRuntimeSecrets().save(values);
 }

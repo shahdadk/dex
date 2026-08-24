@@ -6,12 +6,17 @@ import {
   type DexPairingResponse,
   type DexSyncResponse,
 } from "../messaging/index.js";
-import { createEngineeringTaskAndCommand, deterministicControlPlaneId } from "./commands.js";
+import {
+  createEngineeringTaskAndCommand,
+  createTaskCloudCompletedCommand,
+  deterministicControlPlaneId,
+} from "./commands.js";
 import { ControlPlaneError } from "./errors.js";
 import {
   ModalMonitorRegistrationSchema,
   ModalTerminalInputSchema,
   type DeviceRecord,
+  type CloudTaskCompletionRecord,
   type ModalTerminalInput,
   type SendblueOutboxRecord,
   type VerifiedConversationAssociation,
@@ -413,6 +418,7 @@ export class DexControlPlaneService {
     status: "succeeded" | "failed" | "cancelled";
     transitioned: boolean;
     completionEnqueued: boolean;
+    deviceCommandEnqueued: boolean;
   }> {
     const parsed = ModalTerminalInputSchema.safeParse(input);
     if (!parsed.success) {
@@ -445,6 +451,19 @@ export class DexControlPlaneService {
 
     const summary = safeSummary(terminal.result?.summary ?? terminal.error ?? terminal.reason);
     const now = iso(this.#now());
+    const completionTimestamp = task.completion?.completedAt ??
+      (task.completionKey === expectedCompletionKey ? task.updatedAt : now);
+    const device = await this.#repository.findDeviceByAssociation(
+      task.ownerId,
+      task.conversationId,
+    );
+    if (!device || device.phoneE164 !== task.phoneE164) {
+      throw new ControlPlaneError(
+        409,
+        "modal_result_conflict",
+        "Task completion target is not paired",
+      );
+    }
     const message: SendblueOutboxRecord = {
       id: deterministicControlPlaneId("sendblue_out", expectedCompletionKey),
       dedupeKey: expectedCompletionKey,
@@ -452,8 +471,36 @@ export class DexControlPlaneService {
       conversationId: task.conversationId,
       toPhone: task.phoneE164,
       text: completionText(task.title, terminal.status, summary),
-      createdAt: now,
+      createdAt: completionTimestamp,
       taskId: task.id,
+    };
+    const command = createTaskCloudCompletedCommand({
+      task,
+      device,
+      terminal,
+      summary,
+      issuedAt: completionTimestamp,
+      signingKey: this.#signingKey,
+    });
+    const git = terminal.result?.git;
+    const completion: CloudTaskCompletionRecord = {
+      sandboxId: terminal.sandboxId,
+      resultPath: task.monitor.resultPath,
+      handoffSha256: task.monitor.handoffSha256,
+      status: terminal.status,
+      reason: terminal.reason,
+      exitCode: terminal.exitCode,
+      completedAt: completionTimestamp,
+      ...(terminal.sandboxRetentionExpiresAt === undefined
+        ? {}
+        : { sandboxRetentionExpiresAt: terminal.sandboxRetentionExpiresAt }),
+      ...(terminal.result === undefined ? {} : { result: terminal.result }),
+      ...(git?.bundlePath === undefined ? {} : {
+        bundle: {
+          path: git.bundlePath,
+          ...(git.bundleSha256 === undefined ? {} : { sha256: git.bundleSha256 }),
+        },
+      }),
     };
     try {
       const result = await this.#repository.completeModalTaskAndEnqueue(
@@ -463,12 +510,15 @@ export class DexControlPlaneService {
         summary,
         message,
         now,
+        command,
+        completion,
       );
       return {
         taskId: task.id,
         status: terminal.status,
         transitioned: result.transitioned,
         completionEnqueued: result.enqueued,
+        deviceCommandEnqueued: result.commandEnqueued,
       };
     } catch (error) {
       if (error instanceof RepositoryConflictError) {

@@ -1,24 +1,14 @@
 # Dex architecture
 
-**Status:** implemented prototype with a passing composed golden-path acceptance; credentialed Sendblue/Modal/sleep rehearsal remains external
+**Status:** implemented submission prototype with automated end-to-end contract coverage. Credentialed provider deployment and a real physical-sleep run remain external verification steps.
 
-**Product boundary:** one setup command on a Mac, then an iMessage-only engineering workflow.
+**Product boundary:** install once on a Mac, then talk to one persistent developer over iMessage.
 
-Dex coordinates fresh Claude and Codex workers, durable task state, memory continuity, local power behavior, and a verified handoff into Modal. It relies on existing cloud messaging and task-service boundaries for iMessage transport, owner identity, durable cloud scheduling/state, and transactional outbound delivery.
+## Design principle
 
-## Goals
+Sessions are workers. Tasks are durable.
 
-Dex is designed to:
-
-- turn an owner-authenticated text into one or more durable engineering tasks;
-- perform exact control operations without a model;
-- isolate task work in a dedicated Git worktree and branch;
-- preserve useful context across fresh workers without sharing a live process;
-- continue local work in a Modal sandbox before the Mac sleeps;
-- monitor cloud completion deterministically and deliver one terminal message; and
-- fail closed at owner, handoff, power, and result-validation boundaries.
-
-The P0 path does not include bidirectional repository synchronization, a general agent swarm, autonomous deployment, or a review/remediation loop.
+A task keeps the user's original intent, repository, branch, worktree, semantic stage, summaries, discoveries, decisions, failed approaches, tests, worker history, and cloud metadata. Claude and Codex sessions are replaceable execution attempts beneath that task identity.
 
 ## System context
 
@@ -26,348 +16,265 @@ The P0 path does not include bidirectional repository synchronization, a general
 flowchart LR
     Owner[Verified owner<br/>iMessage]
 
-    subgraph Existing[Existing cloud service boundaries]
-        Ingress[Message transport<br/>and owner identity]
-        Tasks[Durable task scheduling<br/>and state]
-        Outbox[Transactional<br/>message outbox]
+    subgraph CloudBoundary[Dex Cloud]
+        Ingress[Sendblue ingress<br/>auth + dedupe]
+        TaskStore[Durable tasks<br/>and attempts]
+        Commands[Signed device<br/>command queue]
+        Scheduler[Cloud Tasks]
+        Outbox[Transactional<br/>Sendblue outbox]
     end
 
-    subgraph Mac[Owner's Mac]
-        Sync[Signed Dex device sync]
-        Router[Typed message router]
-        Orchestrator[Dex orchestrator]
-        Worktree[Task worktree]
-        LocalWorker[Fresh Claude or Codex]
+    subgraph Mac[Dex on the Mac]
+        Sync[Signed long-poll sync]
+        Router[Typed router]
+        Orchestrator[Task orchestrator]
+        Worktrees[Isolated Git worktrees]
+        CodexLocal[Codex / local]
+        ClaudeLocal[Claude / local]
         Memory[Claude-Mem<br/>+ TaskKnowledge]
-        Power[Battery and sleep gate]
+        Power[Battery + power gate]
         Handoff[Signed handoff<br/>+ Git bundle]
+        Importer[Verified result importer]
     end
 
-    subgraph Cloud[Cloud continuation]
-        Modal[Modal sandbox<br/>Node 22]
-        CloudCodex[Fresh Codex worker]
-        Result[Validated result artifact]
-        Monitor[Deterministic<br/>Modal monitor]
+    subgraph ModalBoundary[Modal]
+        Sandbox[Node 22 sandbox]
+        CodexCloud[Fresh Codex]
+        Result[result.json<br/>+ result.bundle]
     end
 
-    Owner --> Ingress --> Sync --> Router --> Orchestrator
-    Orchestrator --> Worktree --> LocalWorker
-    LocalWorker <--> Memory
-    Orchestrator --> Handoff --> Modal --> CloudCodex --> Result
-    Handoff -. acknowledged .-> Power
-    Tasks --> Monitor
-    Monitor --> Modal
-    Result --> Monitor --> Tasks --> Outbox --> Owner
+    Owner --> Ingress --> TaskStore --> Commands --> Sync --> Router --> Orchestrator
+    Orchestrator --> Worktrees
+    Worktrees --> CodexLocal
+    Worktrees --> ClaudeLocal
+    CodexLocal <--> Memory
+    ClaudeLocal <--> Memory
+    Orchestrator --> Handoff --> Sandbox --> CodexCloud --> Result
+    Handoff -. cloud ownership .-> Power
+    Scheduler --> Sandbox
+    Result --> Scheduler --> TaskStore --> Outbox --> Owner
+    Result -. retained sandbox .-> Importer --> Worktrees
 ```
 
-The cloud transport, task scheduler/store, and outbox are reused dependencies. Dex does not claim those service implementations as new work. Dex owns the protocol adapters and all Dex-specific orchestration shown around those boundaries.
+Cloud messaging, verified-owner identity, durable cloud storage/scheduling, and outbound delivery are existing service boundaries. This repository owns their Dex-specific protocol adapters and the orchestration around them; it does not claim those underlying services as newly built infrastructure.
 
-## Runtime responsibility map
+## Responsibility map
 
-| Area | Dex repository | Existing or external boundary |
+| Area | Dex repository | External boundary |
 | --- | --- | --- |
-| User channel | Signed device sync client, Dex message/receipt schemas, and control-plane service contracts | iMessage ingress, sender association, and outbound transport |
-| Identity | Pairing challenge/service code, device key generation, Keychain storage, request signing, server-command verification | Verified owner/conversation records, deployment, and server key custody |
-| Task lifecycle | Typed actions, task state machine, events, worktrees, worker supervision | Durable cloud task storage where deployed |
-| Language routing | Deterministic gate and Gemini request policy | Gemini API and credential |
-| Local execution | Claude/Codex CLI adapters and process lifecycle | Installed, authenticated provider CLIs |
-| Continuity | Claude-Mem client, TaskKnowledge fallback, selection, redaction, Git checkpoint, signed handoff | Running Claude-Mem service when available |
-| Cloud execution | Modal adapter, cloud worker, startup/result schemas | Modal control plane, sandbox runtime, and model secret |
-| Completion | Deterministic monitor, control-plane completion contract, and idempotency keys | Durable scheduler transaction and outbound delivery worker |
-| Machine control | `pmset` battery parsing, parent-bound `caffeinate`, sleep gate | macOS power subsystem |
-| Local runtime | Long-poll bridge, router, orchestrator, memory, battery, mover, and power composition | Valid external credentials and reachable services |
+| User channel | Sendblue request verification, typed payloads, signed command/receipt protocol, dedupe contracts | Sendblue line and hosted delivery |
+| Identity | Pairing challenge client, device key generation, Keychain storage, request signing, pinned server-key verification | Verified owner/conversation records and server key custody |
+| Task lifecycle | Typed actions, explicit state machine, task scheduler, events, worktrees, worker history, recovery | Durable cloud task rows when deployed |
+| Language routing | Deterministic parser and schema-validated Gemini request policy | Gemini API |
+| Local execution | Claude/Codex adapters, provider IDs, JSON event normalization, scoped environments, cancellation | Installed and authenticated provider CLIs |
+| Continuity | Claude-Mem adapter, TaskKnowledge fallback, selection, redaction, checkpoint, signed handoff | Reachable Claude-Mem worker when available |
+| Cloud execution | Modal mover, cloud worker, startup/result schemas, deterministic monitor, result importer | Modal control plane and private credential boundary |
+| Machine control | `pmset` parsing, simulated-input disclosure, `caffeinate`, restore logic, sleep gate | macOS power subsystem |
 
-## Golden-path sequence
+## Submission flow
 
-The exact P0 conversation is:
+The 60-second video uses one task so the product is legible at a glance:
 
 ```text
-1. fix auth with codex and have claude investigate checkout failures
-2. move checkout failures to the cloud and use codex,
-   then sleep my mac
+fix checkout with codex
+        │
+        ▼
+durable checkout task
+        │
+        ▼
+fresh Codex / local
+        │
+controlled 8% battery reading
+        │
+        ▼
+owner replies yes
+        │
+        ▼
+checkpoint + Claude-Mem + failures + tests
+        │
+        ▼
+fresh Codex / Modal
 ```
 
-The expected sequence and gates are:
+The video labels the 8% value as a controlled sensor input using the production policy path. It demonstrates the continuity concept and names Claude-Mem and Modal. It does not claim that the Mac physically slept or that a completion arrived while it remained asleep.
 
-| Step | Action | Required evidence before continuing |
-| --- | --- | --- |
-| 1 | Existing ingress authenticates the sender and delivers a signed command to the paired device | Verified-owner authority, valid pinned-server signature, unexpired command |
-| 2 | Router creates two typed task actions | Actions pass the Zod schema; no model output is executed directly |
-| 3 | Task manager creates two `dex/<task-id>` branches in isolated worktrees | Durable task and event records exist |
-| 4 | Fresh local Codex implements while fresh local Claude investigates | Both provider IDs are captured; progress is reduced to durable semantic events |
-| 5 | Memory continuity records observations | Secrets are redacted; TaskKnowledge remains available if Claude-Mem is absent |
-| 6 | Owner requests cloud continuation and sleep | Typed `MOVE_TASK` precedes typed `SLEEP` |
-| 7 | Dex checkpoints local state | Task branch commit and reconstructable Git bundle are created |
-| 8 | Dex creates the handoff | 5–15 selected memories, content hash, artifact hash, and HMAC signature validate |
-| 9 | Dex launches Modal and uploads artifacts | Sandbox ID is known; required named secret keys are present |
-| 10 | Cloud worker verifies and loads the handoff | `startup.json` matches task and handoff hash and names loaded memories/failures |
-| 11 | Dex persists cloud ownership and schedules monitoring | Worker/session/sandbox IDs, hash, memory counts, and monitor request are durable |
-| 12 | Dex requests sleep | The immediate deterministic confirmation gate returns true; otherwise the Mac stays awake |
-| 13 | Monitor reconnects and polls | No model call; retry and terminal idempotency keys prevent duplicate effects |
-| 14 | Monitor validates `result.json` | Task ID and handoff hash match; a success reports passing validation |
-| 15 | Existing outbox delivers completion | Durable terminal transition and exactly one completion message |
-
-Any failure before step 11 must keep the Mac awake. A malformed or missing result becomes a failure, never an inferred success.
+The fuller implemented path also supports two concurrent local tasks, allowing Codex to implement while Claude investigates or reviews.
 
 ## Routing policy
 
-The router applies the least-powerful path that can interpret the message:
+The router uses the least-powerful valid interpreter:
 
 | Class | Examples | Executor | Thinking |
 | --- | --- | --- | --- |
-| Exact deterministic | status, memory query, move, change agent, stop, resume, keep awake, sleep | Typed parser and deterministic handler | None |
-| Fast lane | Ordinary task creation and structured extraction | `gemini-3.5-flash-lite` | `minimal` |
-| Brain lane | Long or context-dependent requests | `gemini-3.7-flash` | `low` |
+| Exact control | status, memory, move, change agent, stop, resume, keep awake, sleep | Deterministic parser | None |
+| Fast lane | Ordinary task creation and simple extraction | `gemini-3.5-flash-lite` | `minimal` |
+| Brain lane | Ambiguous or context-dependent decomposition | `gemini-3.7-flash` | `low` |
 
-The Gemini system instruction allows only Dex action types. Returned JSON is schema-validated. If the key is absent or the request fails, the router creates tasks with deterministic splitting; it does not silently turn model text into commands.
+Gemini returns only candidate `DexAction[]` JSON. Zod validation occurs before orchestration. Incoming message text is never executed as shell input, and no model can call `pmset` directly.
 
-Power commands are always deterministic. A model may classify language into a typed `SLEEP` action, but only the power controller can execute `pmset sleepnow` after its confirmation gate succeeds.
-
-Official references: [Gemini model IDs](https://ai.google.dev/gemini-api/docs/models), [Gemini thinking levels](https://ai.google.dev/gemini-api/docs/generate-content/thinking).
-
-## Task and worker lifecycle
-
-A task is durable independently of a worker process:
+## Durable task and worker lifecycle
 
 ```text
-queued -> preparing -> running -> completed
-                         |  |
-                         |  +-> waiting_user -> running
-                         |
-                         +-> checkpointing -> handoff -> running in Modal
-
-Any active state may fail or be cancelled according to the state machine.
-Failed and cancelled tasks may be prepared again.
+queued
+  │
+  ▼
+preparing ──► running ──► completed
+                │  │
+                │  ├──► waiting_user ──► running
+                │  │
+                │  └──► checkpointing ──► handoff ──► running / Modal
+                │
+                ├──► failed
+                └──► cancelled
 ```
 
-Each task records its repository, base branch, Dex branch, worktree, worker history, semantic stage, summaries, and metadata. Workers are disposable sessions. A daemon restart marks active local worker sessions stopped while preserving task and event state.
+The scheduler defaults to two concurrent workers and counts active Modal workers against the limit. Each local task receives a `dex/...` branch and separate worktree. The user's original working tree is not the task workspace, and Dex does not merge, push, or deploy automatically.
 
-Local Codex uses `workspace-write`, `--ask-for-approval never`, JSONL output, and `--ignore-user-config`. Unsafe bypass aliases are rejected. Local Claude defaults to `acceptEdits`; the orchestrator does not request permission bypass. Both adapters use executable-plus-argv process spawning rather than shell-interpolated commands.
+Provider output is reduced to normalized events and semantic stages. The user receives concise summaries rather than JSONL or terminal logs. If the daemon restarts, active local workers are marked stopped, task identity and history are preserved, and the orchestrator can attempt bounded recovery.
 
-## Local-to-cloud continuity
+Recent Claude and Codex transcripts can be discovered and normalized without attaching to arbitrary TTYs. Validated adoption-request parsing exists, but conversational adoption is not a P0 demo claim.
 
-Continuity has three layers:
+## Memory continuity
 
-1. **Task state** preserves the goal, stage, branch, summaries, and worker history.
-2. **TaskKnowledge and Claude-Mem** preserve learned facts, changed files, next steps, and failed approaches across fresh workers.
-3. **The handoff package** makes the cloud continuation independent of the sleeping Mac.
+Continuity uses two complementary stores:
 
-### Memory selection
+1. **Claude-Mem** receives redacted normalized observations and supports progressive search/timeline retrieval.
+2. **TaskKnowledge** deterministically preserves completed work, discoveries, decisions, failures, files, tests, blockers, and next steps when semantic memory is unavailable.
 
-Dex prefers Claude-Mem observations and falls back to task-scoped knowledge. It selects 5–15 unique observations by task relevance, source, recency, and failure/decision value. The handoff records selected sources and warnings, so a fallback cannot be misrepresented as a Claude-Mem-backed run.
+Dex selects a small, relevant set of observations for each new worker. Failed approaches are retained with reasons so a fresh worker can avoid repeating them.
 
-The behavioral continuity criterion is stronger than successful serialization. Demo or acceptance evidence must identify:
+The acceptance criterion is behavioral, not numerical: a fresh worker should use an inherited fact and avoid a known failed approach. Showing only a memory count is insufficient.
 
-- the inherited fact;
-- the failed approach and why it failed; and
-- the cloud worker action that changed because of that context.
+## Signed local-to-Modal handoff
 
-### Handoff contract
+Before upload, Dex checkpoints the task branch and creates:
 
-`handoff.json` contains:
+- `repo.bundle`, containing the reconstructable task branch; and
+- `handoff.json`, containing task identity, original request, completed work, decisions, failures, touched files, validation state, blockers, next step, and selected memories.
 
-- version, task ID, and creation time;
-- goal, constraints, and acceptance criteria;
-- repository location, base/head commits, working branch, and Git bundle metadata;
-- 5–15 memories, memory sources/warnings, learned facts, and failed approaches;
-- validation commands as argv arrays and expected evidence;
-- metadata, content SHA-256, artifact hashes, and an optional integrity signature.
+The package is redacted, secret-scanned, hashed, and HMAC-signed. Credentials are injected separately and are not stored in the handoff. All memory required for continuation is materialized before cloud ownership can be confirmed, so cloud Codex does not depend on the sleeping Mac or its local Claude-Mem process.
 
-For Modal continuation, the signature is required and uses HMAC-SHA-256. Handoff content is redacted and scanned before writing. The handoff directory and handoff file use restricted local modes; the Git bundle is content-hashed. Both artifacts are uploaded separately from credentials and verified in the sandbox.
+Fresh Codex starts only after the cloud worker verifies the task ID, hashes, signature, Git bundle, and required context. Startup evidence records the provider session ID, sandbox ID, handoff hash, and loaded continuity identifiers.
 
-The cloud worker cannot call the local Claude-Mem service. It receives all required continuation context in the verified handoff.
+## Modal monitoring and result return
 
-### Current directionality
-
-P0 supports local-to-Modal continuation. The cloud worker commits successful changes, creates `result.bundle`, hashes it, and reports the branch, commit, path, and hash in `result.json`. The completed sandbox stays reconnectable until its retention timeout. No implementation currently imports that result bundle into the local worktree, and workers are prohibited from pushing, so bidirectional local/cloud synchronization remains P1.
-
-## Modal execution and monitoring
-
-Dex creates a Node 22 sandbox, installs the pinned Codex CLI declared by the mover, attaches either ephemeral scoped worker values or the configured named Modal secret, and uploads:
-
-- `repo.bundle`;
-- `handoff.json`;
-- the compiled cloud worker; and
-- a readiness marker.
-
-The cloud worker verifies hashes and the HMAC before cloning the bundle. It removes the HMAC and Modal credentials from the spawned Codex environment, starts fresh Codex with the inherited context, records startup evidence after receiving a provider thread ID, runs validation commands, commits successful changes, and atomically writes `result.json` plus `result.bundle`.
-
-The monitor is deterministic:
+Monitoring is deterministic and needs no model call:
 
 ```text
-reconnect by sandbox ID
-        |
-      poll
-   /          \
-running      terminal
-   |             |
-reschedule   read result.json
-                 |
-          validate task/hash/status
-                 |
-        exactly-once terminal callback
+sandbox ID
+    │
+    ▼
+Cloud Tasks monitor
+    │
+    ├── running ──► reschedule
+    │
+    └── terminal
+           │
+           ▼
+      validate result
+           │
+           ▼
+  atomic task transition
+  + exactly-once outbox
+  + signed device command
 ```
 
-The first retry is scheduled after 5 seconds and later retries after 10 seconds, bounded by a 25-minute deadline. On deadline, the sandbox is terminated and the task fails. `DexCloudRuntime` wires the monitor to the durable repository and Postgres-backed once/effect ledger; the standalone in-memory once implementation is retained only for focused tests.
+The monitor reconnects by sandbox ID. It uses a 5-second initial delay, 10-second retries, a bounded deadline, and durable idempotency/lease keys. A success is accepted only when `result.json` matches the task and handoff identities and validation passed.
 
-Modal lifecycle reference: [Modal Sandboxes](https://modal.com/docs/guide/sandboxes).
+Successful cloud work creates `result.bundle`. The completed sandbox remains available for a bounded retention period. The local result importer:
 
-## Result artifact
+1. reconnects to the expected sandbox;
+2. copies the bundle into a private temporary directory;
+3. verifies size, SHA-256, Git refs, task branch, and expected commit;
+4. fast-forwards only a clean Dex task worktree; and
+5. terminates the sandbox only after a verified import.
 
-The terminal artifact has this shape:
-
-```json
-{
-  "taskId": "checkout-failures-a1b2",
-  "handoffSha256": "64-character-sha256",
-  "status": "succeeded",
-  "summary": "Fixed the checkout retry boundary and added coverage.",
-  "validation": {
-    "commands": ["[\"npm\",\"test\"]"],
-    "passed": true
-  },
-  "git": {
-    "branch": "dex/checkout-failures-a1b2",
-    "commit": "commit-sha",
-    "bundlePath": "/dex/result.bundle",
-    "bundleSha256": "64-character-sha256"
-  }
-}
-```
-
-Allowed statuses are `succeeded`, `failed`, and `cancelled`. A `succeeded` artifact with failed validation is rejected. A task/hash mismatch, malformed artifact, missing artifact, nonzero sandbox exit paired with claimed success, or deadline expiry produces a terminal failure.
+On a recoverable import failure, Dex records the failure without claiming local synchronization and preserves the sandbox for recovery.
 
 ## Battery and sleep safety
 
-Real battery readings come from `/usr/bin/pmset -g batt`. Simulated readings are created only through an explicit demo path and carry `simulated: true` through durable events and user-facing copy. Threshold alerts occur at 20%, 10%, and 5% while local tasks are active; charging or AC power resets the crossed-threshold list.
+Both real and controlled readings call the same policy function. Real telemetry is parsed from `/usr/bin/pmset -g batt`; controlled readings carry `simulated: true` through events, prompts, `dex watch`, and user-facing text.
 
-The demo command:
+Low-battery prompts capture exact active local task IDs and expire. A plain `yes` in the same verified conversation moves only those captured tasks to Codex in Modal. It is not interpreted as arbitrary approval for another conversation or task.
 
-```bash
-npm exec -- dex demo battery 8
-```
+Normal keep-awake uses a parent-bound `caffeinate` process. Dex does not use `sudo`, change persistent system sleep settings, or enable aggressive closed-lid behavior.
 
-does not query the battery. It sends the simulated reading to the running daemon through a mode-`0600` Unix control socket, records `simulated: true`, and may enqueue a notification only when the normal active-task alert conditions are met. The CLI also prints a local confirmation. It must be described as a controlled policy-path demo, not a real battery event or live iMessage test.
+Sleep ordering is fail-closed:
 
-Dex's keep-awake assertion uses `/usr/bin/caffeinate -i -w <dex-pid>`, which prevents idle sleep only and is bound to the owning process. Dex stores the child object and captured PID and refuses to signal it if identity changes.
+1. confirm every relevant task has durable cloud ownership and monitoring;
+2. send and flush truthful user-facing copy;
+3. restore Dex-owned keep-awake state;
+4. flush local state;
+5. invoke `/usr/bin/pmset sleepnow`; and
+6. report if the request fails and the Mac remains awake.
 
-Sleep follows this sequence:
+The implementation and controlled tests cover this ordering. A physical sleep and cloud completion while the host remains asleep must be proven separately in a credentialed rehearsal.
 
-1. Evaluate cloud-ownership confirmation immediately before any power change.
-2. If false or failed, leave the Mac untouched.
-3. Restore Dex's own keep-awake assertion.
-4. Run `/usr/bin/pmset sleepnow` without `sudo`.
-5. If sleep fails, attempt to restore the prior keep-awake assertion.
+## Security boundaries
 
-No model call participates in the confirmation or command execution.
+### Owner and command boundary
 
-## Trust boundaries
-
-### Owner and cloud command boundary
-
-- Inbound transport webhooks require the configured shared secret, and the control-plane contract requires a verified owner/conversation association before issuing a device command.
-- Non-local cloud URLs must use HTTPS.
-- Device requests sign canonical metadata and content hashes with Ed25519.
-- Sequence, nonce, and timestamp metadata supports replay rejection and one controlled sequence-floor recovery.
-- Commands must validate against the schema, a pinned server key, verified-owner authority, the paired owner ID, and expiry/future-skew limits.
-- Device private key material is stored as a generic-password item in macOS Keychain and is never interpolated into a shell command or error.
+- Sendblue requests require the configured signing secret.
+- Provider message IDs and Dex command IDs are deduplicated.
+- Device requests use Ed25519 signatures, body hashes, sequence numbers, nonces, and timestamps.
+- Commands require a pinned server key, verified-owner authority, matching owner/conversation identity, and valid expiry.
+- Device private keys and local runtime credentials are stored in macOS Keychain.
 
 ### Repository and worker boundary
 
-- Each task operates in a dedicated worktree and Dex branch.
-- Worker prompts prohibit push, deployment, merge, protected-branch modification, and destructive remote actions.
-- Provider completion and exit status are checked independently; exit code zero alone is insufficient.
-- Validation is explicit and recorded, but local workers can still modify files inside their authorized worktree.
+- Tasks execute only in isolated Dex worktrees.
+- Processes are spawned with executable-plus-argv APIs, not shell interpolation.
+- Provider environments strip unrelated Gemini, Modal, Sendblue, OpenAI, and handoff credentials.
+- Workers are instructed not to push, deploy, merge, or modify protected branches.
+- Exit code, provider completion, and validation evidence are checked independently.
 
 ### Memory and cloud boundary
 
-- Known credential forms and sensitive keys are redacted recursively.
-- A remaining secret finding rejects the handoff.
-- Content and artifacts are hashed; cloud handoffs require HMAC verification.
-- Signing and model keys are runtime secrets, never handoff fields.
-- Result task and handoff identities must match the monitor request.
+- Known secret forms are recursively redacted and a remaining finding rejects the handoff.
+- Content and artifacts are hashed; cloud handoffs require signature verification.
+- Result identities must match the registered task, handoff, sandbox, branch, and commit.
+- Local import never rewrites a dirty worktree or a non-Dex branch.
 
 ### Power boundary
 
-- Battery and sleep commands use fixed executable paths and argv.
-- Power effects require deterministic handlers and an immediate confirmation gate.
-- Internal demo control enters through a schema-validated, size-bounded Unix socket with mode `0600`.
-- Dex never changes persistent system sleep policy and does not use aggressive lid-sleep workarounds.
+- Power executables and arguments are fixed.
+- A typed request alone is insufficient; the immediate cloud-ownership gate must pass.
+- The demo control socket is schema-validated, size-bounded, owner-only, and mode `0600`.
 
-## Configuration and secrets
+## Verification matrix
 
-Local setup names are defined by [`.env.example`](../.env.example):
+CI runs typecheck, build, the test suite serially, production dependency audit, and whitespace validation on Node 22.
 
-```text
-DEX_CLOUD_URL
-DEX_DEVICE_ID
-DEX_DEVICE_KEY_ID
-DEX_CLOUD_SERVER_KEYS_JSON
-DEX_SENDBLUE_LINE
-SENDBLUE_NUMBER
-GEMINI_API_KEY
-MODAL_TOKEN_ID
-MODAL_TOKEN_SECRET
-DEX_MODAL_SECRET_NAME
-DEX_HANDOFF_SIGNING_KEY
-DEX_HOME
-CLAUDE_MEM_URL
-DEX_DEFAULT_REPOSITORY
-```
-
-The setup process persists non-secret project/config values under `DEX_HOME` (default `~/.dex`) and stores the device private key plus local runtime credentials in separate macOS Keychain records. A `.env` file is not loaded automatically. The installed LaunchAgent receives `DEX_HOME` and hydrates scoped runtime credentials from Keychain.
-
-Additional execution authority lives outside that file:
-
-- the local Claude and Codex CLIs must already be installed and authenticated;
-- Dex Cloud must provide the owner/conversation association and server verification keys;
-- setup requires the Dex iMessage number plus Modal account credentials; and
-- Modal must receive the cloud model credential and matching handoff verification key, either as ephemeral scoped values or through the configured named secret.
-
-Dex Cloud accepts legacy secret-name aliases (`SENDBLUE_NUMBER`, `SENDBLUE_API_SECRET`, and `SENDBLUE_WEBHOOK_SECRET`) as well as Dex's canonical names. Values remain in the deployment secret manager; they are never copied into source or handoffs.
-
-These values belong in the appropriate Keychain, service, or secret manager—not in Git, task state, event payloads, or handoffs.
-
-## Verification status
-
-As of this document update, typecheck, build, and **111 tests across 18 files** pass. Tests use controlled process spawners, mock HTTP, temporary real Git repositories, a subprocess cloud-worker harness, durable file persistence, fake Modal clients/sandboxes, and fake power executors. The composed golden-path acceptance spans signed webhook ingress through exactly-once terminal Sendblue outbox creation.
-
-| Claim | Evidence in this repository | What remains before a live claim |
+| Claim | Repository evidence | External proof still required |
 | --- | --- | --- |
-| Typed deterministic routing and local transport | Router/runtime tests plus composed signed webhook → pairing → device command → daemon handling acceptance | Live Dex Cloud deployment and paired phone |
-| Gemini lane/model policy | Fast/brain request-shape tests and successful real calls to both configured models | None for model availability; deployment still needs its credential |
-| Claude/Codex process lifecycle | JSONL adapter tests plus successful authenticated disposable-repository smoke runs | Full run triggered by live iMessage |
-| Claude-Mem request/selection behavior | Progressive retrieval tests plus real observation `#5873` written, summarized, searched, and fetched | Record the behavior in the submission video |
-| Reconstructable signed handoff | Temporary real Git repo, cryptographic tests, and tamper rejection in the cloud-worker harness | Transfer one through a real Modal account |
-| Modal SDK shape, mover ordering, and monitor behavior | Fake SDK/sandbox tests and startup-ack tests | Run create/upload/start/detach/reconnect/result against Modal |
-| Signed messaging and control-plane contracts | Cryptographic, tamper, replay, dedupe, persistence, and composed golden-path tests | Pair with deployed Dex Cloud and exchange live iMessages |
-| Real/demo battery distinction and sleep gate | Parsed `pmset` fixtures and fake executors; daemon source starts the poller | Perform an authorized real notification and sleep test |
-| Exactly-once completion logic | Monitor/control-plane tests plus durable file/Postgres repository and one golden-path completion outbox | Credentialed production transaction rehearsal |
+| Typed deterministic routing | Router schemas, route tests, composed command/runtime tests | None for local logic |
+| Parallel fresh workers | Adapter and orchestrator lifecycle tests with isolated temporary repositories | Authenticated provider rehearsal for a specific deployment |
+| Claude-Mem continuity | Observation/retrieval/selection tests and deterministic fallback tests | Reachable Claude-Mem service and behavioral demo evidence |
+| Signed reconstructable handoff | Real temporary Git bundles, cryptographic verification, tamper rejection | Credentialed upload for a specific Modal account |
+| Modal lifecycle | Mover, worker, monitor, terminal callback, and result-import tests | Live sandbox availability and credentials |
+| Exactly-once completion contract | Durable monitor leases, task transition, outbox, command, and reconciliation tests | Deployed Sendblue delivery observation |
+| Battery provenance | Real-parser fixtures and controlled-input policy tests | Real low-battery observation if claimed |
+| Sleep safety | Deterministic gate and fake-executor ordering tests | Physical sleep followed by cloud completion if claimed |
 
-The daemon and Dex Cloud service are both runnable. The cloud service provides Postgres-backed durable state, deterministic monitor retries, Sendblue delivery/reconciliation, and HTTP control-plane routes. The automated golden path proves their contracts in-process, but the repository must not be described as having completed the physical iMessage → real Modal → sleeping Mac → completion-iMessage demonstration until credentials are configured and that rehearsal is recorded.
+Automated acceptance uses controlled external-provider boundaries. It is evidence for the orchestration contract, not evidence that a particular Sendblue deployment, Modal account, or physical sleep event was live.
 
-## P1 after the physical golden path
+## P1 / optional work
 
-- automatic worker-crash replacement and complete daemon-restart recovery;
-- old Claude/Codex session adoption and three-task concurrency;
-- importing a verified Modal `result.bundle` into the local Dex worktree;
+- complete conversational adoption of discovered Claude/Codex sessions;
+- three-task concurrency and broader restart hardening;
 - cross-agent review and bounded remediation; and
-- optional Greptile review after tests pass, with material findings converted to structured Dex feedback for at most one fresh Codex remediation attempt.
+- optional Greptile review for an existing PR after validation passes.
 
-## Internal operational commands
+Greptile is not required for P0 and must not block task completion. Dex never creates or pushes a PR merely to trigger review.
 
-These are implementation and diagnosis surfaces, not the product UI:
+## Operational interfaces
 
 | Command | Purpose | External effect |
 | --- | --- | --- |
-| `npm exec -- dex doctor` | Check Node, macOS, Git, agent CLIs, power tools, Claude-Mem, cloud config, and Modal env | Health probes only |
-| `npm exec -- dex status` | Read durable local task status | None |
-| `npm exec -- dex watch --once` | Render judge/developer state view | None |
+| `npm exec -- dex doctor` | Check runtime, agents, Claude-Mem, cloud config, and Modal authentication | Read-only health probes |
+| `npm exec -- dex status` | Read durable local state | None |
+| `npm exec -- dex watch --once` | Render the judge/developer view | None |
 | `npm exec -- dex route "…"` | Inspect typed routing | May call Gemini when configured |
-| `npm exec -- dex cloud doctor` | Exercise Modal create/exec/detach/reconnect/terminate | Creates and terminates a real sandbox |
-| `npm exec -- dex demo battery 8` | Inject a clearly simulated policy reading through the daemon control socket | Mutates local Dex state and may enqueue demo-labeled copy |
-| `npm exec -- dex power restore` | Attempt local power recovery | Changes only the invoking Dex process's assertion state |
-
-## Provenance
-
-Dex-specific work includes the device protocol adapter, typed router, task/worker state, agent adapters, memory continuity, handoff integrity, local power controls, Modal continuation, deterministic monitor, and product copy. Existing cloud messaging, identity, scheduling/storage, and outbound outbox service boundaries are reused. This architecture depends on them without claiming they were created as part of Dex.
+| `npm exec -- dex cloud doctor` | Exercise Modal create/exec/detach/reconnect/terminate | Creates and terminates a sandbox |
+| `npm exec -- dex demo battery 8` | Inject an explicitly controlled reading through the daemon | Mutates Dex state and may send demo-labeled copy |
+| `npm exec -- dex power restore` | Restore Dex-owned keep-awake state | Stops only Dex's power assertion |
