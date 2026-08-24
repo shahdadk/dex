@@ -38,6 +38,7 @@ import {
   verifySendblueWebhookSecret,
   type HeaderSource,
 } from "./sendblue.js";
+import { modalMonitorTerminalKey } from "../modal-monitor/index.js";
 
 export interface DexControlPlaneOptions {
   repository: ControlPlaneRepository;
@@ -429,7 +430,7 @@ export class DexControlPlaneService {
     if (!task || !task.monitor) {
       throw new ControlPlaneError(409, "modal_result_conflict", "Task monitor is not registered");
     }
-    const expectedCompletionKey = `modal-monitor:${task.id}:terminal`;
+    const expectedCompletionKey = modalMonitorTerminalKey(task.id, task.monitor.handoffSha256);
     if (
       terminal.completionKey !== expectedCompletionKey ||
       terminal.sandboxId !== task.monitor.sandboxId

@@ -223,7 +223,10 @@ function normalizeFailedApproaches(
       .filter(Boolean);
     for (const line of evidence) {
       const causal = line.match(/^(.{5,240}?)\s+(risks?|causes?|caused|leads? to|resulted in)\s+(.{5,400})$/i);
-      if (causal && /\b(?:duplicate|twice|failure|failed|regression|unsafe|breaks?|corrupts?)\b/i.test(causal[3]!)) {
+      const approachLike = causal &&
+        causal[1]!.length <= 180 &&
+        /\b(?:perform(?:ing|ed)?|mov(?:ing|ed)?|plac(?:ing|ed)?|call(?:ing|ed)?|retry(?:ing|ied)?|skipp(?:ing|ed)?|disabl(?:ing|ed)?|assum(?:ing|ed)?|mark(?:ing|ed)?|execut(?:ing|ed)?|send(?:ing|sent)?|writ(?:ing|ten)?|delet(?:ing|ed)?)\b/i.test(causal[1]!);
+      if (causal && approachLike && /\b(?:duplicate|twice|failure|failed|regression|unsafe|breaks?|corrupts?)\b/i.test(causal[3]!)) {
         add(causal[1]!, `${causal[2]} ${causal[3]}`, memory.id);
         break;
       }

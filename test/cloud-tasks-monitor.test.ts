@@ -4,6 +4,7 @@ import {
   type DexControlPlaneService,
 } from "../src/cloud/control-plane/index.js";
 import type { ModalAdapter, ModalSandbox } from "../src/cloud/modal/index.js";
+import { modalMonitorTerminalKey } from "../src/cloud/modal-monitor/index.js";
 import {
   CLOUD_TASKS_MONITOR_PATH,
   CloudTasksModalMonitor,
@@ -25,7 +26,7 @@ const config: CloudTasksMonitorConfig = {
   serviceAccountEmail: "tasks@dex-project.iam.gserviceaccount.com",
 };
 const body = {
-  idempotencyKey: "modal-monitor:task-1:attempt:1",
+  idempotencyKey: `modal-monitor:task-1:${HASH.slice(0, 16)}:attempt:1`,
   request: {
     taskId: "task-1",
     sandboxId: "sandbox-1",
@@ -67,7 +68,7 @@ describe("Cloud Tasks Modal monitoring", () => {
       .toEqual(body);
     await expect(dispatcher.schedule({
       ...body,
-      idempotencyKey: "modal-monitor:task-1:attempt:2",
+      idempotencyKey: `modal-monitor:task-1:${HASH.slice(0, 16)}:attempt:2`,
       delayMs: 10_000,
     })).rejects.toThrow("idempotency key");
   });
@@ -100,7 +101,7 @@ describe("Cloud Tasks Modal monitoring", () => {
     })).rejects.toMatchObject({ status: 400 });
     const mismatchedIdentity = {
       ...body,
-      idempotencyKey: "modal-monitor:task-1:attempt:2",
+      idempotencyKey: `modal-monitor:task-1:${HASH.slice(0, 16)}:attempt:2`,
     };
     const mismatchedHeaders = new Headers(headers);
     mismatchedHeaders.set(
@@ -152,7 +153,7 @@ describe("Cloud Tasks Modal monitoring", () => {
       kind: "rescheduled",
       delayMs: 10_000,
       nextAttempt: 2,
-      idempotencyKey: "modal-monitor:task-1:attempt:2",
+      idempotencyKey: `modal-monitor:task-1:${HASH.slice(0, 16)}:attempt:2`,
       scheduled: true,
     });
     expect(modal.fromId).toHaveBeenCalledWith(body.request.sandboxId);
@@ -160,7 +161,7 @@ describe("Cloud Tasks Modal monitoring", () => {
     expect(schedule).toHaveBeenCalledWith({
       request: { ...body.request, attempt: 2 },
       delayMs: 10_000,
-      idempotencyKey: "modal-monitor:task-1:attempt:2",
+      idempotencyKey: `modal-monitor:task-1:${HASH.slice(0, 16)}:attempt:2`,
     });
     expect(onTerminal).not.toHaveBeenCalled();
   });
@@ -191,14 +192,14 @@ describe("Cloud Tasks Modal monitoring", () => {
       event: {
         taskId: body.request.taskId,
         sandboxId: body.request.sandboxId,
-        completionKey: `modal-monitor:${body.request.taskId}:terminal`,
+        completionKey: modalMonitorTerminalKey(body.request.taskId, body.request.handoffSha256),
         status: "failed",
         reason: "deadline_exceeded",
       },
     });
     expect(sandbox.terminate).toHaveBeenCalledOnce();
     expect(onTerminal).toHaveBeenCalledWith(expect.objectContaining({
-      completionKey: `modal-monitor:${body.request.taskId}:terminal`,
+      completionKey: modalMonitorTerminalKey(body.request.taskId, body.request.handoffSha256),
     }));
   });
 

@@ -22,6 +22,7 @@ import {
   type SendblueInboundWebhook,
   type VerifiedConversationAssociation,
 } from "../src/cloud/control-plane/index.js";
+import { modalMonitorTerminalKey } from "../src/cloud/modal-monitor/index.js";
 
 const NOW_ISO = "2026-08-23T12:00:00.000Z";
 const NOW = Date.parse(NOW_ISO);
@@ -732,7 +733,7 @@ describe("durable device transport events", () => {
     });
     expect(await state.repository.listPendingMonitorJobs(100)).toEqual([
       expect.objectContaining({
-        idempotencyKey: "modal-monitor:local-modal-task:initial",
+        idempotencyKey: `modal-monitor:local-modal-task:${HASH.slice(0, 16)}:initial`,
         taskId: "local-modal-task",
         registration: expect.objectContaining({ sandboxId: "sandbox-1", workerId: "worker-1" }),
         request: expect.objectContaining({ sandboxId: "sandbox-1", attempt: 0 }),
@@ -762,7 +763,7 @@ describe("durable device transport events", () => {
       { attempted: 1, dispatched: 1 },
       { attempted: 0, dispatched: 0 },
     ]));
-    expect(dispatched).toEqual(["modal-monitor:local-modal-task:initial"]);
+    expect(dispatched).toEqual([`modal-monitor:local-modal-task:${HASH.slice(0, 16)}:initial`]);
     expect(await state.repository.listPendingMonitorJobs(100)).toEqual([]);
   });
 });
@@ -795,7 +796,7 @@ describe("Modal task registration and exactly-once completion", () => {
     const terminal = {
       taskId: accepted.taskId,
       sandboxId: "sandbox-1",
-      completionKey: `modal-monitor:${accepted.taskId}:terminal`,
+      completionKey: modalMonitorTerminalKey(accepted.taskId, HASH),
       status: "succeeded" as const,
       reason: "result" as const,
       exitCode: 0,
@@ -888,7 +889,7 @@ describe("Modal task registration and exactly-once completion", () => {
     await expect(state.service.handleModalTerminal({
       taskId: accepted.taskId,
       sandboxId: "sandbox-1",
-      completionKey: `modal-monitor:${accepted.taskId}:terminal`,
+      completionKey: modalMonitorTerminalKey(accepted.taskId, HASH),
       status: "succeeded",
       reason: "result",
       exitCode: 0,
@@ -902,6 +903,84 @@ describe("Modal task registration and exactly-once completion", () => {
       },
     })).rejects.toMatchObject({ status: 409, code: "modal_result_conflict" });
     expect(await state.repository.getTask(accepted.taskId)).toMatchObject({ status: "running" });
+  });
+
+  it("reopens the same durable task for a newer distinct Modal attempt", async () => {
+    const state = fixture();
+    await pairDevice(state);
+    const accepted = await state.service.processSendblueWebhook(
+      inbound("modal-retry-task", "fix checkout with durable retry"),
+      sendblueHeaders(),
+    );
+    if (accepted.kind !== "engineering_command") throw new Error("Expected an engineering command");
+
+    await state.service.registerModalMonitor({
+      taskId: accepted.taskId,
+      workerId: "worker-first",
+      sandboxId: "sandbox-first",
+      handoffSha256: HASH,
+      startedAt: NOW_ISO,
+      resultPath: "/dex/result.json",
+    });
+    const firstCompletionKey = modalMonitorTerminalKey(accepted.taskId, HASH);
+    await state.service.handleModalTerminal({
+      taskId: accepted.taskId,
+      sandboxId: "sandbox-first",
+      completionKey: firstCompletionKey,
+      status: "failed",
+      reason: "nonzero_exit",
+      exitCode: 1,
+      error: "Nested sandbox failed",
+    });
+
+    state.now.value += 60_000;
+    const retryStartedAt = new Date(state.now.value).toISOString();
+    const retryHash = "b".repeat(64);
+    await expect(state.service.registerModalMonitor({
+      taskId: accepted.taskId,
+      workerId: "worker-retry",
+      sandboxId: "sandbox-retry",
+      handoffSha256: retryHash,
+      startedAt: retryStartedAt,
+      resultPath: "/dex/result.json",
+    })).resolves.toEqual({ taskId: accepted.taskId, created: true, status: "running" });
+
+    const reopened = await state.repository.getTask(accepted.taskId);
+    expect(reopened).toMatchObject({
+      status: "running",
+      monitor: {
+        workerId: "worker-retry",
+        sandboxId: "sandbox-retry",
+        handoffSha256: retryHash,
+      },
+    });
+    expect(reopened).not.toHaveProperty("completionKey");
+    expect(reopened).not.toHaveProperty("completion");
+
+    const retryCompletionKey = modalMonitorTerminalKey(accepted.taskId, retryHash);
+    await state.service.handleModalTerminal({
+      taskId: accepted.taskId,
+      sandboxId: "sandbox-retry",
+      completionKey: retryCompletionKey,
+      status: "succeeded",
+      reason: "result",
+      exitCode: 0,
+      result: {
+        taskId: accepted.taskId,
+        handoffSha256: retryHash,
+        status: "succeeded",
+        summary: "Checkout retry completed",
+        validation: { commands: ["npm test"], passed: true },
+        git: { branch: "dex/checkout-retry", commit: "abc123" },
+      },
+    });
+    expect(await state.repository.getTask(accepted.taskId)).toMatchObject({
+      status: "succeeded",
+      completionKey: retryCompletionKey,
+    });
+    expect((await state.repository.listSendblueOutbox())
+      .filter(({ dedupeKey }) => dedupeKey === firstCompletionKey || dedupeKey === retryCompletionKey))
+      .toHaveLength(2);
   });
 });
 

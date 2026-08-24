@@ -6,6 +6,7 @@ import { ControlPlaneError, type MonitorJobRecord } from "../control-plane/index
 import {
   ModalMonitor,
   ModalMonitorRequestSchema,
+  modalMonitorRetryKey,
   type ModalMonitorOutcome,
   type ModalMonitorSchedule,
   type ModalMonitorOnce,
@@ -57,11 +58,11 @@ export function cloudTaskId(idempotencyKey: string): string {
 }
 
 export function modalMonitorIdempotencyKey(
-  request: Pick<ParsedModalMonitorRequest, "taskId" | "attempt">,
+  request: Pick<ParsedModalMonitorRequest, "taskId" | "handoffSha256" | "attempt">,
 ): string {
   return request.attempt === 0
-    ? `modal-monitor:${request.taskId}:initial`
-    : `modal-monitor:${request.taskId}:attempt:${request.attempt}`;
+    ? `modal-monitor:${request.taskId}:${request.handoffSha256.slice(0, 16)}:initial`
+    : modalMonitorRetryKey(request.taskId, request.handoffSha256, request.attempt);
 }
 
 export class CloudTasksMonitorDispatcher {

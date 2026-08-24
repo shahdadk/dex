@@ -358,6 +358,8 @@ describe("Claude-Mem integration", () => {
       project: "worktree-derived-name",
     }));
     expect(client.search).toHaveBeenNthCalledWith(2, expect.not.objectContaining({ project: expect.anything() }));
+    expect(client.timeline).toHaveBeenCalledOnce();
+    expect(client.timeline).toHaveBeenCalledWith(expect.objectContaining({ anchor: 100 }));
   });
 });
 
@@ -473,7 +475,9 @@ describe("handoff package", () => {
       narrative: `Durable checkout observation ${index}`,
       facts: index === 0
         ? ["Performing the external charge before the idempotency lookup risks duplicate charges on duplicate delivery"]
-        : [`Checkout fact ${index}`],
+        : index === 1
+          ? ["The checkout flow had a race condition which caused failed webhook processing and inconsistent state"]
+          : [`Checkout fact ${index}`],
       concepts: ["checkout"],
       filesRead: [],
       filesModified: [],
@@ -492,6 +496,7 @@ describe("handoff package", () => {
       doNotRepeat: true,
       sourceMemoryId: 6000,
     });
+    expect(handoff.failedApproaches).toHaveLength(1);
   });
 
   it("creates, signs, writes, and verifies a memory-complete package", async () => {

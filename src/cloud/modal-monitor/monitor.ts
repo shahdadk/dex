@@ -129,12 +129,16 @@ async function readResultFromSandbox(
   }
 }
 
-function terminalKey(taskId: string): string {
-  return `modal-monitor:${taskId}:terminal`;
+export function modalMonitorAttemptScope(taskId: string, handoffSha256: string): string {
+  return `${taskId}:${handoffSha256.slice(0, 16)}`;
 }
 
-function retryKey(taskId: string, attempt: number): string {
-  return `modal-monitor:${taskId}:attempt:${attempt}`;
+export function modalMonitorTerminalKey(taskId: string, handoffSha256: string): string {
+  return `modal-monitor:${modalMonitorAttemptScope(taskId, handoffSha256)}:terminal`;
+}
+
+export function modalMonitorRetryKey(taskId: string, handoffSha256: string, attempt: number): string {
+  return `modal-monitor:${modalMonitorAttemptScope(taskId, handoffSha256)}:attempt:${attempt}`;
 }
 
 function errorMessage(error: unknown): string {
@@ -204,7 +208,7 @@ export class ModalMonitor {
           const outcome = await this.#deliverTerminal({
             taskId: request.taskId,
             sandboxId: request.sandboxId,
-            completionKey: terminalKey(request.taskId),
+            completionKey: modalMonitorTerminalKey(request.taskId, request.handoffSha256),
             status: "failed",
             reason: "invalid_result",
             exitCode: null,
@@ -221,7 +225,7 @@ export class ModalMonitor {
         const outcome = await this.#deliverTerminal({
           taskId: request.taskId,
           sandboxId: request.sandboxId,
-          completionKey: terminalKey(request.taskId),
+          completionKey: modalMonitorTerminalKey(request.taskId, request.handoffSha256),
           status: artifact.status,
           reason: "result",
           exitCode: artifact.status === "succeeded" ? 0 : 1,
@@ -247,7 +251,7 @@ export class ModalMonitor {
           ? MODAL_MONITOR_INITIAL_DELAY_MS
           : MODAL_MONITOR_RETRY_DELAY_MS;
       const delayMs = Math.min(normalDelay, deadline - now);
-      const idempotencyKey = retryKey(request.taskId, nextAttempt);
+      const idempotencyKey = modalMonitorRetryKey(request.taskId, request.handoffSha256, nextAttempt);
       const nextRequest: ParsedModalMonitorRequest = {
         ...request,
         attempt: nextAttempt,
@@ -275,7 +279,7 @@ export class ModalMonitor {
       return this.#deliverTerminal({
         taskId: request.taskId,
         sandboxId: request.sandboxId,
-        completionKey: terminalKey(request.taskId),
+        completionKey: modalMonitorTerminalKey(request.taskId, request.handoffSha256),
         status: "failed",
         reason: "deadline_exceeded",
         exitCode: null,
@@ -301,7 +305,7 @@ export class ModalMonitor {
       return this.#deliverTerminal({
         taskId: request.taskId,
         sandboxId: request.sandboxId,
-        completionKey: terminalKey(request.taskId),
+        completionKey: modalMonitorTerminalKey(request.taskId, request.handoffSha256),
         status: "failed",
         reason: "invalid_result",
         exitCode,
@@ -313,7 +317,7 @@ export class ModalMonitor {
       return this.#deliverTerminal({
         taskId: request.taskId,
         sandboxId: request.sandboxId,
-        completionKey: terminalKey(request.taskId),
+        completionKey: modalMonitorTerminalKey(request.taskId, request.handoffSha256),
         status: "failed",
         reason: "nonzero_exit",
         exitCode,
@@ -325,7 +329,7 @@ export class ModalMonitor {
     return this.#deliverTerminal({
       taskId: request.taskId,
       sandboxId: request.sandboxId,
-      completionKey: terminalKey(request.taskId),
+      completionKey: modalMonitorTerminalKey(request.taskId, request.handoffSha256),
       status: artifact.status,
       reason: "result",
       exitCode,

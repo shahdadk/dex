@@ -19,6 +19,7 @@ import {
   TaskCreatedTransportPayloadSchema,
 } from "./models.js";
 import { sha256Hex } from "../messaging/index.js";
+import { modalMonitorAttemptScope } from "../modal-monitor/index.js";
 
 export class RepositoryConflictError extends Error {
   constructor(message: string) {
@@ -153,7 +154,7 @@ function monitorJob(registration: ModalMonitorRegistration, createdAt: string): 
   const scope = `${registration.taskId}:${registration.sandboxId}:${registration.handoffSha256}`;
   return {
     id: `monitor_job_${sha256Hex(scope).slice(0, 32)}`,
-    idempotencyKey: `modal-monitor:${registration.taskId}:initial`,
+    idempotencyKey: `modal-monitor:${modalMonitorAttemptScope(registration.taskId, registration.handoffSha256)}:initial`,
     taskId: registration.taskId,
     registration: copy(registration),
     request: {
@@ -178,12 +179,34 @@ function registerMonitorInMaps(
 ): { task: CloudTaskRecord; created: boolean; jobEnqueued: boolean } {
   const task = tasks.get(registration.taskId);
   if (!task) throw new RepositoryConflictError("Task does not exist");
-  if (terminal(task.status)) {
-    throw new RepositoryConflictError("A terminal task cannot register a monitor");
-  }
   let created = false;
   let updated = task;
-  if (task.monitor !== undefined) {
+  if (terminal(task.status)) {
+    const previousCompletedAt = task.completion?.completedAt ?? task.updatedAt;
+    if (
+      task.monitor === undefined ||
+      sameMonitor(task.monitor, registration) ||
+      task.monitor.sandboxId === registration.sandboxId ||
+      task.monitor.handoffSha256 === registration.handoffSha256 ||
+      Date.parse(registration.startedAt) <= Date.parse(previousCompletedAt)
+    ) {
+      throw new RepositoryConflictError("A terminal task requires a newer, distinct Modal attempt");
+    }
+    const {
+      completionKey: _completionKey,
+      summary: _summary,
+      completion: _completion,
+      ...retryableTask
+    } = task;
+    created = true;
+    updated = {
+      ...retryableTask,
+      status: "running",
+      monitor: copy(registration),
+      updatedAt: now,
+    };
+    tasks.set(task.id, updated);
+  } else if (task.monitor !== undefined) {
     if (!sameMonitor(task.monitor, registration)) {
       throw new RepositoryConflictError("Task has a different Modal monitor");
     }

@@ -217,8 +217,13 @@ export async function collectClaudeMemMemories(
       ...(project === undefined ? {} : { project }),
     });
     const searchIds = extractObservationIds(search);
+    // Timeline expansion is meaningful only around a search hit. Some
+    // Claude-Mem versions return an unrelated global timeline when a scoped
+    // query has no results; treating that as a scoped hit can crowd the real
+    // task memory out of the bounded handoff package.
+    if (searchIds.length === 0) return [];
     const timeline = await client.timeline({
-      ...(searchIds[0] === undefined ? { query: options.query } : { anchor: searchIds[0] }),
+      anchor: searchIds[0]!,
       depthBefore: options.timelineDepth ?? 4,
       depthAfter: options.timelineDepth ?? 4,
       ...(project === undefined ? {} : { project }),

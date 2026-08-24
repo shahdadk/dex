@@ -329,6 +329,12 @@ describe("ModalTaskMover", () => {
       "Timed out waiting for Codex/Modal startup acknowledgement",
     );
 
+    const failed = await fixture.store.read();
+    expect(failed.tasks[fixture.task.id]).toMatchObject({
+      status: "failed",
+      stage: "failed",
+      metadata: { cloudMonitorAcknowledged: false },
+    });
     expect(harness.calls).toContain("terminate");
     expect(harness.calls).not.toContain("detach");
     expect(harness.calls).not.toContain("monitor");

@@ -20,6 +20,7 @@ import {
 } from "../src/cloud/control-plane/index.js";
 import {
   ModalMonitor,
+  modalMonitorTerminalKey,
   type ModalMonitorOutcome,
   type ModalTerminalEvent,
 } from "../src/cloud/modal-monitor/index.js";
@@ -802,11 +803,11 @@ describe("Dex golden path", () => {
 
     expect(await repository.getTask(cloudTask.id)).toMatchObject({
       status: "succeeded",
-      completionKey: `modal-monitor:${cloudTask.id}:terminal`,
+      completionKey: modalMonitorTerminalKey(cloudTask.id, terminalArtifact.handoffSha256),
       summary: terminalArtifact.summary,
     });
     const completionMessages = (await repository.listSendblueOutbox()).filter(
-      ({ dedupeKey }) => dedupeKey === `modal-monitor:${cloudTask.id}:terminal`,
+      ({ dedupeKey }) => dedupeKey === modalMonitorTerminalKey(cloudTask.id, terminalArtifact.handoffSha256),
     );
     expect(completionMessages).toEqual([expect.objectContaining({
       taskId: cloudTask.id,

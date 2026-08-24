@@ -57,6 +57,18 @@ export class ModalTaskMover implements TaskMover {
     const handoffPath = path.join(directory, "handoff.json");
     const readyPath = path.join(directory, "ready");
     await mkdir(directory, { recursive: true, mode: 0o700 });
+    await this.#options.store.updateState((state) => {
+      const current = state.tasks[task.id];
+      if (!current) throw new Error(`Task disappeared before cloud handoff: ${task.id}`);
+      current.metadata.cloudMonitorAcknowledged = false;
+      delete current.metadata.cloudFailure;
+      delete current.metadata.reconciledAt;
+      delete current.metadata.sandboxId;
+      delete current.metadata.handoffHash;
+      delete current.metadata.memoryCount;
+      delete current.metadata.failedApproachCount;
+      current.updatedAt = new Date().toISOString();
+    });
     await this.#options.tasks.transition(task.id, "checkpointing", {
       stage: "checkpointing",
       latestSummary: "saving code, tests, and memory for cloud continuation",
@@ -114,6 +126,7 @@ export class ModalTaskMover implements TaskMover {
     const leasePath = this.#options.codexAuthLeasePath ?? path.join(this.#options.handoffsRoot, ".codex-account-auth.lease");
     await acquireCodexAuthLease(leasePath, task.id);
     let sandbox: Awaited<ReturnType<ModalAdapter["create"]>> | undefined;
+    let cloudWorkerId: string | undefined;
     try {
     sandbox = await modal.create({
       appName: "dex",
@@ -154,6 +167,7 @@ export class ModalTaskMover implements TaskMover {
     }, this.#options.startupTimeoutMs ?? 60_000);
     const startedSandbox = sandbox;
     const id = workerId();
+    cloudWorkerId = id;
     const startedAt = startup.acknowledgedAt ?? new Date().toISOString();
     const worker = WorkerSessionSchema.parse({
       id,
@@ -207,6 +221,25 @@ export class ModalTaskMover implements TaskMover {
     await startedSandbox.detach();
     } catch (error) {
       await sandbox?.terminate().catch(() => undefined);
+      const message = error instanceof Error ? error.message : String(error);
+      const failedAt = new Date().toISOString();
+      await this.#options.store.updateState((state) => {
+        const current = state.tasks[task.id];
+        if (current) {
+          current.status = "failed";
+          current.stage = "failed";
+          current.blockedReason = message;
+          current.latestSummary = `cloud handoff failed: ${message}`;
+          current.metadata.cloudMonitorAcknowledged = false;
+          current.updatedAt = failedAt;
+        }
+        const worker = cloudWorkerId ? state.workers[cloudWorkerId] : undefined;
+        if (worker) {
+          worker.status = "failed";
+          worker.lastMessage = message;
+          worker.endedAt = failedAt;
+        }
+      }).catch(() => undefined);
       await releaseCodexAuthLease(leasePath, task.id).catch(() => undefined);
       throw error;
     } finally {

@@ -458,7 +458,7 @@ describe("durable outbox and monitor execution", () => {
         kind: "rescheduled",
         delayMs: 5_000,
         nextAttempt: 1,
-        idempotencyKey: "modal-monitor:task-1:attempt:1",
+        idempotencyKey: `modal-monitor:task-1:${HASH.slice(0, 16)}:attempt:1`,
         scheduled: true,
       }],
     });
@@ -470,7 +470,7 @@ describe("durable outbox and monitor execution", () => {
       kind: "rescheduled",
       delayMs: 10_000,
       nextAttempt: 2,
-      idempotencyKey: "modal-monitor:task-1:attempt:2",
+      idempotencyKey: `modal-monitor:task-1:${HASH.slice(0, 16)}:attempt:2`,
     })]);
     expect(sandbox.poll).toHaveBeenCalledTimes(2);
     expect(terminal).not.toHaveBeenCalled();
