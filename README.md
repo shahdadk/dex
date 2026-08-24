@@ -28,7 +28,13 @@ You: yes
 Dex: okay moving checkout to the cloud with codex right now
 ```
 
-Until the package is published, use the source-checkout commands below. The CLI remains available for setup, diagnostics, recovery, and the controlled battery demonstration; it is not the normal product UI.
+Until the package is published, the public repository supports the same one-time onboarding without a clone:
+
+```bash
+npx --yes --package=github:shahdadk/dex dex setup --project /absolute/path/to/repository
+```
+
+The CLI remains available for setup, diagnostics, recovery, and the controlled battery demonstration; it is not the normal product UI.
 
 ## The 60-second demo
 

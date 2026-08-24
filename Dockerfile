@@ -2,7 +2,10 @@ FROM node:22.15.0-bookworm-slim AS build
 
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci
+# The public GitHub install uses `prepare` to build the untracked dist tree.
+# Container builds copy source in the following step and run the build
+# explicitly, so dependency installation must not invoke prepare early.
+RUN npm ci --ignore-scripts
 COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build && npm prune --omit=dev
