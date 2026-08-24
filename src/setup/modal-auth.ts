@@ -255,7 +255,10 @@ export async function seedModalCodexAuth(options: SeedModalCodexAuthOptions = {}
       if (!hasRemoteAuth) {
         throw new Error("The Modal Codex auth path exists but is not a regular auth.json file");
       }
-    } else if (!/no such file or directory/i.test(`${existing.stdout}\n${existing.stderr}`)) {
+    } else if (!(
+      /no such file or directory/i.test(`${existing.stdout}\n${existing.stderr}`) ||
+      /path\s+["']?\/auth\.json["']?\s+does not exist/i.test(`${existing.stdout}\n${existing.stderr}`)
+    )) {
       throw new Error("Could not inspect the private Modal Codex auth Volume");
     }
     if (!hasRemoteAuth) {

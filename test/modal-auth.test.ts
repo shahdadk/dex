@@ -77,7 +77,11 @@ describe("Modal Codex account auth", () => {
       lifecycle.push(`runner:${args[1]}`);
       runnerCommands.push([command, ...args]);
       if (args[1] === "ls") {
-        return { stdout: "", stderr: "No such file or directory", exitCode: 1 };
+        return {
+          stdout: "",
+          stderr: 'path "/auth.json" does not exist',
+          exitCode: 1,
+        };
       }
       return { stdout: "", stderr: "", exitCode: 0 };
     });
