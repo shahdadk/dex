@@ -1167,6 +1167,10 @@ describe("bounded HTTP surface", () => {
     expect(health.status).toBe(200);
     expect(await health.json()).toEqual({ status: "ok" });
 
+    const publicHealth = await handler(new Request("https://cloud.dex.test/health"));
+    expect(publicHealth.status).toBe(200);
+    expect(await publicHealth.json()).toEqual({ status: "ok" });
+
     const live = await handler(new Request("https://cloud.dex.test/livez"));
     expect(live.status).toBe(200);
     expect(await live.json()).toEqual({ status: "ok" });
@@ -1186,7 +1190,7 @@ describe("bounded HTTP surface", () => {
       readiness: async () => { throw new Error("database unavailable"); },
     });
 
-    for (const path of ["/readyz", "/healthz"]) {
+    for (const path of ["/readyz", "/healthz", "/health"]) {
       const response = await handler(new Request(`https://cloud.dex.test${path}`));
       expect(response.status).toBe(503);
       expect(await response.json()).toEqual({ status: "unavailable" });

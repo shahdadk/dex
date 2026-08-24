@@ -110,7 +110,13 @@ export function createDexControlPlaneFetchHandler(
     try {
       const url = new URL(request.url);
       const isLiveness = url.pathname === "/livez";
-      const isReadiness = url.pathname === "/readyz" || url.pathname === "/healthz";
+      // Cloud Run reserves some paths ending in `z` (including `/healthz`) at
+      // the Google Frontend. Keep the conventional aliases for local/direct
+      // runtimes, and expose `/health` for a public provider-neutral probe.
+      const isReadiness =
+        url.pathname === "/readyz" ||
+        url.pathname === "/healthz" ||
+        url.pathname === "/health";
       if (isLiveness || isReadiness) {
         if (request.method !== "GET") {
           return jsonResponse(405, { code: "method_not_allowed" }, { allow: "GET" });
