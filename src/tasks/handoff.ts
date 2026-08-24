@@ -257,6 +257,33 @@ function deriveLearnedFacts(
   ]).slice(0, 100);
 }
 
+function approachText(value: TaskKnowledge["failedApproaches"] extends readonly (infer T)[] | undefined ? T : never): string[] {
+  if (typeof value === "string") return [value];
+  if (!value) return [];
+  return [value.approach, value.reason ?? "", value.outcome ?? ""];
+}
+
+function buildMemoryQuery(input: HandoffInput, knowledge: TaskKnowledge): string {
+  // Short task titles such as "fix checkout" are not discriminative enough
+  // in a long-lived engineering memory store. Include the worker's concrete
+  // discoveries and decisions so semantic retrieval finds the exact failure
+  // mode instead of unrelated historical bug fixes.
+  const taskContext = [
+    ...(knowledge.learnedFacts ?? []),
+    ...(knowledge.facts ?? []),
+    ...(knowledge.decisions ?? []),
+    ...(knowledge.failedApproaches ?? []).flatMap(approachText),
+    ...(knowledge.attemptedApproaches ?? []).flatMap(approachText),
+    ...(knowledge.nextSteps ?? []),
+  ];
+  return nonEmpty([
+    input.goal,
+    ...taskContext,
+    ...nonEmpty(input.acceptanceCriteria),
+    ...nonEmpty(input.constraints),
+  ]).join(" ").slice(0, 12_000);
+}
+
 export function handoffContent(document: HandoffDocument): Omit<HandoffDocument, "contentHash" | "integrity"> {
   const { contentHash: _contentHash, integrity: _integrity, ...content } = document;
   return content;
@@ -296,7 +323,10 @@ export async function createHandoff(
     const provided = await options.taskKnowledgeProvider();
     if (provided !== undefined) knowledge = mergeTaskKnowledge(knowledge, provided);
   }
-  knowledge = mergeTaskKnowledge(knowledge, continuationFallback(input, checkpoint));
+  knowledge = redactMemoryValue(
+    mergeTaskKnowledge(knowledge, continuationFallback(input, checkpoint)),
+  );
+  const memoryQuery = buildMemoryQuery(input, knowledge);
   const fallbackMemories = taskKnowledgeToMemories(knowledge);
   const memoryWarnings: string[] = [];
   const candidates = [...(input.memories ?? [])];
@@ -312,7 +342,7 @@ export async function createHandoff(
       try {
         candidates.push(
           ...(await collectClaudeMemMemories(memoryClient, {
-            query: [input.goal, ...nonEmpty(input.constraints), ...nonEmpty(input.acceptanceCriteria)].join(" "),
+            query: memoryQuery,
             ...(input.repository.project === undefined
               ? input.repository.path === undefined
                 ? {}
@@ -329,7 +359,7 @@ export async function createHandoff(
   }
 
   const memories = selectMemories(candidates, {
-    query: [input.goal, ...nonEmpty(input.constraints), ...nonEmpty(input.acceptanceCriteria)].join(" "),
+    query: memoryQuery,
     fallback: fallbackMemories,
   });
   const validation = input.validation ?? { commands: [], expectedEvidence: [] };

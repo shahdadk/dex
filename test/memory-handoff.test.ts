@@ -466,6 +466,60 @@ describe("memory selection and safety", () => {
 });
 
 describe("handoff package", () => {
+  it("uses concrete worker discoveries to retrieve the task-specific Claude-Mem failure", async () => {
+    const observations = Array.from({ length: 5 }, (_, index): MemoryObservation => ({
+      id: index === 0 ? 6044 : 6100 + index,
+      source: "claude-mem",
+      type: index === 0 ? "discovery" : "bugfix",
+      title: index === 0
+        ? "Webhook event ordering cannot be assumed for idempotency handling"
+        : `Checkout context ${index}`,
+      narrative: index === 0
+        ? "The prior checkout worker recorded a dangerous ordering assumption."
+        : `Relevant invoice webhook context ${index}`,
+      facts: index === 0
+        ? ["Performing the external charge before the idempotency lookup risks duplicate charges on duplicate delivery"]
+        : [`invoice.paid checkout fact ${index}`],
+      concepts: ["checkout", "invoice.paid", "idempotency"],
+      filesRead: [],
+      filesModified: [],
+    }));
+    const client: MemoryClient = {
+      recordObservation: vi.fn(async () => ({ status: "queued" as const })),
+      summarizeSession: vi.fn(async () => ({ status: "queued" as const })),
+      search: vi.fn(async () => ({
+        content: [{ type: "text", text: observations.map((item) => `#${item.id}`).join(" ") }],
+      })),
+      timeline: vi.fn(async () => ({ content: [] })),
+      getObservations: vi.fn(async () => observations),
+    };
+
+    const handoff = await createHandoff({
+      taskId: "checkout-specific-memory",
+      goal: "fix checkout",
+      repository: { baseCommit: "abc123", workingBranch: "dex/checkout" },
+      taskKnowledge: {
+        learnedFacts: [
+          "An early invoice.paid event currently throws; preserve idempotency before external charges.",
+        ],
+      },
+    }, { memoryClient: client });
+
+    expect(client.search).toHaveBeenCalledWith(expect.objectContaining({
+      query: expect.stringContaining("invoice.paid"),
+    }));
+    expect(client.search).toHaveBeenCalledWith(expect.objectContaining({
+      query: expect.stringContaining("idempotency"),
+    }));
+    expect(handoff.memories).toContainEqual(expect.objectContaining({ id: 6044 }));
+    expect(handoff.failedApproaches).toContainEqual({
+      approach: "Performing the external charge before the idempotency lookup",
+      reason: "risks duplicate charges on duplicate delivery",
+      doNotRepeat: true,
+      sourceMemoryId: 6044,
+    });
+  });
+
   it("materializes an explicit failed approach even when Claude-Mem classifies it as a discovery", async () => {
     const memories = Array.from({ length: 5 }, (_, index): MemoryObservation => ({
       id: 6000 + index,
