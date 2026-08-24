@@ -395,6 +395,50 @@ describe("memory selection and safety", () => {
     expect(selectMemories(many, { query: "checkout" })).toHaveLength(15);
   });
 
+  it("does not let unrelated historical failures crowd topical task memory out", () => {
+    const relevant: MemoryObservation = {
+      id: 6044,
+      source: "claude-mem",
+      type: "discovery",
+      title: "Checkout webhook idempotency",
+      narrative: "invoice.paid ordering requires idempotency before charging",
+      facts: ["External charge before idempotency risks duplicate checkout charges"],
+      concepts: ["checkout", "idempotency"],
+      filesRead: [],
+      filesModified: [],
+    };
+    const unrelated = Array.from({ length: 12 }, (_, index): MemoryObservation => ({
+      id: 1_000 + index,
+      source: "claude-mem",
+      type: "failed-approach",
+      title: `Unrelated deployment failure ${index}`,
+      narrative: "Do not repeat this release pipeline approach because validation failed.",
+      facts: ["A different application release was unsuccessful"],
+      concepts: ["deployment"],
+      filesRead: [],
+      filesModified: [],
+    }));
+    const fallback = taskKnowledgeToMemories({
+      learnedFacts: ["Checkout receives invoice.paid before subscription creation."],
+      decisions: ["Keep checkout idempotency before external charges."],
+      failedApproaches: [{
+        approach: "Charge before idempotency",
+        reason: "Duplicate checkout delivery charges twice.",
+      }],
+      constraints: ["Preserve webhook ordering independence."],
+      nextSteps: ["Run the checkout regression test."],
+    });
+
+    const selected = selectMemories([relevant, ...unrelated], {
+      query: "checkout invoice.paid idempotency duplicate charge",
+      fallback,
+    });
+
+    expect(selected).toContainEqual(expect.objectContaining({ id: 6044 }));
+    expect(selected.some((memory) =>
+      typeof memory.id === "number" && memory.id >= 1_000 && memory.id < 1_100)).toBe(false);
+  });
+
   it("redacts known secret forms and fails closed when a raw secret remains", () => {
     const raw = {
       API_TOKEN: "plain-secret",

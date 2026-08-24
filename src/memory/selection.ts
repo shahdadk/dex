@@ -142,13 +142,27 @@ function scoreMemory(memory: MemoryObservation, queryTokens: Set<string>, now: n
   const text = searchableText(memory).toLowerCase();
   const memoryTokens = tokenize(text);
   let score = memory.source === "claude-mem" ? 2 : 1;
+  let overlap = 0;
   for (const token of queryTokens) {
-    if (memoryTokens.has(token)) score += 4;
-    else if (text.includes(token)) score += 1;
+    if (memoryTokens.has(token)) {
+      score += 4;
+      overlap += 1;
+    } else if (text.includes(token)) {
+      score += 1;
+      overlap += 1;
+    }
   }
   const type = memory.type?.toLowerCase() ?? "";
-  if (["decision", "bugfix", "discovery", "failed-approach", "learned-fact"].includes(type)) score += 5;
-  if (/\b(?:failed|failure|avoid|do not|did not work|unsuccessful|regression)\b/i.test(text)) score += 7;
+  // A generic failure from another project must not outrank a topical fact.
+  // Type and failure bonuses apply to Claude-Mem only after at least one
+  // task-query term matches; deterministic TaskKnowledge remains eligible as
+  // the bounded continuity fallback.
+  if (memory.source !== "claude-mem" || overlap > 0) {
+    if (["decision", "bugfix", "discovery", "failed-approach", "learned-fact"].includes(type)) score += 5;
+    if (/\b(?:failed|failure|avoid|do not|did not work|unsuccessful|regression)\b/i.test(text)) score += 7;
+  } else {
+    score -= 20;
+  }
   if (memory.createdAtEpoch !== undefined) {
     const ageDays = Math.max(0, now - memory.createdAtEpoch) / 86_400_000;
     score += Math.max(0, 3 - ageDays / 30);
@@ -189,15 +203,23 @@ export function selectMemories(
 
   const now = Date.now();
   const queryTokens = tokenize(options.query);
-  return [...unique.values()]
-    .map((memory) => ({ memory, score: scoreMemory(memory, queryTokens, now) }))
+  const ranked = [...unique.values()]
+    .map((memory) => ({
+      memory,
+      score: scoreMemory(memory, queryTokens, now),
+      topical: memory.source !== "claude-mem" ||
+        [...queryTokens].some((token) => searchableText(memory).toLowerCase().includes(token)),
+    }))
     .sort((left, right) => {
       if (right.score !== left.score) return right.score - left.score;
       const rightTime = right.memory.createdAtEpoch ?? 0;
       const leftTime = left.memory.createdAtEpoch ?? 0;
       if (rightTime !== leftTime) return rightTime - leftTime;
       return String(left.memory.id).localeCompare(String(right.memory.id));
-    })
+    });
+  const topical = ranked.filter((candidate) => candidate.topical);
+  const pool = topical.length >= minimum ? topical : ranked;
+  return pool
     .slice(0, maximum)
     .map(({ memory, score }) => ({ ...memory, relevanceScore: Number(score.toFixed(3)) }));
 }

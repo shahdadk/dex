@@ -279,8 +279,6 @@ function buildMemoryQuery(input: HandoffInput, knowledge: TaskKnowledge): string
   return nonEmpty([
     input.goal,
     ...taskContext,
-    ...nonEmpty(input.acceptanceCriteria),
-    ...nonEmpty(input.constraints),
   ]).join(" ").slice(0, 12_000);
 }
 
@@ -323,10 +321,14 @@ export async function createHandoff(
     const provided = await options.taskKnowledgeProvider();
     if (provided !== undefined) knowledge = mergeTaskKnowledge(knowledge, provided);
   }
-  knowledge = redactMemoryValue(
-    mergeTaskKnowledge(knowledge, continuationFallback(input, checkpoint)),
-  );
+  // Build retrieval from task-specific worker knowledge before adding generic
+  // continuity constraints and validation instructions.
+  knowledge = redactMemoryValue(knowledge);
   const memoryQuery = buildMemoryQuery(input, knowledge);
+  knowledge = redactMemoryValue(mergeTaskKnowledge(
+    knowledge,
+    continuationFallback(input, checkpoint),
+  ));
   const fallbackMemories = taskKnowledgeToMemories(knowledge);
   const memoryWarnings: string[] = [];
   const candidates = [...(input.memories ?? [])];

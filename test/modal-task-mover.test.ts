@@ -256,7 +256,11 @@ describe("ModalTaskMover", () => {
     const uploaded = harness.getUploadedHandoff();
     expect(uploaded).toBeDefined();
     expect(uploaded?.memories.length).toBeGreaterThanOrEqual(5);
-    expect(uploaded?.failedApproaches).toHaveLength(1);
+    expect(uploaded?.failedApproaches).toContainEqual(expect.objectContaining({
+      approach: "Detach before scheduling the monitor",
+      reason: "The task could become unowned.",
+      doNotRepeat: true,
+    }));
     const workerId = registration?.workerId;
     expect(workerId).toEqual(expect.any(String));
     expect(registration).toMatchObject({
