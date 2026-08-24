@@ -245,6 +245,7 @@ export class DexDaemonRuntime {
               : completion.status === "cancelled" ? "cancelled" : "failed";
             task.stage = completion.status === "succeeded" ? "done" : "failed";
             task.latestSummary = completion.summary;
+            if (completion.status === "succeeded") delete task.blockedReason;
             task.updatedAt = new Date().toISOString();
             if (resultImport) task.metadata.resultImport = resultImport;
             if (completion.tests) task.testStatus = completion.tests;

@@ -37,6 +37,7 @@ async function fixture() {
     createdAt: now,
     updatedAt: now,
     currentWorkerId: "worker-modal",
+    blockedReason: "an earlier cloud attempt failed",
     metadata: {
       conversationId: "conversation-1",
       sandboxId: "sandbox-1",
@@ -142,6 +143,7 @@ describe("cloud result completion in the daemon", () => {
         },
       },
     });
+    expect((await store.read()).tasks[task.id]?.blockedReason).toBeUndefined();
     expect(drainQueue).toHaveBeenCalledOnce();
     expect(maybeSleepWhenReady).toHaveBeenCalledOnce();
     expect(receipt).toHaveBeenCalledWith("command-cloud-complete", "processed");
