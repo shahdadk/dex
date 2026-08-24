@@ -11,6 +11,7 @@ import {
   CloudTasksMonitorDispatcher,
   CloudTasksRequestAuthenticator,
   cloudTaskId,
+  matchesModalMonitorIdempotencyKey,
   modalMonitorIdempotencyKey,
   type CloudTasksClientLike,
   type CloudTasksMonitorConfig,
@@ -38,6 +39,13 @@ const body = {
 };
 
 describe("Cloud Tasks Modal monitoring", () => {
+  it("writes attempt-scoped keys while accepting persisted legacy monitor keys", () => {
+    expect(modalMonitorIdempotencyKey(body.request)).toBe(body.idempotencyKey);
+    expect(matchesModalMonitorIdempotencyKey("modal-monitor:task-1:attempt:1", body.request)).toBe(true);
+    expect(matchesModalMonitorIdempotencyKey(body.idempotencyKey, body.request)).toBe(true);
+    expect(matchesModalMonitorIdempotencyKey("modal-monitor:another-task:attempt:1", body.request)).toBe(false);
+  });
+
   it("uses a deterministic provider task name and an OIDC HTTP request", async () => {
     const now = Date.parse("2026-08-23T18:00:00.123Z");
     const createTask = vi.fn(async () => [{}]);

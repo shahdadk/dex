@@ -4,6 +4,7 @@ import { z } from "zod";
 import { ClaudeAgentAdapter, CodexAgentAdapter } from "../../agents/index.js";
 import { ModalTaskMover, type ModalMonitorRegistration } from "../../cloud/modal-task-mover.js";
 import type { DexVerifiedCommand } from "../../cloud/messaging/index.js";
+import { DexCloudProtocolError } from "../../cloud/messaging/index.js";
 import type { DexConfig } from "../../config/config.js";
 import type { DexPaths } from "../../config/paths.js";
 import { DexOrchestrator } from "../../dex/orchestrator.js";
@@ -427,7 +428,8 @@ export async function createDaemonRuntime(options: DexDaemonRuntimeOptions): Pro
         taskId: registration.taskId,
         workerId: registration.workerId,
         payload: { ...registration },
-      }, { flush: true });
+      }, { flush: false });
+      await flushMonitorRegistration(() => bridge.syncOnce(0));
       await store.updateState((draft) => {
         const task = draft.tasks[registration.taskId];
         if (!task) throw new Error(`Task disappeared while registering cloud monitoring: ${registration.taskId}`);
@@ -491,6 +493,37 @@ export async function createDaemonRuntime(options: DexDaemonRuntimeOptions): Pro
     resultImporter: new CloudResultImporter(),
     codexAuthLeasePath: path.join(options.paths.handoffs, ".codex-account-auth.lease"),
   });
+}
+
+export async function flushMonitorRegistration(
+  sync: () => Promise<unknown>,
+  options: {
+    timeoutMs?: number;
+    retryDelayMs?: number;
+    now?: () => number;
+    wait?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<void> {
+  const timeoutMs = options.timeoutMs ?? 60_000;
+  const retryDelayMs = options.retryDelayMs ?? 1_000;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0 ||
+      !Number.isSafeInteger(retryDelayMs) || retryDelayMs < 0) {
+    throw new RangeError("Monitor registration retry bounds must be non-negative integers");
+  }
+  const now = options.now ?? Date.now;
+  const wait = options.wait ?? ((ms: number) => delay(ms));
+  const deadline = now() + timeoutMs;
+  for (;;) {
+    try {
+      await sync();
+      return;
+    } catch (error) {
+      if (!(error instanceof DexCloudProtocolError) || !error.retryable || now() >= deadline) {
+        throw error;
+      }
+      await wait(retryDelayMs);
+    }
+  }
 }
 
 function resolveProject(config: DexConfig, projects: Record<string, DexProject>): DexProject {

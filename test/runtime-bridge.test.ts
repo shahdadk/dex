@@ -4,9 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { DexCloudMessagingClient, DexVerifiedCommand } from "../src/cloud/messaging/index.js";
+import {
+  DexCloudProtocolError,
+  type DexCloudMessagingClient,
+  type DexVerifiedCommand,
+} from "../src/cloud/messaging/index.js";
 import { startControlSocket, sendControlCommand } from "../src/local/daemon/control-socket.js";
 import { DexCloudBridge } from "../src/local/daemon/cloud-bridge.js";
+import { flushMonitorRegistration } from "../src/local/daemon/runtime.js";
 import { EventLog } from "../src/state/events.js";
 import { DexStateStore } from "../src/state/store.js";
 
@@ -67,6 +72,40 @@ describe("DexCloudBridge", () => {
     await bridge.notify("chat-1", "queued result", false);
     await expect(bridge.syncOnce(0)).rejects.toThrow("offline");
     expect((await store.read()).pendingTransportEvents).toHaveLength(1);
+  });
+});
+
+describe("Modal monitor ownership acknowledgement", () => {
+  it("retries one durable registration after an ambiguous retryable cloud error", async () => {
+    let clock = 1_000;
+    const wait = vi.fn(async (ms: number) => { clock += ms; });
+    const sync = vi.fn()
+      .mockRejectedValueOnce(new DexCloudProtocolError("dispatch ambiguous", {
+        status: 500,
+        code: "internal_error",
+        retryable: true,
+      }))
+      .mockResolvedValueOnce([]);
+
+    await expect(flushMonitorRegistration(sync, {
+      timeoutMs: 5_000,
+      retryDelayMs: 250,
+      now: () => clock,
+      wait,
+    })).resolves.toBeUndefined();
+    expect(sync).toHaveBeenCalledTimes(2);
+    expect(wait).toHaveBeenCalledWith(250);
+  });
+
+  it("does not retry a permanent monitor-registration rejection", async () => {
+    const error = new DexCloudProtocolError("invalid event", {
+      status: 400,
+      code: "invalid_transport_event",
+      retryable: false,
+    });
+    const sync = vi.fn(async () => { throw error; });
+    await expect(flushMonitorRegistration(sync)).rejects.toBe(error);
+    expect(sync).toHaveBeenCalledOnce();
   });
 });
 

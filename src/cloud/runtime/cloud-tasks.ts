@@ -65,6 +65,22 @@ export function modalMonitorIdempotencyKey(
     : modalMonitorRetryKey(request.taskId, request.handoffSha256, request.attempt);
 }
 
+function legacyModalMonitorIdempotencyKey(
+  request: Pick<ParsedModalMonitorRequest, "taskId" | "attempt">,
+): string {
+  return request.attempt === 0
+    ? `modal-monitor:${request.taskId}:initial`
+    : `modal-monitor:${request.taskId}:attempt:${request.attempt}`;
+}
+
+export function matchesModalMonitorIdempotencyKey(
+  idempotencyKey: string,
+  request: Pick<ParsedModalMonitorRequest, "taskId" | "handoffSha256" | "attempt">,
+): boolean {
+  return idempotencyKey === modalMonitorIdempotencyKey(request) ||
+    idempotencyKey === legacyModalMonitorIdempotencyKey(request);
+}
+
 export class CloudTasksMonitorDispatcher {
   readonly #config: CloudTasksMonitorConfig;
   readonly #client: CloudTasksClientLike;
@@ -92,7 +108,7 @@ export class CloudTasksMonitorDispatcher {
     if (!Number.isSafeInteger(schedule.delayMs) || schedule.delayMs < 0) {
       throw new RangeError("Cloud Tasks monitor delay must be a non-negative integer");
     }
-    if (schedule.idempotencyKey !== modalMonitorIdempotencyKey(schedule.request)) {
+    if (!matchesModalMonitorIdempotencyKey(schedule.idempotencyKey, schedule.request)) {
       throw new TypeError("Cloud Tasks monitor idempotency key does not match its request");
     }
     const parent = this.#client.queuePath(
@@ -186,7 +202,7 @@ export class CloudTasksRequestAuthenticator {
     const result = CloudTasksMonitorBodySchema.safeParse(body);
     if (!result.success) throw new ControlPlaneError(400, "invalid_cloud_task", "Invalid Cloud Tasks monitor body");
     const parsed = result.data;
-    if (parsed.idempotencyKey !== modalMonitorIdempotencyKey(parsed.request)) {
+    if (!matchesModalMonitorIdempotencyKey(parsed.idempotencyKey, parsed.request)) {
       throw new ControlPlaneError(400, "invalid_cloud_task", "Cloud Tasks monitor identity does not match its request");
     }
     const expectedTask = cloudTaskId(parsed.idempotencyKey);
