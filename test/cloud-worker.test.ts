@@ -18,6 +18,7 @@ interface WorkerFixture {
   projectPath: string;
   promptPath: string;
   environmentPath: string;
+  argumentsPath: string;
   handoff: HandoffDocument;
 }
 
@@ -74,6 +75,7 @@ async function createWorkerFixture(): Promise<WorkerFixture> {
   const handoffPath = path.join(cloudRoot, "handoff.json");
   const promptPath = path.join(directory, "codex-prompt.txt");
   const environmentPath = path.join(directory, "codex-environment.json");
+  const argumentsPath = path.join(directory, "codex-arguments.json");
   await Promise.all([mkdir(repositoryPath), mkdir(cloudRoot), mkdir(path.dirname(projectPath))]);
   await mustExec("git", ["init", "-b", "main"], repositoryPath);
   await mustExec("git", ["config", "user.name", "Dex Test"], repositoryPath);
@@ -107,7 +109,7 @@ async function createWorkerFixture(): Promise<WorkerFixture> {
     },
   );
   await writeHandoff(handoffPath, handoff);
-  return { directory, cloudRoot, projectPath, promptPath, environmentPath, handoff };
+  return { directory, cloudRoot, projectPath, promptPath, environmentPath, argumentsPath, handoff };
 }
 
 async function installFakeCodex(directory: string): Promise<string> {
@@ -126,6 +128,7 @@ let prompt = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => { prompt += chunk; });
 process.stdin.on("end", () => {
+  fs.writeFileSync(process.env.FAKE_CODEX_ARGUMENTS_PATH, JSON.stringify(process.argv.slice(2)), "utf8");
   fs.writeFileSync(process.env.FAKE_CODEX_PROMPT_PATH, prompt, "utf8");
   fs.writeFileSync(process.env.FAKE_CODEX_ENV_PATH, JSON.stringify({
     codexHome: process.env.CODEX_HOME,
@@ -164,6 +167,7 @@ async function runWorker(fixture: WorkerFixture) {
       CODEX_HOME: codexHome,
       FAKE_CODEX_PROMPT_PATH: fixture.promptPath,
       FAKE_CODEX_ENV_PATH: fixture.environmentPath,
+      FAKE_CODEX_ARGUMENTS_PATH: fixture.argumentsPath,
     },
   });
 }
@@ -241,6 +245,17 @@ describe("Modal cloud worker", () => {
     expect(JSON.parse(await readFile(fixture.environmentPath, "utf8"))).toEqual({
       codexHome: path.join(fixture.directory, "codex-home"),
     });
+    expect(JSON.parse(await readFile(fixture.argumentsPath, "utf8"))).toEqual([
+      "-C",
+      fixture.projectPath,
+      "--dangerously-bypass-approvals-and-sandbox",
+      "exec",
+      "--json",
+      "--color",
+      "never",
+      "--ignore-user-config",
+      "-",
+    ]);
     expect((await stat(path.join(fixture.directory, "codex-home"))).mode & 0o777).toBe(0o700);
     expect((await stat(path.join(fixture.directory, "codex-home", "auth.json"))).mode & 0o777).toBe(0o600);
     expect(JSON.parse(await readFile(path.join(fixture.cloudRoot, "result.json"), "utf8"))).toMatchObject({

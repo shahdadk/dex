@@ -46,10 +46,11 @@ export async function runCloudWorker(): Promise<void> {
     const worker = spawn("codex", [
       "-C",
       project,
-      "--sandbox",
-      "workspace-write",
-      "--ask-for-approval",
-      "never",
+      // Modal is the outer security boundary. Starting Codex's Linux
+      // bubblewrap sandbox inside that container fails on network namespace
+      // setup, so use the CLI mode explicitly intended for an already
+      // externally sandboxed automation runner.
+      "--dangerously-bypass-approvals-and-sandbox",
       "exec",
       "--json",
       "--color",
