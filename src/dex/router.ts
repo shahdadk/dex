@@ -7,14 +7,20 @@ import {
 } from "../agents/session-adoption.js";
 import { GeminiRouter } from "./gemini.js";
 
-const STATUS = /^(?:dex[:,]?\s*)?(?:status\??|what(?:'s| is) (?:running|going on)|what are you working on)\s*$/i;
+const STATUS = /^(?:dex[:,]?\s*)?(?:status|what(?:'s| is) (?:running|going on)|what are you working on)[?.!]*\s*$/i;
 const LIST_SESSIONS = /^(?:(?:what|which)\s+(?:(?:recent|old)\s+)?(?:(?:claude|codex)\s+)?sessions?\s+(?:do\s+)?(?:i|we)\s+have|(?:show|list)(?:\s+me)?\s+(?:my\s+)?(?:(?:recent|old)\s+)?(?:(?:claude|codex)\s+)?sessions?)\??$/i;
+const ADOPT_LISTED_SESSION = /^(?:please\s+)?(?:continue|resume|adopt|pick\s+(?:back\s+)?up)\s+(?:the\s+)?(first|second|third|fourth|fifth|\d{1,2}(?:st|nd|rd|th)?)\s+(?:one|session)?[?.!]*$/i;
 const MEMORY = /^(?:dex[:,]?\s*)?(?:didn't we|did we|what did we|what happened with|do you remember)\b/i;
+const REVIEW_RESULT = /^(?:show(?:\s+me)?(?:\s+the)?(?:\s+full)?\s+review(?:\s+(?:findings|result))?|what\s+did\s+(?:the\s+)?(?:(?:claude|codex)\s+)?review\s+find|review\s+(?:findings|results?))(?:\s+(?:for|on)\s+(.+?))?[?.!]*$/i;
+const CROSS_AGENT_REVIEW = /^(?:please\s+)?(?:have|ask|use)\s+(claude|codex)\s+(?:to\s+)?review\s+what\s+(claude|codex)\s+(?:did|changed|implemented|built)(?:\s+(?:on|for)\s+(.+))?$/i;
+const NAMED_TASK_REVIEW = /^(?:please\s+)?(?:have|ask|use)\s+(claude|codex)\s+(?:to\s+)?review\s+(?:the\s+)?(.+?)\s+(?:task|work|changes)$/i;
 const KEEP_AWAKE = /\bkeep (?:this|my|the)?\s*mac awake(?: until (?:everything|all tasks) (?:is|are) (?:done|finished))?/i;
 const SLEEP = /\bsleep (?:this|my|the)?\s*mac\b|\bwhen (?:everything|all tasks) (?:is|are) (?:done|finished),? sleep/i;
+const SLEEP_AFTER_TASKS = /\b(?:when|after|once)\s+(?:(?:everything|all tasks|the tasks|the work)\s+(?:(?:is|are)\s+)?(?:done|finished|complete)|(?:everything|all tasks|the tasks|the work)\s+(?:finishes|completes)|it(?:(?:'s| is)\s+(?:done|finished|complete)|\s+(?:finishes|completes))|you(?:'re| are)\s+done)\b/i;
 const MOVE = /\bmove\s+(.+?)\s+to\s+(?:the\s+)?(cloud|local)(?:\s+and\s+use\s+(claude|codex))?/i;
 const CHANGE = /\b(?:give|have|use)\s+(?:the\s+)?(.+?)\s+(?:to|with|use)\s+(claude|codex)\b|\b(?:claude|codex)\s+(?:take over|handle)\s+(.+)/i;
 const CHANGE_AGENT_FIRST = /\b(?:use|switch to)\s+(claude|codex)\s+(?:for|on)\s+(.+)/i;
+const IMPLICIT_TAKEOVER = /^(?:please\s+)?(?:have\s+)?(claude|codex)\s+(?:take over|handle it|handle that|handle this)$/i;
 const STOP = /^(?:dex[:,]?\s*)?(?:stop|cancel|pause)\s+(.+)$/i;
 const RESUME = /^(?:dex[:,]?\s*)?(?:resume|continue)\s+(.+)$/i;
 
@@ -77,11 +83,38 @@ export class MessageRouter {
 
 export function deterministicActions(message: string): DexAction[] {
   if (STATUS.test(message)) return [{ type: "STATUS" }];
+  const listedSession = message.match(ADOPT_LISTED_SESSION)?.[1];
+  if (listedSession) return [{ type: "ADOPT_LISTED_SESSION", ordinal: sessionOrdinal(listedSession) }];
   if (LIST_SESSIONS.test(message)) {
     const provider = message.match(/\b(claude|codex)\b/i)?.[1]?.toLowerCase() as "claude" | "codex" | undefined;
     return [{ type: "LIST_SESSIONS", ...(provider ? { provider } : {}) }];
   }
+  const reviewResult = message.match(REVIEW_RESULT);
+  if (reviewResult) {
+    return [{
+      type: "REVIEW_RESULT",
+      ...(reviewResult[1] ? { taskQuery: normalizeTaskQuery(reviewResult[1]) } : {}),
+    }];
+  }
   if (MEMORY.test(message)) return [{ type: "MEMORY_QUERY", query: message }];
+
+  const crossAgentReview = message.match(CROSS_AGENT_REVIEW);
+  if (crossAgentReview?.[1] && crossAgentReview[2]) {
+    return [{
+      type: "REVIEW_TASK",
+      reviewer: crossAgentReview[1].toLowerCase() as "claude" | "codex",
+      sourceAgent: crossAgentReview[2].toLowerCase() as "claude" | "codex",
+      ...(crossAgentReview[3] ? { taskQuery: normalizeTaskQuery(crossAgentReview[3]) } : {}),
+    }];
+  }
+  const namedTaskReview = message.match(NAMED_TASK_REVIEW);
+  if (namedTaskReview?.[1] && namedTaskReview[2]) {
+    return [{
+      type: "REVIEW_TASK",
+      reviewer: namedTaskReview[1].toLowerCase() as "claude" | "codex",
+      taskQuery: normalizeTaskQuery(namedTaskReview[2]),
+    }];
+  }
 
   const actions: DexAction[] = [];
   const move = message.match(MOVE);
@@ -96,9 +129,10 @@ export function deterministicActions(message: string): DexAction[] {
 
   const change = message.match(CHANGE);
   const agentFirstChange = message.match(CHANGE_AGENT_FIRST);
-  if (change || agentFirstChange) {
-    const taskQuery = agentFirstChange?.[2] ?? change?.[1] ?? change?.[3];
-    const explicitAgent = agentFirstChange?.[1] ?? change?.[2] ?? message.match(/\b(claude|codex)\b/i)?.[1];
+  const implicitTakeover = message.match(IMPLICIT_TAKEOVER);
+  if (change || agentFirstChange || implicitTakeover) {
+    const taskQuery = agentFirstChange?.[2] ?? change?.[1] ?? change?.[3] ?? (implicitTakeover ? "it" : undefined);
+    const explicitAgent = agentFirstChange?.[1] ?? change?.[2] ?? implicitTakeover?.[1] ?? message.match(/\b(claude|codex)\b/i)?.[1];
     if (taskQuery && explicitAgent && !move) {
       actions.push({
         type: "CHANGE_AGENT",
@@ -116,9 +150,7 @@ export function deterministicActions(message: string): DexAction[] {
   if (SLEEP.test(message)) {
     actions.push({
       type: "SLEEP",
-      when: /\bwhen\s+(?:everything|all tasks).*(?:done|finished)\b|\bafter\s+(?:everything|all tasks).*(?:done|finished)\b/i.test(message)
-        ? "tasks_complete"
-        : "now",
+      when: SLEEP_AFTER_TASKS.test(message) ? "tasks_complete" : "now",
     });
   }
   return actions;
@@ -168,5 +200,14 @@ function hasExplicitAgentAssignment(message: string): boolean {
 }
 
 function normalizeTaskQuery(value: string): string {
-  return value.replace(/\b(?:task|thing)\b/gi, "").replace(/\s+/g, " ").trim();
+  return value
+    .replace(/\b(?:task|thing)\b/gi, "")
+    .replace(/^the\s+/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function sessionOrdinal(value: string): number {
+  const named: Record<string, number> = { first: 1, second: 2, third: 3, fourth: 4, fifth: 5 };
+  return named[value.toLowerCase()] ?? Number.parseInt(value, 10);
 }

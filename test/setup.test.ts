@@ -217,6 +217,7 @@ describe("Modal Codex auth setup", () => {
   function fakeModal(modeExitCode = 0) {
     const executions: string[][] = [];
     const sandbox = {
+      sandboxId: "sb-setup-auth",
       exec: vi.fn(async (argv: string[]) => {
         executions.push(argv);
         const isModeCheck = argv[0] === "node" && argv.some((part) => part.includes("auth.auth_mode"));
@@ -258,6 +259,8 @@ describe("Modal Codex auth setup", () => {
       const result = await seedModalCodexAuth({
         authPath: fixture.authPath,
         volumeName: "private-auth",
+        leasePath: path.join(fixture.directory, "account.lease"),
+        operationToken: "6".repeat(64),
         runner,
         modal: fake.modal as never,
         report,
@@ -285,6 +288,8 @@ describe("Modal Codex auth setup", () => {
       await expect(seedModalCodexAuth({
         authPath: fixture.authPath,
         volumeName: "private-auth",
+        leasePath: path.join(fixture.directory, "account.lease"),
+        operationToken: "7".repeat(64),
         runner,
         modal: fake.modal as never,
       })).rejects.toThrow("not a ChatGPT account login");
@@ -325,6 +330,7 @@ describe("setup command", () => {
         detail: "authenticated CLI profile available",
       },
     ]);
+    const waitForHealthySignedTransport = vi.fn();
     const installRuntime = vi.fn(async () => "/tmp/runtime");
     const installLaunchAgent = vi.fn(async () => "/tmp/agent.plist");
     const pairMac = vi.fn(async () => ({
@@ -334,7 +340,11 @@ describe("setup command", () => {
       pairedConversationId: "conversation-1",
     }));
     const persistRuntimeSecrets = vi.fn(async () => undefined);
-    const seedModalCodexAuth = vi.fn(async () => ({ volumeName: "dex-codex-auth" }));
+    const deviceVolume = "dex-codex-auth-aabbccddeeff00112233";
+    const seedModalCodexAuth = vi.fn(async () => {
+      expect(writeFile).not.toHaveBeenCalled();
+      return { volumeName: deviceVolume };
+    });
     const modalConstructor = vi.fn();
     const machineConstructor = vi.fn();
     const updateState = vi.fn(async (mutator: (state: { projects: Record<string, unknown>; revision: number }) => void) => {
@@ -350,6 +360,7 @@ describe("setup command", () => {
     vi.doMock("../src/config/config.js", () => ({
       DexConfigSchema: { parse: parseConfig },
       loadConfig,
+      modalCodexAuthVolumeForDevice: vi.fn(() => deviceVolume),
     }));
     vi.doMock("../src/config/paths.js", () => ({ resolveDexPaths: () => paths }));
     vi.doMock("../src/daemon.js", () => ({ runDaemon: vi.fn() }));
@@ -362,6 +373,7 @@ describe("setup command", () => {
     vi.doMock("../src/setup/doctor.js", () => ({
       runDoctor,
       formatDoctor: () => "Dex Setup\n\nReady.",
+      waitForHealthySignedTransport,
     }));
     vi.doMock("../src/setup/service.js", () => ({ installRuntime, installLaunchAgent }));
     vi.doMock("../src/tasks/worktree.js", () => ({
@@ -396,12 +408,12 @@ describe("setup command", () => {
       persistRuntimeSecrets,
     }));
     vi.doMock("../src/setup/modal-auth.js", () => ({
-      DEFAULT_MODAL_CODEX_AUTH_VOLUME: "dex-codex-auth",
       seedModalCodexAuth,
     }));
 
     vi.stubEnv("DEX_HANDOFF_SIGNING_KEY", "handoff-signing-key");
     vi.stubEnv("GEMINI_API_KEY", "gemini-key");
+    vi.stubEnv("DEX_MODAL_CODEX_AUTH_VOLUME", "");
     process.argv = [
       process.execPath,
       "dex",
@@ -426,21 +438,208 @@ describe("setup command", () => {
       pairingCode: "pair-code",
       deviceName: "Test Mac",
     }));
+    expect(runDoctor).toHaveBeenCalledWith(expect.objectContaining({ deviceId: "device-1" }), {
+      signedTransportMode: "preinstall",
+    });
     expect(runDoctor).toHaveBeenCalledOnce();
     expect(seedModalCodexAuth).toHaveBeenCalledOnce();
+    expect(seedModalCodexAuth).toHaveBeenCalledWith({
+      volumeName: deviceVolume,
+      leasePath: path.join(paths.handoffs, ".codex-account-auth.lease"),
+    });
     expect(persistRuntimeSecrets).toHaveBeenCalledOnce();
     expect(modalConstructor).not.toHaveBeenCalled();
     expect(machineConstructor).not.toHaveBeenCalled();
     expect(installRuntime).not.toHaveBeenCalled();
     expect(installLaunchAgent).not.toHaveBeenCalled();
+    expect(waitForHealthySignedTransport).not.toHaveBeenCalled();
     expect(writeFile).toHaveBeenCalledWith(
       paths.config,
-      expect.stringContaining('"deviceId": "device-1"'),
+      expect.stringMatching(new RegExp(`"deviceId": "device-1"[\\s\\S]*"modalCodexAuthVolume": "${deviceVolume}"`)),
       { mode: 0o600 },
     );
-    expect(log.mock.calls.flat().join("\n")).toContain("You're done. Close Terminal and text Dex.");
+    expect(process.env.DEX_MODAL_CODEX_AUTH_VOLUME).toBe(deviceVolume);
+    expect(log.mock.calls.flat().join("\n")).toContain("signed transport were not started");
+    expect(log.mock.calls.flat().join("\n")).not.toContain("You're done. Close Terminal and text Dex.");
+  });
+
+  it("repairs stale pre-install health and completes only after a new signed daemon sync", async () => {
+    const result = await runServiceSetupCommand();
+
+    expect(result.error).not.toHaveBeenCalled();
+    expect(process.exitCode).not.toBe(1);
+    expect(result.runDoctor).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ deviceId: "device-1" }),
+      { signedTransportMode: "preinstall" },
+    );
+    expect(result.waitForHealthySignedTransport).toHaveBeenCalledWith(expect.objectContaining({
+      loadState: expect.any(Function),
+      afterRevision: 8,
+      notBefore: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+      previousLastSuccessAt: "2026-08-24T11:00:00.000Z",
+    }));
+    expect(result.runDoctor).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ deviceId: "device-1" }),
+    );
+    expect(result.installLaunchAgent).toHaveBeenCalledOnce();
+    expect(result.log.mock.calls.flat().join("\n")).toContain(
+      "You're done. Close Terminal and text Dex.",
+    );
+  });
+
+  it("does not claim setup completion when post-install signed sync times out", async () => {
+    const timeout = new Error(
+      "Dex background service did not record a new healthy signed cloud sync within 45s",
+    );
+    const result = await runServiceSetupCommand({ waitError: timeout });
+
+    expect(process.exitCode).toBe(1);
+    expect(result.installLaunchAgent).toHaveBeenCalledOnce();
+    expect(result.waitForHealthySignedTransport).toHaveBeenCalledOnce();
+    expect(result.runDoctor).toHaveBeenCalledOnce();
+    expect(result.error.mock.calls.flat().join("\n")).toContain(timeout.message);
+    expect(result.log.mock.calls.flat().join("\n")).not.toContain(
+      "You're done. Close Terminal and text Dex.",
+    );
   });
 });
+
+async function runServiceSetupCommand(options: { waitError?: Error } = {}) {
+  const setupPaths = {
+    home: "/tmp/dex-service-setup-test",
+    config: "/tmp/dex-service-setup-test/config.json",
+    state: "/tmp/dex-service-setup-test/state.json",
+    events: "/tmp/dex-service-setup-test/events.jsonl",
+    daemonPid: "/tmp/dex-service-setup-test/daemon.pid",
+    daemonLog: "/tmp/dex-service-setup-test/daemon.log",
+    powerState: "/tmp/dex-service-setup-test/power-state.json",
+    worktrees: "/tmp/dex-service-setup-test/worktrees",
+    handoffs: "/tmp/dex-service-setup-test/handoffs",
+    runtime: "/tmp/dex-service-setup-test/runtime",
+    controlSocket: "/tmp/dex-service-setup-test/runtime/control.sock",
+  };
+  const state: {
+    projects: Record<string, unknown>;
+    revision: number;
+    signedTransportHealth: {
+      status: "healthy";
+      consecutiveFailures: 0;
+      lastAttemptAt: string;
+      lastSuccessAt: string;
+    };
+  } = {
+    projects: {},
+    revision: 7,
+    signedTransportHealth: {
+      status: "healthy",
+      consecutiveFailures: 0,
+      lastAttemptAt: "2026-08-24T11:00:00.000Z",
+      lastSuccessAt: "2026-08-24T11:00:00.000Z",
+    },
+  };
+  const writeFile = vi.fn(async () => undefined);
+  const runDoctor = vi.fn(async () => [
+    { name: "Node", status: "pass" as const, detail: "Node 22" },
+    { name: "Dex Cloud", status: "pass" as const, detail: "signed sync healthy" },
+    { name: "Dex Cloud readiness", status: "pass" as const, detail: "/readyz reachable" },
+    { name: "Modal", status: "pass" as const, detail: "authenticated" },
+  ]);
+  const waitForHealthySignedTransport = options.waitError
+    ? vi.fn(async () => { throw options.waitError; })
+    : vi.fn(async () => ({
+        status: "healthy" as const,
+        consecutiveFailures: 0 as const,
+        lastAttemptAt: new Date().toISOString(),
+        lastSuccessAt: new Date().toISOString(),
+      }));
+  const installRuntime = vi.fn(async () => "/tmp/dex-runtime");
+  const installLaunchAgent = vi.fn(async () => "/tmp/com.dex.daemon.plist");
+  const deviceVolume = "dex-codex-auth-aabbccddeeff00112233";
+
+  vi.doMock("node:fs/promises", async () => ({
+    ...await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises"),
+    writeFile,
+  }));
+  vi.doMock("../src/config/config.js", () => ({
+    DexConfigSchema: { parse: (value: unknown) => value },
+    loadConfig: vi.fn(async () => config()),
+    modalCodexAuthVolumeForDevice: vi.fn(() => deviceVolume),
+  }));
+  vi.doMock("../src/config/paths.js", () => ({ resolveDexPaths: () => setupPaths }));
+  vi.doMock("../src/daemon.js", () => ({ runDaemon: vi.fn() }));
+  vi.doMock("../src/state/store.js", () => ({
+    DexStateStore: class FakeStateStore {
+      read = vi.fn(async () => structuredClone(state));
+      updateState = vi.fn(async (mutator: (draft: typeof state) => void) => {
+        mutator(state);
+        state.revision += 1;
+        return structuredClone(state);
+      });
+    },
+  }));
+  vi.doMock("../src/setup/doctor.js", () => ({
+    runDoctor,
+    formatDoctor: (_checks: unknown, title: string) => `${title}\n\nReady.`,
+    waitForHealthySignedTransport,
+  }));
+  vi.doMock("../src/setup/service.js", () => ({ installRuntime, installLaunchAgent }));
+  vi.doMock("../src/tasks/worktree.js", () => ({
+    inspectRepository: vi.fn(async () => ({
+      root: "/tmp/project",
+      branch: "main",
+      remote: "git@example.test:owner/project.git",
+    })),
+  }));
+  vi.doMock("../src/utils/ids.js", () => ({ projectId: () => "project-1" }));
+  vi.doMock("../src/cloud/modal/adapter.js", () => ({
+    ModalAdapter: class FakeModalAdapter {},
+  }));
+  vi.doMock("../src/setup/onboarding.js", () => ({
+    detectMacName: vi.fn(async () => "Test Mac"),
+    pairMac: vi.fn(async () => ({
+      deviceId: "device-1",
+      keyId: "device-key-1",
+      ownerId: "owner-1",
+      pairedConversationId: "conversation-1",
+    })),
+  }));
+  vi.doMock("../src/local/daemon/control-socket.js", () => ({ sendControlCommand: vi.fn() }));
+  vi.doMock("../src/local/pairing/secrets.js", () => ({
+    hydrateRuntimeSecrets: vi.fn(async () => undefined),
+    persistRuntimeSecrets: vi.fn(async () => undefined),
+  }));
+  vi.doMock("../src/setup/modal-auth.js", () => ({
+    seedModalCodexAuth: vi.fn(async () => ({ volumeName: deviceVolume, disposition: "reused" })),
+  }));
+
+  vi.stubEnv("DEX_HANDOFF_SIGNING_KEY", "handoff-signing-key");
+  vi.stubEnv("GEMINI_API_KEY", "gemini-key");
+  process.exitCode = undefined;
+  process.argv = [
+    process.execPath,
+    "dex",
+    "setup",
+    "--skip-modal-smoke",
+    "--project",
+    "/tmp/project",
+    "--device-name",
+    "Test Mac",
+  ];
+  const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+  const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+  await import("../src/cli.js");
+
+  return {
+    runDoctor,
+    waitForHealthySignedTransport,
+    installLaunchAgent,
+    log,
+    error,
+  };
+}
 
 async function mockServiceDependencies(options: {
   existingPlist?: string;
@@ -545,7 +744,10 @@ describe("runtime and LaunchAgent installation", () => {
     const runtime = "/Users/tester/Dex & Runtime/current";
     const probeControlSocket = vi.fn(async () => undefined);
 
-    await expect(installLaunchAgent(runtime, paths, { probeControlSocket })).resolves.toBe(
+    await expect(installLaunchAgent(runtime, paths, {
+      probeControlSocket,
+      codexAuthVolumeName: "auth-volume-device-specific",
+    })).resolves.toBe(
       "/Users/tester/Library/LaunchAgents/com.dex.daemon.plist",
     );
     expect(mkdir).toHaveBeenCalledWith("/Users/tester/Library/LaunchAgents", {
@@ -561,7 +763,7 @@ describe("runtime and LaunchAgent installation", () => {
     expect(body).toContain("/opt/Dex &amp; Tools/&quot;bin&quot;/&lt;current&gt;");
     expect(body).toContain("<key>DEX_HOME</key><string>/Users/tester/.dex</string>");
     expect(body).toContain("<key>DEX_DEVICE_KEY_ID</key><string>device-key-custom</string>");
-    expect(body).toContain("<key>DEX_MODAL_CODEX_AUTH_VOLUME</key><string>auth-volume-custom</string>");
+    expect(body).toContain("<key>DEX_MODAL_CODEX_AUTH_VOLUME</key><string>auth-volume-device-specific</string>");
     expect(body).toContain("<key>DEX_MODAL_SECRET_NAME</key><string>worker-secret-custom</string>");
     expect(body).toContain("<key>CLAUDE_MEM_WORKER_URL</key><string>http://127.0.0.1:47777/a&amp;b</string>");
     expect(body).toContain("<string>daemon</string>");
@@ -667,17 +869,266 @@ describe("persisted LaunchAgent runtime settings", () => {
 });
 
 describe("doctor cloud wording", () => {
-  it("does not claim that /readyz verifies host-sleep survival", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true })));
-    const { dexCloudCheck } = await import("../src/setup/doctor.js");
-    const check = await dexCloudCheck({
+  it("treats signed transport as pending during pre-install while still probing readiness", async () => {
+    const { dexCloudChecks } = await import("../src/setup/doctor.js");
+    const loadState = vi.fn(async () => { throw new Error("stale state must not block repair"); });
+    const fetch = vi.fn(async () => new Response(null, { status: 200 }));
+
+    await expect(dexCloudChecks({
       ...config(),
       deviceId: "device-1",
+    }, {
+      signedTransportMode: "preinstall",
+      loadState,
+      fetch,
+    })).resolves.toEqual([
+      expect.objectContaining({
+        name: "Dex Cloud",
+        status: "warn",
+        detail: expect.stringContaining("pending service installation or restart"),
+      }),
+      expect.objectContaining({ name: "Dex Cloud readiness", status: "pass" }),
+    ]);
+    expect(loadState).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledOnce();
+
+    const unavailable = await dexCloudChecks({
+      ...config(),
+      deviceId: "device-1",
+    }, {
+      signedTransportMode: "preinstall",
+      loadState,
+      fetch: vi.fn(async () => new Response(null, { status: 503 })),
+    });
+    expect(unavailable[0]).toMatchObject({ name: "Dex Cloud", status: "warn" });
+    expect(unavailable[1]).toMatchObject({ name: "Dex Cloud readiness", status: "fail" });
+  });
+
+  it("waits through stale pre-install health for a new daemon-signed success", async () => {
+    const { waitForHealthySignedTransport } = await import("../src/setup/doctor.js");
+    let clock = Date.parse("2026-08-24T12:00:00.000Z");
+    const stale = {
+      version: 1 as const,
+      revision: 10,
+      projects: {},
+      tasks: {},
+      workers: {},
+      pendingMachineActions: [],
+      pendingConversationPrompts: [],
+      pendingSessionSelections: {},
+      processedMessageIds: [],
+      pendingTransportEvents: [],
+      pendingTransportReceipts: [],
+      signedTransportHealth: {
+        status: "healthy" as const,
+        consecutiveFailures: 0 as const,
+        lastAttemptAt: "2026-08-24T11:58:00.000Z",
+        lastSuccessAt: "2026-08-24T11:58:00.000Z",
+      },
+    };
+    const repaired = {
+      ...stale,
+      revision: 11,
+      signedTransportHealth: {
+        status: "healthy" as const,
+        consecutiveFailures: 0 as const,
+        lastAttemptAt: "2026-08-24T12:00:00.200Z",
+        lastSuccessAt: "2026-08-24T12:00:00.200Z",
+      },
+    };
+    const loadState = vi.fn()
+      .mockResolvedValueOnce(stale)
+      .mockResolvedValueOnce(repaired);
+    const wait = vi.fn(async (ms: number) => { clock += ms; });
+
+    await expect(waitForHealthySignedTransport({
+      loadState,
+      afterRevision: 10,
+      notBefore: "2026-08-24T12:00:00.000Z",
+      previousLastSuccessAt: "2026-08-24T11:58:00.000Z",
+      timeoutMs: 45_000,
+      pollMs: 250,
+      now: () => clock,
+      wait,
+    })).resolves.toEqual(repaired.signedTransportHealth);
+    expect(loadState).toHaveBeenCalledTimes(2);
+    expect(wait).toHaveBeenCalledWith(250);
+  });
+
+  it("bounds post-install waiting when signed transport never becomes healthy", async () => {
+    const { waitForHealthySignedTransport } = await import("../src/setup/doctor.js");
+    let clock = Date.parse("2026-08-24T12:00:00.000Z");
+    const wait = vi.fn(async (ms: number) => { clock += ms; });
+    const loadState = vi.fn(async () => ({
+      version: 1 as const,
+      revision: 11,
+      projects: {},
+      tasks: {},
+      workers: {},
+      pendingMachineActions: [],
+      pendingConversationPrompts: [],
+      pendingSessionSelections: {},
+      processedMessageIds: [],
+      pendingTransportEvents: [],
+      pendingTransportReceipts: [],
+      signedTransportHealth: {
+        status: "degraded" as const,
+        consecutiveFailures: 2,
+        lastAttemptAt: "2026-08-24T12:00:00.000Z",
+        lastError: "http" as const,
+      },
+    }));
+
+    await expect(waitForHealthySignedTransport({
+      loadState,
+      afterRevision: 10,
+      notBefore: "2026-08-24T12:00:00.000Z",
+      timeoutMs: 500,
+      pollMs: 250,
+      now: () => clock,
+      wait,
+    })).rejects.toThrow(/did not record a new healthy signed cloud sync.*degraded/i);
+    expect(wait).toHaveBeenCalledTimes(2);
+    expect(loadState).toHaveBeenCalledTimes(3);
+  });
+
+  it("passes only when signed daemon sync is recent and reports /readyz separately", async () => {
+    const { dexCloudChecks } = await import("../src/setup/doctor.js");
+    const state = {
+      version: 1 as const,
+      revision: 0,
+      projects: {},
+      tasks: {},
+      workers: {},
+      pendingMachineActions: [],
+      pendingConversationPrompts: [],
+      pendingSessionSelections: {},
+      processedMessageIds: [],
+      pendingTransportEvents: [],
+      pendingTransportReceipts: [],
+      signedTransportHealth: {
+        status: "healthy" as const,
+        consecutiveFailures: 0 as const,
+        lastAttemptAt: "2026-08-24T12:00:20.000Z",
+        lastSuccessAt: "2026-08-24T12:00:20.000Z",
+      },
+    };
+    const fetch = vi.fn(async () => new Response(null, { status: 200 }));
+    const checks = await dexCloudChecks({
+      ...config(),
+      deviceId: "device-1",
+    }, {
+      now: () => Date.parse("2026-08-24T12:00:30.000Z"),
+      loadState: async () => state,
+      fetch,
     });
 
-    expect(check.status).toBe("pass");
-    expect(check.detail).toContain("/readyz is reachable");
-    expect(check.detail).toContain("host-sleep continuity is not verified");
-    expect(check.detail).not.toContain("survives host sleep");
+    expect(checks).toEqual([
+      expect.objectContaining({
+        name: "Dex Cloud",
+        status: "pass",
+        detail: expect.stringContaining("signed daemon sync succeeded 10s ago"),
+      }),
+      expect.objectContaining({
+        name: "Dex Cloud readiness",
+        status: "pass",
+        detail: "/readyz is reachable (supporting check only)",
+      }),
+    ]);
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    {
+      name: "stale",
+      health: {
+        status: "healthy" as const,
+        consecutiveFailures: 0 as const,
+        lastAttemptAt: "2026-08-24T11:58:00.000Z",
+        lastSuccessAt: "2026-08-24T11:58:00.000Z",
+      },
+      detail: "stale",
+    },
+    {
+      name: "degraded",
+      health: {
+        status: "degraded" as const,
+        consecutiveFailures: 3,
+        lastAttemptAt: "2026-08-24T12:00:29.000Z",
+        lastSuccessAt: "2026-08-24T12:00:20.000Z",
+        lastError: "http" as const,
+      },
+      detail: "degraded",
+    },
+  ])("fails when /readyz is 200 but signed transport is $name", async ({ health, detail }) => {
+    const { dexCloudChecks } = await import("../src/setup/doctor.js");
+    const checks = await dexCloudChecks({
+      ...config(),
+      deviceId: "device-1",
+    }, {
+      now: () => Date.parse("2026-08-24T12:00:30.000Z"),
+      loadState: async () => ({
+        version: 1,
+        revision: 0,
+        projects: {},
+        tasks: {},
+        workers: {},
+        pendingMachineActions: [],
+        pendingConversationPrompts: [],
+        pendingSessionSelections: {},
+        processedMessageIds: [],
+        pendingTransportEvents: [],
+        pendingTransportReceipts: [],
+        signedTransportHealth: health,
+      }),
+      fetch: vi.fn(async () => new Response(null, { status: 200 })),
+    });
+
+    expect(checks[0]).toMatchObject({ name: "Dex Cloud", status: "fail" });
+    expect(checks[0]?.detail).toContain(detail);
+    expect(checks[1]).toMatchObject({ name: "Dex Cloud readiness", status: "pass" });
+  });
+
+  it("keeps unpaired setup intuitive without probing cloud or local daemon state", async () => {
+    const { dexCloudChecks } = await import("../src/setup/doctor.js");
+    const loadState = vi.fn();
+    const fetch = vi.fn();
+
+    await expect(dexCloudChecks(config(), { loadState, fetch })).resolves.toEqual([
+      expect.objectContaining({
+        name: "Dex Cloud",
+        status: "warn",
+        detail: "not paired yet",
+      }),
+    ]);
+    expect(loadState).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("reports a paired-but-unobserved daemon without treating readiness as signed health", async () => {
+    const { dexCloudChecks } = await import("../src/setup/doctor.js");
+    const checks = await dexCloudChecks({
+      ...config(),
+      deviceId: "device-1",
+    }, {
+      loadState: async () => ({
+        version: 1,
+        revision: 0,
+        projects: {},
+        tasks: {},
+        workers: {},
+        pendingMachineActions: [],
+        pendingConversationPrompts: [],
+        pendingSessionSelections: {},
+        processedMessageIds: [],
+        pendingTransportEvents: [],
+        pendingTransportReceipts: [],
+      }),
+      fetch: vi.fn(async () => new Response(null, { status: 200 })),
+    });
+
+    expect(checks[0]).toMatchObject({ name: "Dex Cloud", status: "warn" });
+    expect(checks[0]?.detail).toContain("daemon may be unavailable");
+    expect(checks[1]).toMatchObject({ name: "Dex Cloud readiness", status: "pass" });
   });
 });

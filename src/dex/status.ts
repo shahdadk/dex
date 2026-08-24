@@ -9,7 +9,8 @@ export function buildStatusMessage(tasks: DexTask[], workers: WorkerSession[] = 
   const heading = active.length > 0 ? `${active.length} ${active.length === 1 ? "thing" : "things"} active:` : "recent work:";
   const lines = tasks.slice(0, 6).map((task) => {
     const worker = task.currentWorkerId ? workerById.get(task.currentWorkerId) : undefined;
-    const detail = task.latestSummary ? semanticSummary(task.latestSummary) : stageText(task);
+    const baseDetail = task.latestSummary ? semanticSummary(task.latestSummary) : stageText(task);
+    const detail = withReviewSummary(task, baseDetail);
     const owner = worker && task.metadata.showAgent === true ? ` (${worker.agent})` : "";
     return `${displayTitle(task.title)}${owner} — ${detail}`;
   });
@@ -23,6 +24,18 @@ export function buildStatusMessage(tasks: DexTask[], workers: WorkerSession[] = 
       ? `${blocked.length === 1 ? blocked[0]?.title : `${blocked.length} tasks`} needs your input.`
       : "nothing needs you right now.",
   ].join("\n");
+}
+
+function withReviewSummary(task: DexTask, baseDetail: string): string {
+  const value = task.metadata.latestReview;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return baseDetail;
+  const review = value as Record<string, unknown>;
+  const reviewer = review.reviewer === "claude" || review.reviewer === "codex" ? review.reviewer : "agent";
+  if (review.status === "failed") return `${truncateAtWord(baseDetail, 135)} · ${reviewer} review needs a retry`;
+  if (review.status === "cancelled") return `${truncateAtWord(baseDetail, 135)} · ${reviewer} review stopped`;
+  if (review.status !== "completed" || typeof review.summary !== "string") return baseDetail;
+  const summary = semanticSummary(review.summary);
+  return `${truncateAtWord(baseDetail, 105)} · ${reviewer} review: ${truncateAtWord(summary, 100)}`;
 }
 
 function semanticSummary(value: string): string {

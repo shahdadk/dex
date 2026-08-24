@@ -11,6 +11,10 @@ describe("MessageRouter", () => {
       actions: [{ type: "STATUS" }],
       source: "deterministic",
     });
+    await expect(router.route("what's running?")).resolves.toEqual({
+      actions: [{ type: "STATUS" }],
+      source: "deterministic",
+    });
   });
 
   it("lists recent sessions without turning the request into a task", async () => {
@@ -20,6 +24,10 @@ describe("MessageRouter", () => {
     });
     await expect(router.route("show my recent Claude sessions")).resolves.toEqual({
       actions: [{ type: "LIST_SESSIONS", provider: "claude" }],
+      source: "deterministic",
+    });
+    await expect(router.route("continue the second one")).resolves.toEqual({
+      actions: [{ type: "ADOPT_LISTED_SESSION", ordinal: 2 }],
       source: "deterministic",
     });
   });
@@ -136,6 +144,44 @@ describe("MessageRouter", () => {
       actions: [{ type: "CHANGE_AGENT", taskQuery: "checkout", agent: "claude" }],
       source: "deterministic",
     });
+    await expect(router.route("have claude take over")).resolves.toEqual({
+      actions: [{ type: "CHANGE_AGENT", taskQuery: "it", agent: "claude" }],
+      source: "deterministic",
+    });
+  });
+
+  it("routes cross-agent review to the existing durable task", async () => {
+    await expect(router.route("have claude review what codex did")).resolves.toEqual({
+      actions: [{ type: "REVIEW_TASK", reviewer: "claude", sourceAgent: "codex" }],
+      source: "deterministic",
+    });
+    await expect(router.route("ask claude to review what codex changed on checkout")).resolves.toEqual({
+      actions: [{
+        type: "REVIEW_TASK",
+        reviewer: "claude",
+        sourceAgent: "codex",
+        taskQuery: "checkout",
+      }],
+      source: "deterministic",
+    });
+  });
+
+  it("routes an explicit named-task review without creating another task", async () => {
+    await expect(router.route("have claude review the checkout changes")).resolves.toEqual({
+      actions: [{ type: "REVIEW_TASK", reviewer: "claude", taskQuery: "checkout" }],
+      source: "deterministic",
+    });
+  });
+
+  it("routes requests for persisted review findings without starting another worker", async () => {
+    await expect(router.route("show me the full review for checkout")).resolves.toEqual({
+      actions: [{ type: "REVIEW_RESULT", taskQuery: "checkout" }],
+      source: "deterministic",
+    });
+    await expect(router.route("what did the claude review find?")).resolves.toEqual({
+      actions: [{ type: "REVIEW_RESULT" }],
+      source: "deterministic",
+    });
   });
 
   it("routes cloud movement and sleep as typed actions", async () => {
@@ -152,6 +198,25 @@ describe("MessageRouter", () => {
   it("sleeps after a cloud handoff unless the user explicitly says when done", async () => {
     const result = await router.route("move checkout to the cloud and use codex, then sleep my mac");
     expect(result.actions).toContainEqual({ type: "SLEEP", when: "now" });
+  });
+
+  it.each([
+    "sleep my mac when everything finishes",
+    "sleep my mac when all tasks are complete",
+    "after the work completes sleep this mac",
+    "sleep the mac once you're done",
+    "move everything to the cloud and sleep my mac when it's done",
+  ])("never turns an explicit sleep-when-done request into immediate sleep: %s", async (message) => {
+    const result = await router.route(message);
+    expect(result.actions).toContainEqual({ type: "SLEEP", when: "tasks_complete" });
+    expect(result.actions).not.toContainEqual({ type: "SLEEP", when: "now" });
+  });
+
+  it("normalizes conversational articles out of task references", async () => {
+    await expect(router.route("stop the frontend task")).resolves.toEqual({
+      actions: [{ type: "STOP_TASK", taskQuery: "frontend" }],
+      source: "deterministic",
+    });
   });
 });
 

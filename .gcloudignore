@@ -1,5 +1,6 @@
-.git
 .gcloudignore
+.git
+.gitignore
 .dex
 .env
 .env.*

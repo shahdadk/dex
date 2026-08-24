@@ -255,19 +255,25 @@ export async function collectClaudeMemMemories(
       options.batchLimit ?? 40,
     );
     if (ids.length === 0) return [];
-    return client.getObservations({
+    const observations = await client.getObservations({
       ids,
       orderBy: "date_desc",
       limit: options.batchLimit ?? 40,
       ...(project === undefined ? {} : { project }),
     });
+    if (project === undefined) return observations;
+    const expectedProject = project.trim().toLowerCase();
+    // Treat the project boundary as an authorization boundary, not merely a
+    // relevance hint. Timeline expansion and some Claude-Mem deployments can
+    // return observations outside the requested project. Missing or different
+    // project metadata is therefore ineligible for a task handoff.
+    return observations.filter((observation) =>
+      observation.project?.trim().toLowerCase() === expectedProject,
+    );
   };
 
-  const scoped = await collect(options.project);
-  // Claude-Mem project labels can differ from a repository basename (for
-  // example, worktrees may inherit the parent Git project). Preserve scoped
-  // retrieval when it works, but do not silently discard a relevant durable
-  // memory solely because that derived label has no observations.
-  if (scoped.length > 0 || options.project === undefined) return scoped;
-  return collect();
+  // Never fall back from a scoped task query to the global memory corpus.
+  // If the project has no Claude-Mem hits, deterministic TaskKnowledge is the
+  // safe continuity fallback.
+  return collect(options.project);
 }

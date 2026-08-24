@@ -202,6 +202,104 @@ describe("Dex cloud request signing", () => {
       consecutiveFailures: 0,
     });
   });
+
+  it("recovers when the process-local sequence is ahead of the durable cloud sequence", async () => {
+    const deviceKeys = generateDexDeviceKeyPair();
+    const serverKeys = generateDexDeviceKeyPair();
+    const sequences: string[] = [];
+    const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const sequence = requestHeaders(init).get("x-appfi-sequence") ?? "";
+      sequences.push(sequence);
+      if (sequences.length === 1) {
+        return jsonResponse(
+          { code: "stale_sequence", expectedSequence: 40 },
+          {
+            status: 409,
+            headers: { "x-appfi-expected-sequence": "40" },
+          },
+        );
+      }
+      return jsonResponse({
+        version: 1,
+        cursor: "device:40",
+        commands: [],
+        acceptedEventIds: [],
+        acceptedReceiptIds: [],
+        nextSequence: 41,
+      });
+    });
+    const client = new DexCloudMessagingClient({
+      baseUrl: "https://cloud.dex.example",
+      deviceId: "device-1",
+      ownerId: "owner-1",
+      keyPair: deviceKeys,
+      pinnedServerKeys: [{
+        algorithm: "ed25519",
+        keyId: "server-1",
+        publicKey: serverKeys.publicKey,
+      }],
+      initialSequence: 99,
+      fetch,
+      now: () => NOW,
+      nonce: (sequence) => `nonce-ahead-${sequence}`,
+    });
+
+    await expect(client.sync({
+      version: 1,
+      cursor: "device:39",
+      events: [],
+      receipts: [],
+      waitMs: 0,
+    })).resolves.toMatchObject({ cursor: "device:40", nextSequence: 41 });
+
+    expect(sequences).toEqual(["100", "40"]);
+  });
+
+  it("retains only a bounded event identifier from an invalid-event rejection", async () => {
+    const keyPair = generateDexDeviceKeyPair();
+    const payload = {
+      version: 1 as const,
+      events: [normalizeDexEvent({
+        id: "event-invalid",
+        timestamp: ISO,
+        type: "task.completed",
+        payload: {},
+      })],
+      receipts: [],
+      waitMs: 0,
+    };
+    const valid = new DexCloudMessagingClient({
+      baseUrl: "https://cloud.dex.example",
+      deviceId: "device-1",
+      keyPair,
+      fetch: async () => jsonResponse({
+        code: "invalid_transport_event",
+        eventId: "event-invalid",
+      }, { status: 400 }),
+      now: () => NOW,
+    });
+    await expect(valid.sync(payload)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_transport_event",
+      invalidEventId: "event-invalid",
+    });
+
+    const oversized = new DexCloudMessagingClient({
+      baseUrl: "https://cloud.dex.example",
+      deviceId: "device-1",
+      keyPair,
+      fetch: async () => jsonResponse({
+        code: "invalid_transport_event",
+        eventId: "x".repeat(513),
+      }, { status: 400 }),
+      now: () => NOW,
+    });
+    await expect(oversized.sync(payload)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_transport_event",
+      invalidEventId: undefined,
+    });
+  });
 });
 
 describe("signed command authority", () => {

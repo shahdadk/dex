@@ -237,7 +237,10 @@ export class MemoryContinuity {
       toolName: payload.toolName,
       toolInput: payload.toolInput,
       toolResponse: payload.toolResponse,
-      cwd: task.worktreePath,
+      // Claude-Mem derives its project boundary from cwd. Use the stable
+      // repository root rather than Dex's task-specific worktree so a later
+      // worker in the same project can retrieve the observation safely.
+      cwd: task.repositoryPath,
       agentId: worker.id,
       agentType: worker.agent,
       platformSource: worker.agent === "claude" ? "claude-code" : "codex",

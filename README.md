@@ -87,14 +87,14 @@ The durable object is the task, not an agent session. Each task owns its intent,
 | --- | --- |
 | Messaging | Sendblue webhook verification, owner/conversation binding, signed device commands, replay protection, deduplication, and transactional completion contracts |
 | Routing | Deterministic control routes plus schema-validated Gemini routes; natural language never becomes shell input |
-| Tasks | Durable state machine, isolated branches/worktrees, two-worker scheduling, semantic status, cancellation, agent changes, and restart recovery |
-| Workers | Fresh Codex and Claude CLI adapters with JSON event normalization, provider session IDs, cancellation, timeouts, and scoped environments |
+| Tasks | Durable state machine, isolated branches/worktrees, up to three concurrent workers, conversation-aware follow-ups, semantic status, cancellation, agent changes, and restart recovery |
+| Workers | Fresh Codex and Claude CLI adapters with JSON event normalization, provider session IDs, cancellation, timeouts, scoped environments, and hardened review-only cross-agent execution |
 | Memory | Claude-Mem observation/retrieval path plus deterministic `TaskKnowledge` fallback; failed approaches are first-class handoff data |
 | Cloud | Signed Git bundle and handoff, direct Modal upload, fresh cloud Codex, deterministic monitor, retained result artifact, and validated local result import |
 | Machine | Real `pmset` battery parsing, explicit simulated readings, owner-scoped follow-up prompts, `caffeinate`, restore behavior, and a deterministic sleep gate |
 | Diagnostics | `doctor`, `status`, `watch`, cloud smoke check, memory fixture, battery fixture, and power restore |
 
-Session transcript discovery and validated adoption requests are present, but the end-to-end conversational adoption flow is not part of the P0 demo. Greptile review is P1.
+Recent Claude/Codex sessions can be discovered and adopted as durable Dex tasks either directly or with a follow-up such as “continue the second one.” Active and unrelated-project sessions are rejected. A completed task can also receive a fresh read-only review worker without changing task identity. Greptile remains an optional post-validation P1 integration.
 
 ## Decision policy
 

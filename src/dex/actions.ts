@@ -25,8 +25,22 @@ export const DexActionSchema = z.discriminatedUnion("type", [
   CreateTaskActionSchema,
   z.object({ type: z.literal("STATUS"), taskQuery: z.string().min(1).optional() }),
   ListSessionsActionSchema,
+  z.object({
+    type: z.literal("ADOPT_LISTED_SESSION"),
+    ordinal: z.number().int().min(1).max(50),
+  }).strict(),
   SessionAdoptionRequestSchema,
   z.object({ type: z.literal("MEMORY_QUERY"), query: z.string().min(1) }),
+  z.object({
+    type: z.literal("REVIEW_TASK"),
+    reviewer: AgentKindSchema,
+    sourceAgent: AgentKindSchema.optional(),
+    taskQuery: z.string().min(1).optional(),
+  }),
+  z.object({
+    type: z.literal("REVIEW_RESULT"),
+    taskQuery: z.string().min(1).optional(),
+  }),
   z.object({
     type: z.literal("MOVE_TASK"),
     taskQuery: z.string().min(1),

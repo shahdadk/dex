@@ -2,11 +2,13 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
-  ModalResultArtifactSchema,
   type ModalAdapter,
-  type ModalResultArtifact,
   type ModalSandbox,
 } from "../modal/index.js";
+import {
+  ModalResultWithAuthPersistenceSchema,
+  type ModalResultWithAuthPersistence,
+} from "../control-plane/models.js";
 import {
   ModalMonitorRequestSchema,
   type ModalMonitorRequest,
@@ -37,7 +39,11 @@ export interface ModalTerminalEvent {
   status: "succeeded" | "failed" | "cancelled";
   reason: ModalTerminalReason;
   exitCode: number | null;
-  result?: ModalResultArtifact;
+  result?: ModalResultWithAuthPersistence;
+  sandboxTerminal?: {
+    kind: "poll" | "terminate_wait";
+    volumePersisted: true;
+  };
   sandboxRetentionExpiresAt?: string;
   error?: string;
 }
@@ -141,8 +147,26 @@ export function modalMonitorRetryKey(taskId: string, handoffSha256: string, atte
   return `modal-monitor:${modalMonitorAttemptScope(taskId, handoffSha256)}:attempt:${attempt}`;
 }
 
+export function modalMonitorDeadlineCleanupKey(taskId: string, handoffSha256: string): string {
+  return `modal-monitor:${modalMonitorAttemptScope(taskId, handoffSha256)}:deadline-cleanup`;
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+class ModalResultRetrievalError extends Error {
+  constructor(cause: unknown) {
+    super("Modal result artifact is temporarily unavailable", { cause });
+    this.name = "ModalResultRetrievalError";
+  }
+}
+
+class ModalResultInvalidError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = "ModalResultInvalidError";
+  }
 }
 
 function resultNotReady(error: unknown): boolean {
@@ -154,22 +178,57 @@ async function readValidatedResult(
   dependencies: ModalMonitorDependencies,
   sandbox: ModalSandbox,
   request: ParsedModalMonitorRequest,
-): Promise<ModalResultArtifact> {
-  const raw = await (dependencies.readResult ?? readResultFromSandbox)(
-    sandbox,
-    request.resultPath,
-  );
-  const artifact = ModalResultArtifactSchema.parse(raw);
+): Promise<ModalResultWithAuthPersistence> {
+  let raw: unknown;
+  try {
+    raw = await (dependencies.readResult ?? readResultFromSandbox)(
+      sandbox,
+      request.resultPath,
+    );
+  } catch (error) {
+    if (resultNotReady(error) || error instanceof ModalResultInvalidError) throw error;
+    if (error instanceof SyntaxError) {
+      throw new ModalResultInvalidError("Result artifact is not valid JSON", error);
+    }
+    throw new ModalResultRetrievalError(error);
+  }
+  const parsed = ModalResultWithAuthPersistenceSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new ModalResultInvalidError("Result artifact does not match the required schema", parsed.error);
+  }
+  const artifact = parsed.data;
   if (artifact.taskId !== request.taskId) {
-    throw new Error("Result taskId does not match monitor taskId");
+    throw new ModalResultInvalidError("Result taskId does not match monitor taskId");
   }
   if (artifact.handoffSha256 !== request.handoffSha256) {
-    throw new Error("Result handoffSha256 does not match the verified handoff");
+    throw new ModalResultInvalidError("Result handoffSha256 does not match the verified handoff");
   }
   if (artifact.status === "succeeded" && !artifact.validation.passed) {
-    throw new Error("A succeeded result must report passing validation");
+    throw new ModalResultInvalidError("A succeeded result must report passing validation");
+  }
+  if (
+    artifact.authVolumePersisted
+    && (
+      artifact.authVolumePersisted.taskId !== request.taskId
+      || artifact.authVolumePersisted.handoffSha256 !== request.handoffSha256
+    )
+  ) {
+    throw new ModalResultInvalidError(
+      "Auth persistence evidence does not match the monitored task and handoff",
+    );
   }
   return artifact;
+}
+
+async function terminateWithVolumePersistence(
+  sandbox: ModalSandbox,
+): Promise<ModalTerminalEvent["sandboxTerminal"]> {
+  try {
+    await sandbox.terminate({ wait: true });
+    return { kind: "terminate_wait", volumePersisted: true };
+  } catch {
+    return undefined;
+  }
 }
 
 export class ModalMonitor {
@@ -200,11 +259,26 @@ export class ModalMonitor {
     // period after atomically writing result.json. Consume that result while
     // the filesystem is still reachable, then terminate the hold process.
     if (exitCode === null && sandbox && now < deadline) {
-      let artifact: ModalResultArtifact | undefined;
+      let artifact: ModalResultWithAuthPersistence | undefined;
       try {
         artifact = await readValidatedResult(this.#dependencies, sandbox, request);
       } catch (error) {
+        if (error instanceof ModalResultRetrievalError) {
+          return this.#reschedule(
+            request,
+            MODAL_MONITOR_RETRY_DELAY_MS,
+            sandbox,
+          );
+        }
         if (!resultNotReady(error)) {
+          const sandboxTerminal = await terminateWithVolumePersistence(sandbox);
+          if (!sandboxTerminal) {
+            return this.#reschedule(
+              request,
+              MODAL_MONITOR_RETRY_DELAY_MS,
+              sandbox,
+            );
+          }
           const outcome = await this.#deliverTerminal({
             taskId: request.taskId,
             sandboxId: request.sandboxId,
@@ -213,15 +287,45 @@ export class ModalMonitor {
             reason: "invalid_result",
             exitCode: null,
             error: errorMessage(error),
+            sandboxTerminal,
           });
-          await sandbox.terminate().catch(() => undefined);
           return outcome;
         }
       }
       if (artifact) {
+        if (artifact.status === "succeeded" && !artifact.authVolumePersisted) {
+          const sandboxTerminal = await terminateWithVolumePersistence(sandbox);
+          if (!sandboxTerminal) {
+            return this.#reschedule(
+              request,
+              MODAL_MONITOR_RETRY_DELAY_MS,
+              sandbox,
+            );
+          }
+          return this.#deliverTerminal({
+            taskId: request.taskId,
+            sandboxId: request.sandboxId,
+            completionKey: modalMonitorTerminalKey(request.taskId, request.handoffSha256),
+            status: "failed",
+            reason: "invalid_result",
+            exitCode: null,
+            error: "A retained successful result is missing explicit Modal v2 auth persistence evidence",
+            sandboxTerminal,
+          });
+        }
         const sandboxRetentionExpiresAt = artifact.status === "succeeded"
           ? new Date(now + MODAL_SUCCESS_RESULT_RETENTION_MS).toISOString()
           : undefined;
+        const sandboxTerminal = artifact.status === "succeeded"
+          ? undefined
+          : await terminateWithVolumePersistence(sandbox);
+        if (artifact.status !== "succeeded" && !sandboxTerminal) {
+          return this.#reschedule(
+            request,
+            MODAL_MONITOR_RETRY_DELAY_MS,
+            sandbox,
+          );
+        }
         const outcome = await this.#deliverTerminal({
           taskId: request.taskId,
           sandboxId: request.sandboxId,
@@ -230,52 +334,31 @@ export class ModalMonitor {
           reason: "result",
           exitCode: artifact.status === "succeeded" ? 0 : 1,
           result: artifact,
+          ...(sandboxTerminal ? { sandboxTerminal } : {}),
           ...(sandboxRetentionExpiresAt === undefined
             ? {}
             : { sandboxRetentionExpiresAt }),
         });
         if (artifact.status === "succeeded") {
           await sandbox.detach();
-        } else {
-          await sandbox.terminate().catch(() => undefined);
         }
         return outcome;
       }
     }
 
     if (exitCode === null && now < deadline) {
-      if (sandbox) await sandbox.detach();
-      const nextAttempt = request.attempt + 1;
       const normalDelay =
         request.attempt === 0
           ? MODAL_MONITOR_INITIAL_DELAY_MS
           : MODAL_MONITOR_RETRY_DELAY_MS;
       const delayMs = Math.min(normalDelay, deadline - now);
-      const idempotencyKey = modalMonitorRetryKey(request.taskId, request.handoffSha256, nextAttempt);
-      const nextRequest: ParsedModalMonitorRequest = {
-        ...request,
-        attempt: nextAttempt,
-      };
-      const scheduled = await this.#once.runOnce(idempotencyKey, () =>
-        this.#dependencies.schedule({
-          request: nextRequest,
-          delayMs,
-          idempotencyKey,
-        }),
-      );
-      return {
-        kind: "rescheduled",
-        delayMs,
-        nextAttempt,
-        idempotencyKey,
-        scheduled,
-      };
+      return this.#reschedule(request, delayMs, sandbox);
     }
 
     if (exitCode === null) {
-      if (sandbox) {
-        await sandbox.terminate().catch(() => undefined);
-      }
+      const sandboxTerminal = sandbox
+        ? await this.#attemptDeadlineCleanup(request, sandbox)
+        : undefined;
       return this.#deliverTerminal({
         taskId: request.taskId,
         sandboxId: request.sandboxId,
@@ -283,13 +366,18 @@ export class ModalMonitor {
         status: "failed",
         reason: "deadline_exceeded",
         exitCode: null,
-        ...(observationError === undefined
-          ? {}
-          : { error: errorMessage(observationError) }),
+        ...(sandboxTerminal ? { sandboxTerminal } : {}),
+        ...(!sandboxTerminal
+          ? {
+              error: sandbox
+                ? "Modal monitor deadline exceeded before a validated result; sandbox cleanup could not be confirmed. Sandbox ownership remains recorded for recovery."
+                : "Modal monitor deadline exceeded before a validated result; sandbox reconnect was unavailable. Sandbox ownership remains recorded for recovery.",
+            }
+          : {}),
       });
     }
 
-    let artifact: ModalResultArtifact | undefined;
+    let artifact: ModalResultWithAuthPersistence | undefined;
     let artifactError: unknown;
     try {
       if (!sandbox) throw observationError ?? new Error("Sandbox unavailable");
@@ -302,6 +390,16 @@ export class ModalMonitor {
     }
 
     if (!artifact) {
+      if (
+        now < deadline &&
+        (artifactError instanceof ModalResultRetrievalError || resultNotReady(artifactError))
+      ) {
+        return this.#reschedule(
+          request,
+          MODAL_MONITOR_RETRY_DELAY_MS,
+          sandbox,
+        );
+      }
       return this.#deliverTerminal({
         taskId: request.taskId,
         sandboxId: request.sandboxId,
@@ -309,6 +407,7 @@ export class ModalMonitor {
         status: "failed",
         reason: "invalid_result",
         exitCode,
+        sandboxTerminal: { kind: "poll", volumePersisted: true },
         error: errorMessage(artifactError),
       });
     }
@@ -322,6 +421,7 @@ export class ModalMonitor {
         reason: "nonzero_exit",
         exitCode,
         result: artifact,
+        sandboxTerminal: { kind: "poll", volumePersisted: true },
         error: `Sandbox exited with code ${exitCode}`,
       });
     }
@@ -334,6 +434,7 @@ export class ModalMonitor {
       reason: "result",
       exitCode,
       result: artifact,
+      sandboxTerminal: { kind: "poll", volumePersisted: true },
     });
   }
 
@@ -344,6 +445,59 @@ export class ModalMonitor {
       this.#dependencies.onTerminal(event),
     );
     return { kind: "terminal", event, callbackInvoked };
+  }
+
+  async #attemptDeadlineCleanup(
+    request: ParsedModalMonitorRequest,
+    sandbox: ModalSandbox,
+  ): Promise<ModalTerminalEvent["sandboxTerminal"]> {
+    let sandboxTerminal: ModalTerminalEvent["sandboxTerminal"];
+    await this.#once.runOnce(
+      modalMonitorDeadlineCleanupKey(request.taskId, request.handoffSha256),
+      async () => {
+        sandboxTerminal = await terminateWithVolumePersistence(sandbox);
+        if (!sandboxTerminal) {
+          // Cleanup is deliberately abandoned after this fenced attempt. A
+          // deadline failure without sandboxTerminal evidence keeps the
+          // sandbox ID/ownership durable and prevents account-auth lease
+          // release, while detach releases only this monitor's connection.
+          await Promise.resolve(sandbox.detach()).catch(() => undefined);
+        }
+      },
+    );
+    return sandboxTerminal;
+  }
+
+  async #reschedule(
+    request: ParsedModalMonitorRequest,
+    delayMs: number,
+    sandbox?: ModalSandbox,
+  ): Promise<ModalMonitorOutcome> {
+    if (sandbox) await Promise.resolve(sandbox.detach()).catch(() => undefined);
+    const nextAttempt = request.attempt + 1;
+    const idempotencyKey = modalMonitorRetryKey(
+      request.taskId,
+      request.handoffSha256,
+      nextAttempt,
+    );
+    const nextRequest: ParsedModalMonitorRequest = {
+      ...request,
+      attempt: nextAttempt,
+    };
+    const scheduled = await this.#once.runOnce(idempotencyKey, () =>
+      this.#dependencies.schedule({
+        request: nextRequest,
+        delayMs,
+        idempotencyKey,
+      }),
+    );
+    return {
+      kind: "rescheduled",
+      delayMs,
+      nextAttempt,
+      idempotencyKey,
+      scheduled,
+    };
   }
 }
 

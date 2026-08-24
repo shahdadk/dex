@@ -11,6 +11,7 @@ import {
 import {
   DexControlPlaneService,
   InMemoryControlPlaneRepository,
+  ModalTerminalInputSchema,
   MonitorJobOutbox,
   SetupCodePairingChallengeService,
   createDexControlPlaneFetchHandler,
@@ -34,6 +35,26 @@ const WEBHOOK_SECRET = "sendblue-test-secret";
 const INTERNAL_SECRET = "internal-test-secret";
 const HASH = "a".repeat(64);
 const SETUP_CODE = "K7D4Q9";
+
+function modalResultArtifact(status: "succeeded" | "failed" | "cancelled" = "succeeded") {
+  return {
+    taskId: "task-1",
+    handoffSha256: HASH,
+    status,
+    summary: `${status} result`,
+    validation: { commands: ["npm test"], passed: status === "succeeded" },
+    git: { branch: "dex/task-1", commit: "abc123" },
+    authVolumePersisted: {
+      version: 1 as const,
+      method: "modal-volume-v2-sync" as const,
+      mountPath: "/codex-home" as const,
+      taskId: "task-1",
+      handoffSha256: HASH,
+      authSha256: "b".repeat(64),
+      persistedAt: "2026-08-23T12:00:10.000Z",
+    },
+  };
+}
 
 function inbound(
   messageHandle: string,
@@ -769,6 +790,85 @@ describe("durable device transport events", () => {
 });
 
 describe("Modal task registration and exactly-once completion", () => {
+  describe("terminal event consistency", () => {
+    const base = {
+      taskId: "task-1",
+      sandboxId: "sandbox-1",
+      completionKey: "completion-1",
+    } as const;
+
+    it("accepts the monitor's valid failed-result and terminal-evidence shapes", () => {
+      expect(ModalTerminalInputSchema.safeParse({
+        ...base,
+        status: "failed",
+        reason: "result",
+        exitCode: 1,
+        result: modalResultArtifact("failed"),
+        sandboxTerminal: { kind: "terminate_wait", volumePersisted: true },
+      }).success).toBe(true);
+      expect(ModalTerminalInputSchema.safeParse({
+        ...base,
+        status: "failed",
+        reason: "invalid_result",
+        exitCode: 17,
+        sandboxTerminal: { kind: "poll", volumePersisted: true },
+      }).success).toBe(true);
+      expect(ModalTerminalInputSchema.safeParse({
+        ...base,
+        status: "failed",
+        reason: "invalid_result",
+        exitCode: null,
+        sandboxTerminal: { kind: "terminate_wait", volumePersisted: true },
+      }).success).toBe(true);
+      expect(ModalTerminalInputSchema.safeParse({
+        ...base,
+        status: "failed",
+        reason: "deadline_exceeded",
+        exitCode: null,
+        error: "Cleanup was abandoned while sandbox ownership remains recorded.",
+      }).success).toBe(true);
+    });
+
+    it.each([
+      ["deadline_exceeded with an exit code", {
+        ...base,
+        status: "failed",
+        reason: "deadline_exceeded",
+        exitCode: 0,
+      }],
+      ["succeeded with a non-result reason", {
+        ...base,
+        status: "succeeded",
+        reason: "nonzero_exit",
+        exitCode: 0,
+        result: modalResultArtifact("succeeded"),
+      }],
+      ["cancelled with a result reason", {
+        ...base,
+        status: "cancelled",
+        reason: "result",
+        exitCode: 1,
+        result: modalResultArtifact("cancelled"),
+      }],
+      ["poll evidence with a null exit code", {
+        ...base,
+        status: "failed",
+        reason: "invalid_result",
+        exitCode: null,
+        sandboxTerminal: { kind: "poll", volumePersisted: true },
+      }],
+      ["a result status inconsistent with its terminal status", {
+        ...base,
+        status: "failed",
+        reason: "result",
+        exitCode: 1,
+        result: modalResultArtifact("succeeded"),
+      }],
+    ])("rejects %s", (_description, input) => {
+      expect(ModalTerminalInputSchema.safeParse(input).success).toBe(false);
+    });
+  });
+
   it("atomically transitions a task and enqueues one terminal Sendblue message", async () => {
     const state = fixture();
     const paired = await pairDevice(state);
@@ -811,6 +911,15 @@ describe("Modal task registration and exactly-once completion", () => {
           commit: "abc123",
           bundlePath: "/dex/result.bundle",
           bundleSha256: "b".repeat(64),
+        },
+        authVolumePersisted: {
+          version: 1 as const,
+          method: "modal-volume-v2-sync" as const,
+          mountPath: "/codex-home" as const,
+          taskId: accepted.taskId,
+          handoffSha256: HASH,
+          authSha256: "c".repeat(64),
+          persistedAt: "2026-08-23T12:04:59.000Z",
         },
       },
       sandboxRetentionExpiresAt: "2026-08-23T12:05:00.000Z",
@@ -872,6 +981,54 @@ describe("Modal task registration and exactly-once completion", () => {
     })).rejects.toMatchObject({ status: 409, code: "modal_result_conflict" });
   });
 
+  it("durably records one deadline failure while retaining sandbox ownership", async () => {
+    const state = fixture();
+    const paired = await pairDevice(state);
+    const accepted = await state.service.processSendblueWebhook(
+      inbound("modal-deadline-task", "investigate checkout in the cloud"),
+      sendblueHeaders(),
+    );
+    if (accepted.kind !== "engineering_command") throw new Error("Expected an engineering command");
+    await state.service.registerModalMonitor({
+      taskId: accepted.taskId,
+      sandboxId: "sandbox-still-owned",
+      handoffSha256: HASH,
+      startedAt: NOW_ISO,
+    });
+    const terminal = {
+      taskId: accepted.taskId,
+      sandboxId: "sandbox-still-owned",
+      completionKey: modalMonitorTerminalKey(accepted.taskId, HASH),
+      status: "failed" as const,
+      reason: "deadline_exceeded" as const,
+      exitCode: null,
+      error: "Sandbox cleanup could not be confirmed; ownership remains recorded.",
+    };
+
+    const completions = await Promise.all(
+      Array.from({ length: 8 }, () => state.service.handleModalTerminal(terminal)),
+    );
+
+    expect(completions.filter((result) => result.transitioned)).toHaveLength(1);
+    expect(completions.filter((result) => result.completionEnqueued)).toHaveLength(1);
+    expect(await state.repository.getTask(accepted.taskId)).toMatchObject({
+      status: "failed",
+      completionKey: terminal.completionKey,
+      completion: {
+        sandboxId: "sandbox-still-owned",
+        handoffSha256: HASH,
+        status: "failed",
+        reason: "deadline_exceeded",
+        exitCode: null,
+      },
+    });
+    expect((await state.repository.listSendblueOutbox())
+      .filter((message) => message.taskId === accepted.taskId)).toHaveLength(1);
+    expect((await state.repository.listPendingDeviceCommands(paired.deviceId, 100))
+      .filter((record) => record.command.command.type === "task.cloud.completed"))
+      .toHaveLength(1);
+  });
+
   it("rejects terminal evidence that does not match the registered handoff", async () => {
     const state = fixture();
     await pairDevice(state);
@@ -893,6 +1050,7 @@ describe("Modal task registration and exactly-once completion", () => {
       status: "succeeded",
       reason: "result",
       exitCode: 0,
+      sandboxTerminal: { kind: "poll", volumePersisted: true },
       result: {
         taskId: accepted.taskId,
         handoffSha256: "b".repeat(64),
@@ -965,6 +1123,7 @@ describe("Modal task registration and exactly-once completion", () => {
       status: "succeeded",
       reason: "result",
       exitCode: 0,
+      sandboxTerminal: { kind: "poll", volumePersisted: true },
       result: {
         taskId: accepted.taskId,
         handoffSha256: retryHash,

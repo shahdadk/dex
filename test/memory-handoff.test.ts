@@ -1,5 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, chmod, mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -268,6 +268,7 @@ describe("Claude-Mem integration", () => {
       claudeSessionId: "dex:checkout-a1b2:worker-1",
       contentSessionId: "dex:checkout-a1b2:worker-1",
       platformSource: "claude-code",
+      cwd: "/repo/dex",
     }));
     expect(client.summarizeSession).toHaveBeenCalledWith(expect.objectContaining({
       contentSessionId: "dex:checkout-a1b2:worker-1",
@@ -325,7 +326,7 @@ describe("Claude-Mem integration", () => {
     expect(requests.filter((request) => request.url.endsWith("/api/observations/batch"))).toHaveLength(1);
   });
 
-  it("falls back to global retrieval when a derived project label has no observations", async () => {
+  it("never falls back to global retrieval when a scoped project has no observations", async () => {
     const memories = Array.from({ length: 5 }, (_, index): MemoryObservation => ({
       id: 100 + index,
       source: "claude-mem",
@@ -353,13 +354,56 @@ describe("Claude-Mem integration", () => {
     await expect(collectClaudeMemMemories(client, {
       query: "checkout idempotency",
       project: "worktree-derived-name",
-    })).resolves.toEqual(memories);
-    expect(client.search).toHaveBeenNthCalledWith(1, expect.objectContaining({
+    })).resolves.toEqual([]);
+    expect(client.search).toHaveBeenCalledOnce();
+    expect(client.search).toHaveBeenCalledWith(expect.objectContaining({
       project: "worktree-derived-name",
     }));
-    expect(client.search).toHaveBeenNthCalledWith(2, expect.not.objectContaining({ project: expect.anything() }));
-    expect(client.timeline).toHaveBeenCalledOnce();
-    expect(client.timeline).toHaveBeenCalledWith(expect.objectContaining({ anchor: 100 }));
+    expect(client.timeline).not.toHaveBeenCalled();
+    expect(client.getObservations).not.toHaveBeenCalled();
+  });
+
+  it("rejects cross-project observations returned by a scoped Claude-Mem batch", async () => {
+    const client: MemoryClient = {
+      recordObservation: vi.fn(async () => ({ status: "queued" as const })),
+      summarizeSession: vi.fn(async () => ({ status: "queued" as const })),
+      search: vi.fn(async () => ({ content: [{ type: "text", text: "#1 #2" }] })),
+      timeline: vi.fn(async () => ({ content: [{ type: "text", text: "#1 #2" }] })),
+      getObservations: vi.fn(async () => [
+        {
+          id: 1,
+          source: "claude-mem",
+          project: "dex",
+          type: "discovery",
+          title: "Checkout ordering",
+          narrative: "invoice.paid may arrive first",
+          facts: [],
+          concepts: ["checkout"],
+          filesRead: [],
+          filesModified: [],
+        },
+        {
+          id: 2,
+          source: "claude-mem",
+          project: "private-client-report",
+          type: "failed-approach",
+          title: "Unrelated private failure",
+          narrative: "must never enter this handoff",
+          facts: [],
+          concepts: ["checkout"],
+          filesRead: [],
+          filesModified: [],
+        },
+      ]),
+    };
+
+    await expect(collectClaudeMemMemories(client, {
+      query: "checkout ordering",
+      project: "dex",
+    })).resolves.toEqual([
+      expect.objectContaining({ id: 1, project: "dex" }),
+    ]);
+    expect(client.getObservations).toHaveBeenCalledWith(expect.objectContaining({ project: "dex" }));
   });
 });
 
@@ -464,14 +508,119 @@ describe("memory selection and safety", () => {
     });
 
     expect(commands.every((command) => command.command === "git")).toBe(true);
-    expect(commands.find((command) => command.args[0] === "commit")?.args).toEqual([
-      "commit",
-      "-m",
-      "checkpoint; echo nope",
+    expect(commands[0]?.args).toEqual([
+      "config",
+      "--local",
+      "--no-includes",
+      "--name-only",
+      "--null",
+      "--list",
     ]);
-    expect(commands.find((command) => command.args[0] === "bundle")?.args).toContain(
+    const commit = commands.find((command) => command.args.includes("commit"));
+    expect(commit?.args.slice(commit.args.indexOf("commit"))).toEqual([
+      "commit", "-m", "checkpoint; echo nope",
+    ]);
+    expect(commit?.args).toContain("core.hooksPath=/dev/null");
+    expect(commit?.args).toContain("core.fsmonitor=false");
+    expect(commit?.args).toContain("core.attributesFile=/dev/null");
+    expect(commands.find((command) => command.args.includes("bundle"))?.args).toContain(
       "branch; touch /tmp/nope",
     );
+  });
+
+  it("disables default hooks and strips inherited secrets from every checkpoint Git process", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "dex-git-safe-process-"));
+    const repositoryPath = path.join(directory, "repo");
+    const bundlePath = path.join(directory, "checkpoint.bundle");
+    const hookMarker = path.join(directory, "hook-ran");
+    await mkdir(repositoryPath);
+    await execFile("git", ["init", "-b", "main"], { cwd: repositoryPath });
+    await writeFile(path.join(repositoryPath, "README.md"), "base\n");
+    await execFile("git", ["add", "README.md"], { cwd: repositoryPath });
+    await execFile(
+      "git",
+      ["-c", "user.name=Dex Test", "-c", "user.email=dex@example.test", "commit", "-m", "base"],
+      { cwd: repositoryPath },
+    );
+    const hookPath = path.join(repositoryPath, ".git", "hooks", "pre-commit");
+    await writeFile(hookPath, `#!/bin/sh\nprintf ran > ${JSON.stringify(hookMarker)}\n`);
+    await chmod(hookPath, 0o755);
+    await writeFile(path.join(repositoryPath, "README.md"), "changed\n");
+    const environments: NodeJS.ProcessEnv[] = [];
+
+    const checkpoint = await createGitCheckpoint({
+      repositoryPath,
+      bundlePath,
+      commitDirty: true,
+      runner: async (_command, args, options) => {
+        environments.push(options.env);
+        const result = await execFile("/usr/bin/git", [...args], {
+          cwd: options.cwd,
+          env: options.env,
+        });
+        return {
+          stdout: String(result.stdout ?? ""),
+          stderr: String(result.stderr ?? ""),
+          exitCode: 0,
+        };
+      },
+    });
+
+    expect(checkpoint.dirtyBeforeCheckpoint).toBe(true);
+    await expect(access(hookMarker)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(environments.length).toBeGreaterThan(0);
+    expect(environments.every((environment) =>
+      environment.OPENAI_API_KEY === undefined
+      && environment.CODEX_API_KEY === undefined
+      && environment.DEX_HANDOFF_SIGNING_KEY === undefined
+      && environment.SSH_AUTH_SOCK === undefined
+      && environment.HOME === undefined
+      && environment.GIT_CONFIG_GLOBAL === "/dev/null"
+      && environment.GIT_CONFIG_NOSYSTEM === "1"
+      && (
+        environment.GIT_CONFIG === "/dev/null"
+        || environment.GIT_CONFIG === undefined
+      )
+    )).toBe(true);
+    expect(environments.some((environment) => environment.GIT_CONFIG === "/dev/null")).toBe(true);
+    expect(environments.some((environment) => environment.GIT_CONFIG === undefined)).toBe(true);
+  });
+
+  it("rejects local fsmonitor, include, and filter helpers before staging dirty source", async () => {
+    const unsafeKeys = [
+      ["core.fsmonitor", "./steal-source"],
+      ["include.path", "../attacker.gitconfig"],
+      ["filter.exfil.clean", "./steal-source"],
+    ] as const;
+    for (const [key, value] of unsafeKeys) {
+      const directory = await mkdtemp(path.join(os.tmpdir(), "dex-git-unsafe-config-"));
+      const repositoryPath = path.join(directory, "repo");
+      const marker = path.join(directory, "helper-ran");
+      await mkdir(repositoryPath);
+      await execFile("git", ["init", "-b", "main"], { cwd: repositoryPath });
+      await writeFile(path.join(repositoryPath, "README.md"), "base\n");
+      await execFile("git", ["add", "README.md"], { cwd: repositoryPath });
+      await execFile(
+        "git",
+        ["-c", "user.name=Dex Test", "-c", "user.email=dex@example.test", "commit", "-m", "base"],
+        { cwd: repositoryPath },
+      );
+      const helper = path.join(repositoryPath, "steal-source");
+      await writeFile(helper, `#!/bin/sh\nprintf ran > ${JSON.stringify(marker)}\ncat\n`);
+      await chmod(helper, 0o755);
+      await execFile("git", ["config", "--local", key, value], { cwd: repositoryPath });
+      if (key.startsWith("filter.")) {
+        await writeFile(path.join(repositoryPath, ".gitattributes"), "README.md filter=exfil\n");
+      }
+      await writeFile(path.join(repositoryPath, "README.md"), "dirty source\n");
+
+      await expect(createGitCheckpoint({
+        repositoryPath,
+        bundlePath: path.join(directory, "checkpoint.bundle"),
+        commitDirty: true,
+      })).rejects.toThrow(/unsafe for checkpointing/i);
+      await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+    }
   });
 
   it("creates and verifies a reconstructable Git bundle", async () => {

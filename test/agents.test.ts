@@ -6,6 +6,7 @@ import {
   ClaudeAgentAdapter,
   CodexAgentAdapter,
   buildClaudeResumeArgs,
+  buildCodexStartArgs,
   buildCodexResumeArgs,
   buildCodexWorkerPrompt,
   type AgentEvent,
@@ -15,7 +16,7 @@ import {
 } from "../src/agents/index.js";
 
 class FakeAgentProcess extends EventEmitter {
-  readonly pid = 4242;
+  readonly pid: number | undefined;
   readonly stdin = new PassThrough();
   readonly stdout = new PassThrough();
   readonly stderr = new PassThrough();
@@ -25,8 +26,9 @@ class FakeAgentProcess extends EventEmitter {
   prompt = "";
   private closed = false;
 
-  constructor(private readonly closeWhenKilled = true) {
+  constructor(private readonly closeWhenKilled = true, pid: number | null = 4242) {
     super();
+    this.pid = pid ?? undefined;
     this.stdin.on("data", (chunk) => {
       this.prompt += chunk.toString("utf8");
     });
@@ -82,21 +84,34 @@ afterEach(() => {
 });
 
 describe("CodexAgentAdapter", () => {
-  it("passes only the Codex credential and strips unrelated daemon secrets", async () => {
+  it("uses account auth and strips provider keys plus unrelated daemon secrets", async () => {
     vi.stubEnv("CODEX_API_KEY", "codex-test-key");
+    vi.stubEnv("OPENAI_API_KEY", "openai-test-key");
+    vi.stubEnv("ANTHROPIC_API_KEY", "anthropic-test-key");
     vi.stubEnv("GEMINI_API_KEY", "gemini-test-key");
     vi.stubEnv("MODAL_TOKEN_SECRET", "modal-test-secret");
     vi.stubEnv("DEX_HANDOFF_SIGNING_KEY", "handoff-test-key");
     const process = new FakeAgentProcess();
     const { calls, spawner } = fakeSpawner([process]);
-    const pending = new CodexAgentAdapter({ spawner }).start({ cwd: "/repo", prompt: "work" });
+    const pending = new CodexAgentAdapter({ spawner }).start({
+      cwd: "/repo",
+      prompt: "work",
+      env: {
+        CODEX_HOME: "/private/codex-home",
+        CODEX_API_KEY: "override-codex-key",
+        OPENAI_API_KEY: "override-openai-key",
+      },
+    });
     process.stdout.write('{"type":"thread.started","thread_id":"thread-env"}\n');
     const handle = await pending;
     process.stdout.write('{"type":"turn.completed"}\n');
     process.finish(0);
     await handle.result;
 
-    expect(calls[0]?.options.env.CODEX_API_KEY).toBe("codex-test-key");
+    expect(calls[0]?.options.env.CODEX_HOME).toBe("/private/codex-home");
+    expect(calls[0]?.options.env.CODEX_API_KEY).toBeUndefined();
+    expect(calls[0]?.options.env.OPENAI_API_KEY).toBeUndefined();
+    expect(calls[0]?.options.env.ANTHROPIC_API_KEY).toBeUndefined();
     expect(calls[0]?.options.env.GEMINI_API_KEY).toBeUndefined();
     expect(calls[0]?.options.env.MODAL_TOKEN_SECRET).toBeUndefined();
     expect(calls[0]?.options.env.DEX_HANDOFF_SIGNING_KEY).toBeUndefined();
@@ -198,6 +213,27 @@ describe("CodexAgentAdapter", () => {
     ]);
   });
 
+  it("enforces an explicit read-only sandbox for review workers", () => {
+    expect(buildCodexStartArgs({
+      cwd: "/repo",
+      prompt: "review",
+      sandboxMode: "read-only",
+    })).toEqual([
+      "-C",
+      "/repo",
+      "--sandbox",
+      "read-only",
+      "--ask-for-approval",
+      "never",
+      "exec",
+      "--json",
+      "--color",
+      "never",
+      "--ignore-user-config",
+      "-",
+    ]);
+  });
+
   it("requires turn.completed as well as exit code zero", async () => {
     const process = new FakeAgentProcess();
     const { spawner } = fakeSpawner([process]);
@@ -245,20 +281,29 @@ describe("CodexAgentAdapter", () => {
 });
 
 describe("ClaudeAgentAdapter", () => {
-  it("passes only Claude provider credentials and strips unrelated daemon secrets", async () => {
+  it("uses account auth and strips Claude credentials plus unrelated daemon secrets", async () => {
     vi.stubEnv("ANTHROPIC_AUTH_TOKEN", "anthropic-test-token");
+    vi.stubEnv("ANTHROPIC_API_KEY", "anthropic-test-key");
     vi.stubEnv("GEMINI_API_KEY", "gemini-test-key");
     vi.stubEnv("MODAL_TOKEN_SECRET", "modal-test-secret");
     const process = new FakeAgentProcess();
     const { calls, spawner } = fakeSpawner([process]);
-    const pending = new ClaudeAgentAdapter({ spawner }).start({ cwd: "/repo", prompt: "work" });
+    const pending = new ClaudeAgentAdapter({ spawner }).start({
+      cwd: "/repo",
+      prompt: "work",
+      env: {
+        ANTHROPIC_AUTH_TOKEN: "override-token",
+        ANTHROPIC_API_KEY: "override-key",
+      },
+    });
     process.stdout.write('{"type":"system","subtype":"init","session_id":"session-env"}\n');
     const handle = await pending;
     process.stdout.write('{"type":"result","subtype":"success","result":"done"}\n');
     process.finish(0);
     await handle.result;
 
-    expect(calls[0]?.options.env.ANTHROPIC_AUTH_TOKEN).toBe("anthropic-test-token");
+    expect(calls[0]?.options.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(calls[0]?.options.env.ANTHROPIC_API_KEY).toBeUndefined();
     expect(calls[0]?.options.env.GEMINI_API_KEY).toBeUndefined();
     expect(calls[0]?.options.env.MODAL_TOKEN_SECRET).toBeUndefined();
   });
@@ -412,6 +457,28 @@ describe("agent lifecycle", () => {
     const secondHandle = await secondPromise;
     await adapter.stop(secondHandle);
     await expect(secondHandle.result).resolves.toMatchObject({ status: "cancelled" });
+  });
+
+  it("rejects stop when TERM and KILL produce no verifiable process exit", async () => {
+    vi.useFakeTimers();
+    const process = new FakeAgentProcess(false, null);
+    const { spawner } = fakeSpawner([process]);
+    const adapter = new CodexAgentAdapter({ spawner });
+    const pending = adapter.start({
+      cwd: "/repo",
+      prompt: "work",
+      stopGraceMs: 10,
+    });
+    process.stdout.write('{"type":"thread.started","thread_id":"thread-resistant"}\n');
+    const handle = await pending;
+
+    const stopping = handle.stop();
+    const rejected = expect(stopping).rejects.toThrow(/termination could not be verified/i);
+    await vi.advanceTimersByTimeAsync(1_011);
+
+    await rejected;
+    await expect(handle.result).resolves.toMatchObject({ status: "cancelled" });
+    expect(process.signals).toEqual(["SIGTERM", "SIGKILL"]);
   });
 
   it("rejects startup when no provider ID arrives", async () => {

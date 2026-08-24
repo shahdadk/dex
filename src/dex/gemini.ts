@@ -142,6 +142,26 @@ const GEMINI_ACTION_SCHEMA = {
       {
         type: "object",
         properties: {
+          type: { const: "REVIEW_TASK" },
+          reviewer: { enum: ["claude", "codex"] },
+          sourceAgent: { enum: ["claude", "codex"] },
+          taskQuery: { type: "string" },
+        },
+        required: ["type", "reviewer"],
+        additionalProperties: false,
+      },
+      {
+        type: "object",
+        properties: {
+          type: { const: "REVIEW_RESULT" },
+          taskQuery: { type: "string" },
+        },
+        required: ["type"],
+        additionalProperties: false,
+      },
+      {
+        type: "object",
+        properties: {
           type: { const: "MOVE_TASK" },
           taskQuery: { type: "string" },
           destination: { enum: ["local", "cloud"] },
@@ -185,11 +205,13 @@ const GEMINI_ACTION_SCHEMA = {
 const ROUTER_PROMPT = `You route messages for Dex, a persistent software developer.
 Return only a JSON array of actions. Never return shell commands.
 Allowed action types: CREATE_TASK, STATUS, LIST_SESSIONS, ADOPT_SESSION, MEMORY_QUERY,
-MOVE_TASK, CHANGE_AGENT, STOP_TASK, RESUME_TASK, KEEP_AWAKE, SLEEP.
+REVIEW_TASK, REVIEW_RESULT, MOVE_TASK, CHANGE_AGENT, STOP_TASK, RESUME_TASK, KEEP_AWAKE, SLEEP.
 Split independent engineering outcomes into separate CREATE_TASK actions.
 Use preferredAgent for explicit Claude/Codex choices and executionPreference for local/cloud choices.
 Use LIST_SESSIONS when the user asks what prior Claude/Codex sessions exist.
 Only use ADOPT_SESSION when the user supplies an exact provider and session ID;
 never invent session identity or any shell/TTY operation.
+Use REVIEW_TASK when one agent should review work already performed on a durable task.
+Use REVIEW_RESULT when the user asks to read the findings from a completed review.
 The type field must use the exact uppercase enum value shown above.
 Use SLEEP with tasks_complete when the user says sleep when done.`;

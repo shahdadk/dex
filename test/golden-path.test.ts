@@ -347,7 +347,7 @@ async function eventually(assertion: () => Promise<void>, timeoutMs = 5_000): Pr
 }
 
 describe("Dex golden path", () => {
-  it("carries one Sendblue request through durable local and Modal execution exactly once", async () => {
+  it("carries one Sendblue request through durable local and Modal execution exactly once and stays awake until explicitly asked", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "dex-golden-path-"));
     temporaryDirectories.push(directory);
     const repositoryPath = await createRepository(directory);
@@ -442,6 +442,7 @@ describe("Dex golden path", () => {
       handoffsRoot: paths.handoffs,
       workerScriptPath: path.join(process.cwd(), "src", "cloud", "cloud-worker.ts"),
       signingKey: HANDOFF_SECRET,
+      codexAuthVolumeName: "dex-codex-auth-0123456789abcdefabcd",
       modal: modal.adapter,
       taskKnowledge: (taskId) => memory.getTaskKnowledge(taskId),
       scheduleMonitor: async (input) => {
@@ -474,6 +475,7 @@ describe("Dex golden path", () => {
         claude: new ClaudeAgentAdapter({ spawner: agentBoundary.spawner }),
       },
       notify: (conversationId, text) => bridge.notify(conversationId, text),
+      flushTransport: async () => { await bridge.syncOnce(0); },
       publishTask: async (task, conversationId) => {
         await bridge.publish({
           type: "task.created",
@@ -705,6 +707,13 @@ describe("Dex golden path", () => {
       },
     });
     expect(state.tasks[primary.id]).toMatchObject({ status: "completed", stage: "done" });
+
+    // Low battery and a successful cloud handoff are never themselves sleep
+    // authorization. The no-sleep demo path ends here with the Mac awake.
+    expect(state.pendingMachineActions).toEqual([]);
+    expect(powerCommands).toEqual([]);
+    expect((await readEvents(paths.events)).some(({ type }) => type === "power.sleep_requested"))
+      .toBe(false);
 
     await expect(power.requestSleep("now", CONVERSATION_ID)).resolves.toBeUndefined();
     expect(powerCommands).toEqual(["/usr/bin/pmset sleepnow"]);

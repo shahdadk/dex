@@ -41,7 +41,7 @@ export function buildCodexStartArgs(options: CodexRunOptions): string[] {
     "-C",
     options.cwd,
     "--sandbox",
-    "workspace-write",
+    options.sandboxMode ?? "workspace-write",
     "--ask-for-approval",
     "never",
   ];
@@ -68,7 +68,7 @@ export function buildCodexResumeArgs(
     "-C",
     options.cwd,
     "--sandbox",
-    "workspace-write",
+    options.sandboxMode ?? "workspace-write",
     "--ask-for-approval",
     "never",
   ];

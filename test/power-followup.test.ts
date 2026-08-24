@@ -3,17 +3,19 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DexVerifiedCommand } from "../src/cloud/messaging/index.js";
-import type { DexOrchestrator } from "../src/dex/orchestrator.js";
+import { DexTerminalOutcomeQueuedError, type DexOrchestrator } from "../src/dex/orchestrator.js";
 import type { MessageRouter } from "../src/dex/router.js";
+import { resolveDexPaths } from "../src/config/paths.js";
 import { BatteryMonitor } from "../src/local/battery-monitor.js";
 import type { DexCloudBridge } from "../src/local/daemon/cloud-bridge.js";
 import { DexPowerController } from "../src/local/daemon/power-controller.js";
-import { DexDaemonRuntime } from "../src/local/daemon/runtime.js";
+import { DexDaemonRuntime, terminalEffectsAreReadyForPower } from "../src/local/daemon/runtime.js";
 import { MacMachineController, type SleepInhibitor } from "../src/local/machine/index.js";
 import { simulatedBatteryReading } from "../src/local/power/index.js";
 import { EventLog } from "../src/state/events.js";
 import { DexTaskSchema, WorkerSessionSchema } from "../src/state/schemas.js";
 import { DexStateStore } from "../src/state/store.js";
+import { TaskManager } from "../src/tasks/task-manager.js";
 
 const directories: string[] = [];
 const NOW = "2026-08-23T12:00:00.000Z";
@@ -267,6 +269,33 @@ describe("low-battery conversation follow-up", () => {
     expect((await store.read()).pendingConversationPrompts).toEqual([]);
     expect(notify).toHaveBeenCalledWith("chat-1", expect.stringContaining("prompt expired"));
   });
+
+  it("accepts an atomically queued terminal outcome without sending a second failure", async () => {
+    const { directory, store, events } = await fixture();
+    const notify = vi.fn(async () => undefined);
+    const receipt = vi.fn(async () => undefined);
+    const syncOnce = vi.fn(async () => []);
+    const runtime = new DexDaemonRuntime({
+      bridge: { notify, receipt, syncOnce } as unknown as DexCloudBridge,
+      router: { route: vi.fn(async () => ({ actions: [{ type: "STATUS" }], source: "deterministic" })) } as unknown as MessageRouter,
+      orchestrator: {
+        handle: vi.fn(async () => {
+          throw new DexTerminalOutcomeQueuedError("task-1", "terminal notification already queued");
+        }),
+      } as unknown as DexOrchestrator,
+      store,
+      events,
+      battery: { start: vi.fn(), stop: vi.fn() } as unknown as BatteryMonitor,
+      power: new DexPowerController({ store, events, notify: async () => undefined }),
+      codexAuthLeasePath: path.join(directory, "lease"),
+    });
+
+    await runtime.handleCommand(messageCommand("fix checkout"));
+
+    expect(receipt).toHaveBeenCalledWith(expect.stringContaining("command-fix checkout"), "processed");
+    expect(notify).not.toHaveBeenCalled();
+    expect(syncOnce).toHaveBeenCalled();
+  });
 });
 
 describe("durable power intent", () => {
@@ -335,7 +364,7 @@ describe("durable power intent", () => {
     expect((await store.read()).machine?.sleepPreventionActive).toBe(true);
   });
 
-  it("keeps the request pending and corrects the user when pmset fails", async () => {
+  it("consumes the at-most-once request and corrects the user when pmset fails", async () => {
     const { store, events } = await fixture();
     let active = true;
     const inhibitor: SleepInhibitor = {
@@ -344,22 +373,30 @@ describe("durable power intent", () => {
       restore: vi.fn(async () => { const changed = active; active = false; return changed; }),
     };
     const notify = vi.fn(async () => undefined);
+    const executor = vi.fn(async () => ({ stdout: "", stderr: "denied", exitCode: 1 }));
     const power = new DexPowerController({
       store,
       events,
       machine: new MacMachineController({
         caffeinate: inhibitor,
-        commandExecutor: async () => ({ stdout: "", stderr: "denied", exitCode: 1 }),
+        commandExecutor: executor,
       }),
       notify,
     });
 
     await expect(power.requestSleep("now", "chat-1")).rejects.toThrow("pmset sleepnow failed: denied");
-    expect(notify).toHaveBeenNthCalledWith(1, "chat-1", expect.stringContaining("requesting sleep"));
+    expect(notify).toHaveBeenNthCalledWith(
+      1,
+      "chat-1",
+      expect.stringContaining("requesting sleep"),
+      expect.stringMatching(/^evt_/),
+    );
     expect(notify).toHaveBeenNthCalledWith(2, "chat-1", expect.stringContaining("still awake"));
-    expect((await store.read()).pendingMachineActions).toEqual([expect.objectContaining({ type: "sleep" })]);
+    expect((await store.read()).pendingMachineActions).toEqual([]);
     expect((await store.read()).machine?.sleepPreventionActive).toBe(true);
     expect(inhibitor.start).toHaveBeenCalledOnce();
+    await expect(power.maybeSleepWhenReady()).resolves.toBe(false);
+    expect(executor).toHaveBeenCalledOnce();
   });
 
   it("flushes the final cloud-safe notification before pmset succeeds", async () => {
@@ -380,7 +417,11 @@ describe("durable power intent", () => {
       commandExecutor: async () => {
         calls.push("pmset");
         const duringCommand = await store.read();
-        expect(duringCommand.pendingMachineActions).toEqual([expect.objectContaining({ type: "sleep" })]);
+        // The external effect is claimed durably before pmset so a restart
+        // cannot replay a successful request.
+        expect(duringCommand.pendingMachineActions).toEqual([
+          expect.objectContaining({ type: "sleep", phase: "sleep_claimed" }),
+        ]);
         expect(duringCommand.machine?.sleepPreventionActive).toBe(true);
         expect(notify).toHaveBeenCalledOnce();
         return { stdout: "", stderr: "", exitCode: 0 };
@@ -393,5 +434,289 @@ describe("durable power intent", () => {
     expect(calls).toEqual(["notify", "restore", "pmset"]);
     expect((await store.read()).pendingMachineActions).toEqual([]);
     expect((await store.read()).machine?.sleepPreventionActive).toBe(false);
+  });
+
+  it.each(["event", "receipt"] as const)(
+    "does not run pmset while a durable transport %s is pending",
+    async (pendingKind) => {
+      const { store, events } = await fixture();
+      await store.updateState((state) => {
+        if (pendingKind === "event") {
+          state.pendingTransportEvents.push({
+            id: "event-pending",
+            timestamp: NOW,
+            type: "message.sent",
+            payload: { conversationId: "chat-1", text: "not accepted" },
+          });
+        } else {
+          state.pendingTransportReceipts.push({
+            commandId: "receipt-pending",
+            status: "processed",
+            occurredAt: NOW,
+          });
+        }
+      });
+      const executor = vi.fn(async () => ({ stdout: "", stderr: "", exitCode: 0 }));
+      const power = new DexPowerController({
+        store,
+        events,
+        machine: new MacMachineController({ commandExecutor: executor }),
+        notify: async () => undefined,
+      });
+
+      await expect(power.requestSleep("now", "chat-1")).resolves.toBeUndefined();
+
+      expect(executor).not.toHaveBeenCalled();
+      expect((await store.read()).pendingMachineActions).toEqual([
+        expect.objectContaining({ type: "sleep" }),
+      ]);
+    },
+  );
+
+  it.each([
+    ["malformed", { version: 1, phase: "notification_pending" }],
+    ["recovery pending", {
+      version: 1,
+      phase: "recovery_pending",
+      reason: "recovery is being evaluated",
+      updatedAt: NOW,
+    }],
+  ] as const)("fails closed for a %s local terminal journal", async (_label, journal) => {
+    const { store, events } = await fixture();
+    await addTask(store, "task-local", { status: "completed" });
+    await store.updateState((state) => {
+      state.tasks["task-local"]!.metadata.localTerminalEffects = journal;
+      state.pendingMachineActions.push({
+        type: "sleep",
+        trigger: "all_tasks_complete",
+        requestedAt: NOW,
+      });
+    });
+    const executor = vi.fn(async () => ({ stdout: "", stderr: "", exitCode: 0 }));
+    const power = new DexPowerController({
+      store,
+      events,
+      machine: new MacMachineController({ commandExecutor: executor }),
+      notify: async () => undefined,
+      durabilityGate: terminalEffectsAreReadyForPower,
+    });
+
+    await expect(power.maybeSleepWhenReady()).resolves.toBe(false);
+    expect(executor).not.toHaveBeenCalled();
+  });
+
+  it("does not replay sleep after pmset succeeded but post-effect bookkeeping crashed", async () => {
+    const { store, events } = await fixture();
+    const executor = vi.fn(async () => ({ stdout: "", stderr: "", exitCode: 0 }));
+    const originalUpdateState = store.updateState.bind(store);
+    let failNextUpdate = false;
+    vi.spyOn(store, "updateState").mockImplementation(async (mutator) => {
+      if (failNextUpdate) {
+        failNextUpdate = false;
+        throw new Error("simulated crash after pmset");
+      }
+      return originalUpdateState(mutator);
+    });
+    const first = new DexPowerController({
+      store,
+      events,
+      machine: new MacMachineController({
+        commandExecutor: async (...args) => {
+          const result = await executor(...args);
+          failNextUpdate = true;
+          return result;
+        },
+      }),
+      notify: async () => undefined,
+    });
+
+    await expect(first.requestSleep("now", "chat-1"))
+      .rejects.toThrow("simulated crash after pmset");
+    expect(executor).toHaveBeenCalledOnce();
+    expect((await store.read()).pendingMachineActions).toEqual([
+      expect.objectContaining({ type: "sleep", phase: "sleep_claimed" }),
+    ]);
+
+    const restarted = new DexPowerController({
+      store,
+      events,
+      machine: new MacMachineController({ commandExecutor: executor }),
+      notify: async () => undefined,
+    });
+    await expect(restarted.maybeSleepWhenReady()).resolves.toBe(false);
+    expect(executor).toHaveBeenCalledOnce();
+  });
+
+  it("serializes concurrent sleep evaluations behind one notification and one pmset claim", async () => {
+    const { store, events } = await fixture();
+    let notificationStarted!: () => void;
+    const notificationReady = new Promise<void>((resolve) => { notificationStarted = resolve; });
+    let releaseNotification!: () => void;
+    const notificationBlocked = new Promise<void>((resolve) => { releaseNotification = resolve; });
+    const notify = vi.fn(async () => {
+      notificationStarted();
+      await notificationBlocked;
+    });
+    const executor = vi.fn(async () => ({ stdout: "", stderr: "", exitCode: 0 }));
+    const power = new DexPowerController({
+      store,
+      events,
+      machine: new MacMachineController({ commandExecutor: executor }),
+      notify,
+    });
+
+    const requested = power.requestSleep("now", "chat-1");
+    await notificationReady;
+    const concurrent = [power.maybeSleepWhenReady(), power.maybeSleepWhenReady()];
+    releaseNotification();
+    await expect(Promise.all([requested, ...concurrent])).resolves.toEqual([undefined, false, false]);
+
+    expect(notify).toHaveBeenCalledOnce();
+    expect(executor).toHaveBeenCalledOnce();
+    expect((await store.read()).pendingMachineActions).toEqual([]);
+  });
+
+  it("does not claim sleep until the stable notification event leaves the transport outbox", async () => {
+    const { store, events } = await fixture();
+    const notificationIds: string[] = [];
+    const notify = vi.fn(async (_conversationId: string, _text: string, stableEventId?: string) => {
+      expect(stableEventId).toEqual(expect.stringMatching(/^evt_/));
+      notificationIds.push(stableEventId!);
+      if (notificationIds.length === 1) {
+        await store.updateState((state) => {
+          state.pendingTransportEvents.push({
+            id: stableEventId!,
+            timestamp: NOW,
+            type: "message.sent",
+            payload: { conversationId: "chat-1", text: "requesting sleep" },
+          });
+        });
+      }
+    });
+    const executor = vi.fn(async () => ({ stdout: "", stderr: "", exitCode: 0 }));
+    const power = new DexPowerController({
+      store,
+      events,
+      machine: new MacMachineController({ commandExecutor: executor }),
+      notify,
+    });
+
+    await power.requestSleep("now", "chat-1");
+    expect(executor).not.toHaveBeenCalled();
+    expect((await store.read()).pendingMachineActions[0]).toMatchObject({
+      phase: "notification_pending",
+      notificationEventId: notificationIds[0],
+    });
+
+    await store.updateState((state) => {
+      state.pendingTransportEvents = state.pendingTransportEvents.filter(
+        ({ id }) => id !== notificationIds[0],
+      );
+    });
+    await expect(power.maybeSleepWhenReady()).resolves.toBe(true);
+
+    expect(notificationIds).toEqual([notificationIds[0], notificationIds[0]]);
+    expect(executor).toHaveBeenCalledOnce();
+  });
+
+  it("resumes after a crash following notification acceptance without notifying twice", async () => {
+    const { store, events } = await fixture();
+    const notify = vi.fn(async () => undefined);
+    const executor = vi.fn(async () => ({ stdout: "", stderr: "", exitCode: 0 }));
+    const first = new DexPowerController({
+      store,
+      events,
+      machine: new MacMachineController({ commandExecutor: executor }),
+      notify,
+      transportBarrier: async () => { throw new Error("simulated crash after notification"); },
+    });
+
+    await expect(first.requestSleep("now", "chat-1"))
+      .rejects.toThrow("simulated crash after notification");
+    expect(notify).toHaveBeenCalledOnce();
+    expect(executor).not.toHaveBeenCalled();
+    const journal = (await store.read()).pendingMachineActions[0];
+    expect(journal).toMatchObject({
+      type: "sleep",
+      phase: "notification_accepted",
+      notificationEventId: expect.stringMatching(/^evt_/),
+    });
+
+    const restarted = new DexPowerController({
+      store,
+      events,
+      machine: new MacMachineController({ commandExecutor: executor }),
+      notify,
+    });
+    await expect(restarted.maybeSleepWhenReady()).resolves.toBe(true);
+
+    expect(notify).toHaveBeenCalledOnce();
+    expect(executor).toHaveBeenCalledOnce();
+    expect((await store.read()).pendingMachineActions).toEqual([]);
+  });
+
+  it("blocks sleep through terminal enqueue and transport acceptance, then delivers exactly once", async () => {
+    const { directory, store, events } = await fixture();
+    await addTask(store, "task-local", { title: "checkout" });
+    await store.updateState((state) => {
+      state.pendingMachineActions.push({
+        type: "sleep",
+        trigger: "all_tasks_complete",
+        requestedAt: NOW,
+        conversationId: "chat-1",
+      });
+    });
+    const tasks = new TaskManager(store, events, resolveDexPaths(directory));
+    await tasks.markRecoveryPendingIfCurrentWorker(
+      "task-local",
+      "worker-task-local",
+      { stage: "failed", latestSummary: "worker failed" },
+      "recovery is still being evaluated",
+    );
+    const executor = vi.fn(async () => ({ stdout: "", stderr: "", exitCode: 0 }));
+    const power = new DexPowerController({
+      store,
+      events,
+      machine: new MacMachineController({ commandExecutor: executor }),
+      notify: async () => undefined,
+      durabilityGate: terminalEffectsAreReadyForPower,
+    });
+
+    const sleepDuringRecovery = power.maybeSleepWhenReady();
+    await expect(sleepDuringRecovery).resolves.toBe(false);
+    expect(executor).not.toHaveBeenCalled();
+
+    const terminalInput = {
+      status: "failed" as const,
+      stage: "failed" as const,
+      summary: "recovery exhausted",
+      blockedReason: "worker failed",
+      conversationId: "chat-1",
+      text: "checkout failed. recovery exhausted",
+      kind: "work_failed" as const,
+      dedupeKey: "work-failed:worker-task-local",
+    };
+    await Promise.all([
+      tasks.finalizeIfCurrentWorkerWithNotification("task-local", "worker-task-local", terminalInput),
+      power.maybeSleepWhenReady(),
+    ]);
+    expect(executor).not.toHaveBeenCalled();
+
+    const delivered: string[] = [];
+    await store.updateState((state) => {
+      for (const event of state.pendingTransportEvents) {
+        if (event.type === "message.sent" && typeof event.payload.text === "string") {
+          delivered.push(event.payload.text);
+        }
+      }
+      state.pendingTransportEvents = [];
+    });
+    await expect(power.maybeSleepWhenReady()).resolves.toBe(false);
+    expect(executor).not.toHaveBeenCalled();
+
+    await tasks.confirmAcceptedLocalTerminalNotifications();
+    await expect(power.maybeSleepWhenReady()).resolves.toBe(true);
+    expect(executor).toHaveBeenCalledOnce();
+    expect(delivered).toEqual(["checkout failed. recovery exhausted"]);
   });
 });

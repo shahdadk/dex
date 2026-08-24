@@ -48,13 +48,17 @@ export class BatteryMonitor {
     }
     await this.#options.store.updateState((state) => {
       const previous = state.machine;
-      const alerts = reading.charging || reading.powerSource !== "battery"
-        ? []
-        : previous?.batteryAlertThresholds ?? [];
-      crossed = THRESHOLDS.find(
-        (threshold) => reading.batteryPercent <= threshold && !alerts.includes(threshold),
-      );
-      if (crossed !== undefined) alerts.push(crossed);
+      const isDischarging = reading.powerSource === "battery" && !reading.charging;
+      const alerts = isDischarging ? [...(previous?.batteryAlertThresholds ?? [])] : [];
+      if (isDischarging) {
+        const newlyCrossed = THRESHOLDS.filter(
+          (threshold) => reading.batteryPercent <= threshold && !alerts.includes(threshold),
+        );
+        if (newlyCrossed.length > 0) {
+          alerts.push(...newlyCrossed);
+          crossed = newlyCrossed.at(-1);
+        }
+      }
       state.machine = {
         id: previous?.id ?? this.#options.deviceId ?? "local-mac",
         hostname: previous?.hostname ?? os.hostname(),

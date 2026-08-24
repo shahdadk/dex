@@ -2,14 +2,22 @@
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Command } from "commander";
-import { loadConfig, DexConfigSchema } from "./config/config.js";
+import {
+  loadConfig,
+  DexConfigSchema,
+  modalCodexAuthVolumeForDevice,
+} from "./config/config.js";
 import { resolveDexPaths } from "./config/paths.js";
 import { runDaemon } from "./daemon.js";
 import { MessageRouter } from "./dex/router.js";
 import { buildStatusMessage } from "./dex/status.js";
 import { DexProjectSchema } from "./state/schemas.js";
 import { DexStateStore } from "./state/store.js";
-import { runDoctor, formatDoctor } from "./setup/doctor.js";
+import {
+  runDoctor,
+  formatDoctor,
+  waitForHealthySignedTransport,
+} from "./setup/doctor.js";
 import { installLaunchAgent, installRuntime } from "./setup/service.js";
 import { inspectRepository } from "./tasks/worktree.js";
 import { projectId } from "./utils/ids.js";
@@ -17,7 +25,7 @@ import { ModalAdapter } from "./cloud/modal/adapter.js";
 import { detectMacName, pairMac } from "./setup/onboarding.js";
 import { sendControlCommand } from "./local/daemon/control-socket.js";
 import { hydrateRuntimeSecrets, persistRuntimeSecrets } from "./local/pairing/secrets.js";
-import { DEFAULT_MODAL_CODEX_AUTH_VOLUME, seedModalCodexAuth } from "./setup/modal-auth.js";
+import { seedModalCodexAuth } from "./setup/modal-auth.js";
 import {
   discoverClaudeMem,
   extractObservationIds,
@@ -44,7 +52,7 @@ program
     // Validate the repository before creating a cloud pairing or mutating Dex
     // state. registerProject performs the actual durable write after pairing.
     await inspectRepository(options.project);
-    let config = await loadConfig(paths);
+    let config = await loadConfig(paths, { allowLegacyPairedModalAuthVolume: true });
     const deviceName = options.deviceName ?? await detectMacName();
     const identity = await pairMac({
       config,
@@ -52,19 +60,20 @@ program
       deviceName,
     });
     const project = await registerProject(store, options.project);
+    const modalCodexAuthVolume = modalCodexAuthVolumeForDevice(identity.deviceId);
     config = DexConfigSchema.parse({
       ...config,
       deviceId: identity.deviceId,
       deviceKeyId: identity.keyId,
+      modalCodexAuthVolume,
       ownerId: identity.ownerId,
       ...(identity.pairedConversationId ? { pairedConversationId: identity.pairedConversationId } : {}),
       deviceName,
       defaultProjectId: project.id,
       defaultRepository: project.path,
     });
-    await writeFile(paths.config, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
-    const checks = await runDoctor(config);
-    console.log(formatDoctor(checks, "Dex Setup"));
+    const checks = await runDoctor(config, { signedTransportMode: "preinstall" });
+    console.log(formatDoctor(checks, "Dex Setup · Preflight", "Pre-install checks passed."));
     if (checks.some((check) => check.status === "fail")) {
       throw new Error("Required setup checks failed; fix them and run dex setup again.");
     }
@@ -77,8 +86,14 @@ program
     if (!process.env.GEMINI_API_KEY) {
       throw new Error("GEMINI_API_KEY is required for Dex's ambiguous routing lane");
     }
-    const auth = await seedModalCodexAuth();
-    process.env.DEX_MODAL_CODEX_AUTH_VOLUME = auth.volumeName;
+    process.env.DEX_MODAL_CODEX_AUTH_VOLUME = modalCodexAuthVolume;
+    const auth = await seedModalCodexAuth({
+      volumeName: modalCodexAuthVolume,
+      leasePath: path.join(paths.handoffs, ".codex-account-auth.lease"),
+    });
+    // Do not persist a migrated device-to-Volume binding until that exact
+    // Volume has passed the lease-protected account-auth verification.
+    await writeFile(paths.config, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
     console.log(`✓ Codex ChatGPT account auth ${auth.disposition} in private Modal Volume ${auth.volumeName}`);
     if (!options.skipModalSmoke) {
       const smoke = await modalSmokeTest();
@@ -87,10 +102,32 @@ program
     await persistRuntimeSecrets();
     if (options.service) {
       const runtime = await installRuntime(paths, VERSION);
-      await installLaunchAgent(runtime, paths);
-      console.log("\n✓ Dex is running in the background");
+      await installLaunchAgent(runtime, paths, { codexAuthVolumeName: modalCodexAuthVolume });
+      // Require a sync written after the newly installed service itself has
+      // reported ready. This deliberately waits through one 25-second poll
+      // rather than accepting a stale write raced in by the previous daemon.
+      const serviceReadyAt = new Date().toISOString();
+      const transportBaseline = await store.read();
+      await waitForHealthySignedTransport({
+        loadState: () => store.read(),
+        afterRevision: transportBaseline.revision,
+        notBefore: serviceReadyAt,
+        ...(transportBaseline.signedTransportHealth?.lastSuccessAt === undefined
+          ? {}
+          : { previousLastSuccessAt: transportBaseline.signedTransportHealth.lastSuccessAt }),
+      });
+      const finalChecks = await runDoctor(config);
+      console.log(`\n${formatDoctor(finalChecks, "Dex Setup · Final checks")}`);
+      if (finalChecks.some((check) => check.status === "fail")) {
+        throw new Error("Dex background service started, but final setup checks failed.");
+      }
+      console.log("\n✓ Dex is running in the background with signed cloud transport");
+      console.log(`\nProject:\n${project.path}\n\nYou're done. Close Terminal and text Dex.`);
+      return;
     }
-    console.log(`\nProject:\n${project.path}\n\nYou're done. Close Terminal and text Dex.`);
+    console.log("\n! --no-service selected: the background daemon and signed transport were not started");
+    console.log(`\nProject:\n${project.path}`);
+    console.log("\nDeveloper setup is prepared. Run `dex daemon` or rerun `dex setup` without --no-service before texting Dex.");
   });
 
 program.command("doctor").description("Run internal dependency diagnostics").action(async () => {
@@ -336,14 +373,11 @@ async function modalSmokeTest(): Promise<{ id: string; version: string }> {
   const modal = new ModalAdapter();
   const signingKey = process.env.DEX_HANDOFF_SIGNING_KEY;
   if (!signingKey) throw new Error("DEX_HANDOFF_SIGNING_KEY is required for the Modal worker check");
-  const codexAuthVolumeName = process.env.DEX_MODAL_CODEX_AUTH_VOLUME ?? DEFAULT_MODAL_CODEX_AUTH_VOLUME;
   const sandbox = await modal.create({
     secretNames: [process.env.DEX_MODAL_SECRET_NAME ?? "dex-workers"],
     requiredSecretKeys: ["DEX_HANDOFF_SIGNING_KEY"],
-    volumeNames: { "/codex-home": codexAuthVolumeName },
     params: {
       timeoutMs: 120_000,
-      env: { CODEX_HOME: "/codex-home" },
       command: ["sleep", "120"],
     },
   });
@@ -351,7 +385,7 @@ async function modalSmokeTest(): Promise<{ id: string; version: string }> {
     const process = await sandbox.exec([
       "node",
       "-e",
-      "const fs=require('node:fs'); if (!fs.existsSync('/codex-home/auth.json') || !process.env.DEX_HANDOFF_SIGNING_KEY) process.exit(9); process.stdout.write(process.version)",
+      "if (!process.env.DEX_HANDOFF_SIGNING_KEY) process.exit(9); process.stdout.write(process.version)",
     ]);
     const [exitCode, output] = await Promise.all([process.wait(), process.stdout.readText()]);
     if (exitCode !== 0) throw new Error(`Modal command exited ${exitCode}: ${await process.stderr.readText()}`);

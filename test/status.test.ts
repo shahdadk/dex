@@ -60,4 +60,39 @@ describe("status persona", () => {
     expect(message).not.toContain("git diff");
     expect(message).not.toContain("`");
   });
+
+  it("includes durable cross-agent review findings without replacing the implementation result", () => {
+    const now = new Date().toISOString();
+    const task: DexTask = {
+      id: "checkout-review",
+      kind: "dex",
+      projectId: "p1",
+      title: "checkout",
+      originalRequest: "fix checkout",
+      repositoryPath: "/repo",
+      baseBranch: "main",
+      dexBranch: "dex/checkout-review",
+      worktreePath: "/worktree",
+      status: "completed",
+      stage: "done",
+      createdAt: now,
+      updatedAt: now,
+      latestSummary: "checkout fix validated — 2/2 tests passed",
+      workerHistory: [],
+      memoryQueries: [],
+      metadata: {
+        latestReview: {
+          reviewer: "claude",
+          sourceAgent: "codex",
+          status: "completed",
+          summary: "no material findings; the ordering regression is covered",
+        },
+      },
+    };
+
+    const message = buildStatusMessage([task]);
+
+    expect(message).toContain("checkout fix validated — 2/2 tests passed");
+    expect(message).toContain("claude review: no material findings");
+  });
 });

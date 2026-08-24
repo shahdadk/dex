@@ -26,7 +26,10 @@ export interface AgentRunOptions {
   extraArgs?: readonly string[];
 }
 
-export type CodexRunOptions = AgentRunOptions;
+export interface CodexRunOptions extends AgentRunOptions {
+  /** Explicit filesystem boundary for the worker; implementation work defaults to workspace-write. */
+  sandboxMode?: "read-only" | "workspace-write";
+}
 
 export interface ClaudeRunOptions extends AgentRunOptions {
   permissionMode?:

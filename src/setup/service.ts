@@ -20,6 +20,7 @@ const LAUNCH_AGENT_ENVIRONMENT_NAMES = [
 
 export interface InstallLaunchAgentOptions {
   environment?: NodeJS.ProcessEnv;
+  codexAuthVolumeName?: string;
   readinessTimeoutMs?: number;
   readinessPollMs?: number;
   probeControlSocket?(socketPath: string): Promise<void>;
@@ -55,7 +56,12 @@ export async function installLaunchAgent(
     log: paths.daemonLog,
     dexHome: paths.home,
     executablePath: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-    environment: launchAgentEnvironment(options.environment ?? process.env),
+    environment: launchAgentEnvironment({
+      ...(options.environment ?? process.env),
+      ...(options.codexAuthVolumeName
+        ? { DEX_MODAL_CODEX_AUTH_VOLUME: options.codexAuthVolumeName }
+        : {}),
+    }),
   });
   const existing = await readFile(plist, "utf8").catch(() => "");
   if (existing !== body) await writeFile(plist, body, { mode: 0o600 });

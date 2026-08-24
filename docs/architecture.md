@@ -98,7 +98,7 @@ fresh Codex / Modal
 
 The video labels the 8% value as a controlled sensor input using the production policy path. It demonstrates the continuity concept and names Claude-Mem and Modal. It does not claim that the Mac physically slept or that a completion arrived while it remained asleep.
 
-The fuller implemented path also supports two concurrent local tasks, allowing Codex to implement while Claude investigates or reviews.
+The fuller implemented path supports up to three concurrent workers, allowing Codex to implement while Claude investigates or reviews.
 
 ## Routing policy
 
@@ -128,11 +128,13 @@ preparing ──► running ──► completed
                 └──► cancelled
 ```
 
-The scheduler defaults to two concurrent workers and counts active Modal workers against the limit. Each local task receives a `dex/...` branch and separate worktree. The user's original working tree is not the task workspace, and Dex does not merge, push, or deploy automatically.
+The scheduler defaults to three concurrent workers and counts active Modal workers against the limit. Each local task receives a `dex/...` branch and separate worktree. The user's original working tree is not the task workspace, and Dex does not merge, push, or deploy automatically.
 
 Provider output is reduced to normalized events and semantic stages. The user receives concise summaries rather than JSONL or terminal logs. If the daemon restarts, active local workers are marked stopped, task identity and history are preserved, and the orchestrator can attempt bounded recovery.
 
 Recent Claude and Codex transcripts can be discovered and normalized without attaching to arbitrary TTYs. Validated adoption-request parsing exists, but conversational adoption is not a P0 demo claim.
+
+Cross-agent review stays on the same durable task while preserving the implementation outcome. Codex reviews run in an explicit read-only sandbox. Claude reviews combine `--safe-mode`, plan mode, explicit hook disabling, empty setting/MCP sources, disabled slash commands, no session persistence, and an editing-disabled review tool surface. Safe mode suppresses ordinary customizations while preserving persisted Claude Max authentication; repository tests inspect the constructed invocation, minimal environment, and absence of API-key variables. An authenticated provider rehearsal and organization-managed policy remain external boundaries. Full findings are retained durably, iMessage receives a bounded semantic summary, and “show me the full review” delivers the stored result in bounded ordered messages when one transport payload is insufficient.
 
 ## Memory continuity
 
@@ -260,12 +262,11 @@ Automated acceptance uses controlled external-provider boundaries. It is evidenc
 
 ## P1 / optional work
 
-- complete conversational adoption of discovered Claude/Codex sessions;
-- three-task concurrency and broader restart hardening;
-- cross-agent review and bounded remediation; and
+- bounded remediation from persisted cross-agent findings;
+- durable delayed cleanup of retained Modal sandboxes; and
 - optional Greptile review for an existing PR after validation passes.
 
-Greptile is not required for P0 and must not block task completion. Dex never creates or pushes a PR merely to trigger review.
+Direct and ordinal-follow-up session adoption, three-task concurrency, conversation-aware task follow-ups, bounded crash/restart recovery, and read-only cross-agent review are implemented. Greptile is not required for P0 and must not block task completion. Dex never creates or pushes a PR merely to trigger review.
 
 ## Operational interfaces
 

@@ -60,6 +60,15 @@ function result(status: "succeeded" | "failed" | "cancelled" = "succeeded") {
     summary: "Implemented the Modal handoff.",
     validation: { commands: ["npm test"], passed: status === "succeeded" },
     git: { branch: "dex/task-1", commit: "abc123" },
+    authVolumePersisted: {
+      version: 1 as const,
+      method: "modal-volume-v2-sync" as const,
+      mountPath: "/codex-home" as const,
+      taskId: "task-1",
+      handoffSha256: HASH,
+      authSha256: "b".repeat(64),
+      persistedAt: "2026-08-23T12:00:10.000Z",
+    },
   };
 }
 
@@ -301,7 +310,11 @@ describe("ModalMonitor", () => {
     expect(first).toMatchObject({
       kind: "terminal",
       callbackInvoked: true,
-      event: { status: "succeeded", reason: "result" },
+      event: {
+        status: "succeeded",
+        reason: "result",
+        sandboxTerminal: { kind: "poll", volumePersisted: true },
+      },
     });
     expect(duplicate).toMatchObject({
       kind: "terminal",
@@ -344,8 +357,50 @@ describe("ModalMonitor", () => {
     });
 
     expect(callbacks).toHaveLength(1);
+    expect(callbacks[0]?.sandboxTerminal).toBeUndefined();
     expect(calls).toContain("detach");
     expect(calls).not.toContain("terminate");
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["forged", {
+      version: 1,
+      method: "modal-volume-v2-sync",
+      mountPath: "/codex-home",
+      taskId: "another-task",
+      handoffSha256: HASH,
+      authSha256: "b".repeat(64),
+      persistedAt: "2026-08-23T12:00:10.000Z",
+    }],
+  ] as const)("does not retain a successful sandbox with %s auth persistence evidence", async (_kind, evidence) => {
+    const calls: string[] = [];
+    const callbacks: ModalTerminalEvent[] = [];
+    const raw = sandbox(null, calls);
+    const { ModalSandbox } = await import("../src/cloud/modal/index.js");
+    const artifact = result();
+    const candidate = { ...artifact, authVolumePersisted: evidence };
+    if (evidence === undefined) delete (candidate as { authVolumePersisted?: unknown }).authVolumePersisted;
+    const monitor = new ModalMonitor({
+      modal: { fromId: async () => new ModalSandbox(raw) },
+      now: () => STARTED_AT_MS + 20_000,
+      schedule: async () => undefined,
+      onTerminal: async (event) => { callbacks.push(event); },
+      readResult: async () => candidate,
+    });
+
+    await expect(monitor.run({
+      taskId: "task-1",
+      sandboxId: "sb-1",
+      handoffSha256: HASH,
+      startedAt: STARTED_AT,
+    })).resolves.toMatchObject({
+      kind: "terminal",
+      event: { status: "failed", reason: "invalid_result" },
+    });
+    expect(callbacks).toHaveLength(1);
+    expect(calls).toContain("terminate");
+    expect(calls).not.toContain("detach");
   });
 
   it("keeps a readable result alive when durable terminal delivery fails", async () => {
@@ -378,6 +433,135 @@ describe("ModalMonitor", () => {
       event: { status: "succeeded", reason: "result" },
     });
     expect(attempts).toBe(2);
+    expect(calls).toContain("detach");
+    expect(calls).not.toContain("terminate");
+  });
+
+  it("retries cleanup instead of delivering a terminal event without persistence evidence", async () => {
+    const calls: string[] = [];
+    const callbacks: ModalTerminalEvent[] = [];
+    const schedules: Array<{ attempt: number; delayMs: number }> = [];
+    const raw = sandbox(null, calls);
+    let terminationAttempts = 0;
+    raw.terminate = async () => {
+      calls.push("terminate");
+      terminationAttempts += 1;
+      if (terminationAttempts === 1) throw new Error("snapshot still committing");
+    };
+    const { ModalSandbox } = await import("../src/cloud/modal/index.js");
+    const monitor = new ModalMonitor({
+      modal: { fromId: async () => new ModalSandbox(raw) },
+      now: () => STARTED_AT_MS + 20_000,
+      schedule: async ({ request, delayMs }) => {
+        schedules.push({ attempt: request.attempt, delayMs });
+      },
+      onTerminal: async (event) => {
+        callbacks.push(event);
+      },
+      readResult: async () => result("failed"),
+    });
+
+    await expect(monitor.run({
+      taskId: "task-1",
+      sandboxId: "sb-1",
+      handoffSha256: HASH,
+      startedAt: STARTED_AT,
+    })).resolves.toMatchObject({
+      kind: "rescheduled",
+      delayMs: 10_000,
+      nextAttempt: 1,
+    });
+    expect(callbacks).toHaveLength(0);
+    expect(schedules).toEqual([{ attempt: 1, delayMs: 10_000 }]);
+
+    await expect(monitor.run({
+      taskId: "task-1",
+      sandboxId: "sb-1",
+      handoffSha256: HASH,
+      startedAt: STARTED_AT,
+      attempt: 1,
+    })).resolves.toMatchObject({
+      kind: "terminal",
+      event: {
+        status: "failed",
+        reason: "result",
+        sandboxTerminal: { kind: "terminate_wait", volumePersisted: true },
+      },
+    });
+    expect(callbacks).toHaveLength(1);
+    expect(terminationAttempts).toBe(2);
+  });
+
+  it("reschedules transient result retrieval failures without destroying valid work", async () => {
+    const { ModalSandbox } = await import("../src/cloud/modal/index.js");
+    for (const exitCode of [null, 0] as const) {
+      const calls: string[] = [];
+      const callbacks: ModalTerminalEvent[] = [];
+      const schedules: Array<{ attempt: number; delayMs: number }> = [];
+      const monitor = new ModalMonitor({
+        modal: { fromId: async () => new ModalSandbox(sandbox(exitCode, calls)) },
+        now: () => STARTED_AT_MS + 20_000,
+        schedule: async ({ request, delayMs }) => {
+          schedules.push({ attempt: request.attempt, delayMs });
+        },
+        onTerminal: async (event) => {
+          callbacks.push(event);
+        },
+        readResult: async () => {
+          throw new Error("temporary Modal filesystem transport failure");
+        },
+      });
+
+      await expect(monitor.run({
+        taskId: "task-1",
+        sandboxId: "sb-1",
+        handoffSha256: HASH,
+        startedAt: STARTED_AT,
+      })).resolves.toMatchObject({
+        kind: "rescheduled",
+        delayMs: 10_000,
+        nextAttempt: 1,
+      });
+      expect(schedules).toEqual([{ attempt: 1, delayMs: 10_000 }]);
+      expect(callbacks).toHaveLength(0);
+      expect(calls).toContain("detach");
+      expect(calls).not.toContain("terminate");
+    }
+  });
+
+  it("retries an exited sandbox while its result artifact is not yet visible", async () => {
+    const calls: string[] = [];
+    const callbacks: ModalTerminalEvent[] = [];
+    const schedules: Array<{ attempt: number; delayMs: number }> = [];
+    const { ModalSandbox } = await import("../src/cloud/modal/index.js");
+    const monitor = new ModalMonitor({
+      modal: { fromId: async () => new ModalSandbox(sandbox(0, calls)) },
+      now: () => STARTED_AT_MS + 20_000,
+      schedule: async ({ request, delayMs }) => {
+        schedules.push({ attempt: request.attempt, delayMs });
+      },
+      onTerminal: async (event) => {
+        callbacks.push(event);
+      },
+      readResult: async () => {
+        const error = new Error("result.json does not exist yet") as NodeJS.ErrnoException;
+        error.code = "ENOENT";
+        throw error;
+      },
+    });
+
+    await expect(monitor.run({
+      taskId: "task-1",
+      sandboxId: "sb-1",
+      handoffSha256: HASH,
+      startedAt: STARTED_AT,
+    })).resolves.toMatchObject({
+      kind: "rescheduled",
+      delayMs: 10_000,
+      nextAttempt: 1,
+    });
+    expect(schedules).toEqual([{ attempt: 1, delayMs: 10_000 }]);
+    expect(callbacks).toHaveLength(0);
     expect(calls).toContain("detach");
     expect(calls).not.toContain("terminate");
   });
@@ -422,8 +606,18 @@ describe("ModalMonitor", () => {
     });
 
     expect(events).toMatchObject([
-      { taskId: "task-1", status: "failed", reason: "invalid_result" },
-      { taskId: "task-2", status: "failed", reason: "deadline_exceeded" },
+      {
+        taskId: "task-1",
+        status: "failed",
+        reason: "invalid_result",
+        sandboxTerminal: { kind: "poll", volumePersisted: true },
+      },
+      {
+        taskId: "task-2",
+        status: "failed",
+        reason: "deadline_exceeded",
+        sandboxTerminal: { kind: "terminate_wait", volumePersisted: true },
+      },
     ]);
     expect(timeoutCalls).toContain("terminate");
   });

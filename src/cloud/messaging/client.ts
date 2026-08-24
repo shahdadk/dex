@@ -63,16 +63,24 @@ export class DexCloudProtocolError extends Error {
   readonly status: number | undefined;
   readonly code: string;
   readonly retryable: boolean;
+  readonly invalidEventId: string | undefined;
 
   constructor(
     message: string,
-    options: { status?: number; code: string; retryable?: boolean; cause?: unknown },
+    options: {
+      status?: number;
+      code: string;
+      retryable?: boolean;
+      invalidEventId?: string;
+      cause?: unknown;
+    },
   ) {
     super(message, options.cause === undefined ? undefined : { cause: options.cause });
     this.name = "DexCloudProtocolError";
     if (options.status !== undefined) this.status = options.status;
     this.code = options.code;
     this.retryable = options.retryable ?? false;
+    this.invalidEventId = options.invalidEventId;
   }
 }
 
@@ -124,6 +132,20 @@ function positiveInteger(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0
     ? value
     : undefined;
+}
+
+function boundedIdentifier(value: unknown): string | undefined {
+  return typeof value === "string" &&
+      value.length >= 1 &&
+      value.length <= 512 &&
+      value.trim() === value
+    ? value
+    : undefined;
+}
+
+function invalidTransportEventId(json: unknown, code: string, status: number): string | undefined {
+  if (status !== 400 || code !== "invalid_transport_event") return undefined;
+  return boundedIdentifier(record(json)?.eventId);
 }
 
 function replaySequence(parsed: ParsedResponse): number | undefined {
@@ -263,7 +285,13 @@ export class DexCloudMessagingClient {
 
       if (isReplayResponse(parsed) && !recoveredReplay) {
         const nextSequence = replaySequence(parsed);
-        if (nextSequence !== undefined) this.#sequencer.setNextSequenceFloor(nextSequence);
+        if (nextSequence !== undefined) {
+          if (responseCode(parsed.json) === "stale_sequence") {
+            this.#sequencer.resynchronizeNextSequence(nextSequence);
+          } else {
+            this.#sequencer.setNextSequenceFloor(nextSequence);
+          }
+        }
         recoveredReplay = true;
         continue;
       }
@@ -271,10 +299,16 @@ export class DexCloudMessagingClient {
       if (!parsed.response.ok) {
         this.#markFailure("http");
         const code = responseCode(parsed.json) ?? `http_${parsed.response.status}`;
+        const invalidEventId = invalidTransportEventId(
+          parsed.json,
+          code,
+          parsed.response.status,
+        );
         throw new DexCloudProtocolError("Dex cloud rejected the request", {
           status: parsed.response.status,
           code,
           retryable: parsed.response.status === 429 || parsed.response.status >= 500,
+          ...(invalidEventId === undefined ? {} : { invalidEventId }),
         });
       }
 

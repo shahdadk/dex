@@ -85,6 +85,7 @@ export const WorkerSessionSchema = z.object({
   id: z.string().min(1),
   taskId: z.string().min(1),
   agent: AgentKindSchema,
+  purpose: z.enum(["work", "review"]).default("work"),
   target: ExecutionTargetSchema,
   status: WorkerStatusSchema,
   providerSessionId: z.string().optional(),
@@ -128,6 +129,12 @@ export const PendingMachineActionSchema = z.discriminatedUnion("type", [
     trigger: z.enum(["now", "all_tasks_complete"]),
     requestedAt: z.string().datetime(),
     conversationId: z.string().optional(),
+    notificationEventId: z.string().min(1).max(512).optional(),
+    phase: z.enum([
+      "notification_pending",
+      "notification_accepted",
+      "sleep_claimed",
+    ]).optional(),
   }),
   z.object({
     type: z.literal("restore"),
@@ -146,6 +153,23 @@ export const PendingConversationPromptSchema = z.object({
 });
 export type PendingConversationPrompt = z.infer<typeof PendingConversationPromptSchema>;
 
+export const ListedProviderSessionSchema = z.object({
+  provider: AgentKindSchema,
+  sessionId: z.string().min(1).max(512),
+  cwd: z.string().min(1).max(4096).optional(),
+  updatedAt: z.string().datetime(),
+  summary: z.string().min(1).max(180).optional(),
+  active: z.boolean(),
+}).strict();
+
+export const PendingSessionSelectionSchema = z.object({
+  conversationId: z.string().min(1),
+  sessions: z.array(ListedProviderSessionSchema).min(1).max(50),
+  createdAt: z.string().datetime(),
+  expiresAt: z.string().datetime(),
+}).strict();
+export type PendingSessionSelection = z.infer<typeof PendingSessionSelectionSchema>;
+
 export const PendingTransportEventSchema = z.object({
   id: z.string().min(1),
   timestamp: z.string().datetime(),
@@ -162,6 +186,42 @@ export const PendingTransportReceiptSchema = z.object({
   reason: z.string().max(1000).optional(),
 });
 
+export const QuarantinedTransportEventSchema = z.object({
+  id: z.string().min(1).max(512),
+  timestamp: z.string().datetime(),
+  type: z.string().min(1).max(512),
+  taskId: z.string().min(1).max(512).optional(),
+  workerId: z.string().min(1).max(512).optional(),
+  reason: z.literal("invalid_transport_event"),
+  quarantinedAt: z.string().datetime(),
+}).strict();
+
+export const SignedTransportErrorSchema = z.enum([
+  "network",
+  "http",
+  "protocol",
+  "verification",
+  "unknown",
+]);
+export type SignedTransportError = z.infer<typeof SignedTransportErrorSchema>;
+
+export const SignedTransportHealthSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.literal("healthy"),
+    consecutiveFailures: z.literal(0),
+    lastAttemptAt: z.string().datetime(),
+    lastSuccessAt: z.string().datetime(),
+  }).strict(),
+  z.object({
+    status: z.literal("degraded"),
+    consecutiveFailures: z.number().int().min(1).max(10_000),
+    lastAttemptAt: z.string().datetime(),
+    lastSuccessAt: z.string().datetime().optional(),
+    lastError: SignedTransportErrorSchema,
+  }).strict(),
+]);
+export type SignedTransportHealth = z.infer<typeof SignedTransportHealthSchema>;
+
 export const DexStateSchema = z.object({
   version: z.literal(1),
   revision: z.number().int().min(0),
@@ -171,10 +231,13 @@ export const DexStateSchema = z.object({
   machine: MachineStateSchema.optional(),
   pendingMachineActions: z.array(PendingMachineActionSchema),
   pendingConversationPrompts: z.array(PendingConversationPromptSchema).max(100).default([]),
+  pendingSessionSelections: z.record(z.string(), PendingSessionSelectionSchema).default({}),
   processedMessageIds: z.array(z.string()).max(5000),
   lastInboundCursor: z.string().optional(),
   pendingTransportEvents: z.array(PendingTransportEventSchema).max(5000).default([]),
   pendingTransportReceipts: z.array(PendingTransportReceiptSchema).max(5000).default([]),
+  quarantinedTransportEvents: z.array(QuarantinedTransportEventSchema).max(1000).default([]),
+  signedTransportHealth: SignedTransportHealthSchema.optional(),
 });
 export type DexState = z.infer<typeof DexStateSchema>;
 
@@ -187,9 +250,11 @@ export function emptyState(): DexState {
     workers: {},
     pendingMachineActions: [],
     pendingConversationPrompts: [],
+    pendingSessionSelections: {},
     processedMessageIds: [],
     pendingTransportEvents: [],
     pendingTransportReceipts: [],
+    quarantinedTransportEvents: [],
   };
 }
 

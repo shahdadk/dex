@@ -1,19 +1,22 @@
-import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { constants, type Stats } from "node:fs";
 import {
   chmod,
-  lstat,
   mkdir,
   mkdtemp,
+  open,
   realpath,
   rm,
+  unlink,
+  type FileHandle,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { NotFoundError as ModalNotFoundError } from "modal";
 import { z } from "zod";
 import { ModalAdapter } from "../../cloud/modal/adapter.js";
 import type { DexTask } from "../../state/schemas.js";
-import { execFile } from "../../utils/exec.js";
 import {
   CloudResultCompletionSchema,
   type CloudResultCompletion,
@@ -25,7 +28,21 @@ const GIT_CONFIG_ARGS = [
   "core.hooksPath=/dev/null",
   "-c",
   "core.fsmonitor=false",
+  "-c",
+  "core.pager=cat",
+  "-c",
+  "core.attributesFile=/dev/null",
+  "-c",
+  "commit.gpgsign=false",
+  "-c",
+  "tag.gpgsign=false",
+  "-c",
+  "credential.helper=",
+  "-c",
+  "core.sshCommand=/usr/bin/false",
 ] as const;
+const BUNDLE_DESCRIPTOR_PATH = "/dev/fd/3";
+const UNSAFE_LOCAL_GIT_CONFIG = /^(?:include(?:if\..+)?\.path|core\.(?:hookspath|fsmonitor|worktree|sshcommand|pager|editor|gitproxy)|filter\..+|credential\..+|diff\.external|diff\..+\.command|difftool\..+\.cmd|merge\..+\.driver|mergetool\..+\.cmd|gpg\..+|user\.signingkey|commit\.gpgsign|tag\.gpgsign|pager\..+|sequence\.editor)$/i;
 
 const ImportTaskSchema = z.object({
   id: z.string().min(1).max(512),
@@ -74,6 +91,7 @@ export interface CloudResultSandbox {
   copyToLocal(remotePath: string, localPath: string): Promise<void>;
   detach(): void | Promise<void>;
   terminate(params?: { wait?: boolean }): Promise<void | number>;
+  poll?(): Promise<number | null>;
 }
 
 export interface CloudResultModal {
@@ -89,7 +107,7 @@ export interface CloudResultCommandResult {
 export type CloudResultArgvRunner = (
   command: string,
   args: readonly string[],
-  options: { cwd: string },
+  options: { cwd: string; env: NodeJS.ProcessEnv; bundleFd?: number },
 ) => Promise<CloudResultCommandResult>;
 
 export interface CloudResultImporterOptions {
@@ -110,6 +128,12 @@ export interface ImportCloudResultInput {
     | "metadata"
   >;
   completion: unknown;
+  /**
+   * Revalidates durable task/worker ownership immediately before the task
+   * branch is advanced. Retrieval and bundle verification may take long
+   * enough for a replacement worker to take ownership in the meantime.
+   */
+  beforeApply?: () => Promise<void>;
 }
 
 /** The small set of values a caller needs to persist after a successful import. */
@@ -129,7 +153,7 @@ interface ExpectedResult {
   branch: string;
   commit: string;
   remoteBundlePath: string;
-  bundleSha256?: string;
+  bundleSha256: string;
   bundleBytes?: number;
 }
 
@@ -137,6 +161,15 @@ interface VerifiedWorktree {
   worktreePath: string;
   baseRef: string;
   baseCommit: string;
+}
+
+interface TrustedBundle {
+  handle: FileHandle;
+  directory: string;
+  dev: number;
+  ino: number;
+  size: number;
+  sha256: string;
 }
 
 type ImportTask = z.output<typeof ImportTaskSchema>;
@@ -249,7 +282,14 @@ function resolveExpectedResult(
   const bundleSha256 = oneMetadataValue([
     completion.bundle?.sha256,
     completion.result.git.bundleSha256,
-  ], "bundle SHA-256", false);
+  ], "bundle SHA-256")!;
+  if (!/^[a-f0-9]{64}$/.test(bundleSha256)) {
+    throw importError(
+      "invalid_input",
+      "Cloud result bundle SHA-256 metadata is invalid.",
+      false,
+    );
+  }
 
   let commit: string;
   try {
@@ -278,7 +318,7 @@ function resolveExpectedResult(
       branch: task.dexBranch,
       commit,
       remoteBundlePath,
-      ...(bundleSha256 === undefined ? {} : { bundleSha256 }),
+      bundleSha256,
       ...(completion.bundle?.bytes === undefined
         ? {}
         : { bundleBytes: completion.bundle.bytes }),
@@ -292,12 +332,6 @@ function safeTaskSegment(taskId: string): string {
   return `${readable}-${digest}`;
 }
 
-async function sha256File(file: string): Promise<string> {
-  const hash = createHash("sha256");
-  for await (const chunk of createReadStream(file)) hash.update(chunk);
-  return hash.digest("hex");
-}
-
 function parseBundleHeads(output: string): Map<string, string> {
   const heads = new Map<string, string>();
   for (const line of output.split("\n")) {
@@ -307,8 +341,319 @@ function parseBundleHeads(output: string): Map<string, string> {
   return heads;
 }
 
-const defaultRunner: CloudResultArgvRunner = (command, args, options) =>
-  execFile(command, args, options);
+function safeGitEnvironment(readLocalConfiguration = false): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin",
+    LANG: process.env.LANG ?? "C",
+    LC_ALL: "C",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_ATTR_NOSYSTEM: "1",
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_ASKPASS: "/usr/bin/false",
+    SSH_ASKPASS: "/usr/bin/false",
+    GIT_SSH_COMMAND: "/usr/bin/false",
+    GIT_PAGER: "cat",
+    PAGER: "cat",
+    GIT_EDITOR: "/usr/bin/true",
+    GIT_SEQUENCE_EDITOR: "/usr/bin/true",
+    GIT_NO_REPLACE_OBJECTS: "1",
+  };
+  if (!readLocalConfiguration) environment.GIT_CONFIG = "/dev/null";
+  if (process.env.TMPDIR) environment.TMPDIR = process.env.TMPDIR;
+  return environment;
+}
+
+const defaultRunner: CloudResultArgvRunner = (_command, args, options) =>
+  new Promise((resolve, reject) => {
+    const child = spawn("/usr/bin/git", [...args], {
+      cwd: options.cwd,
+      env: options.env,
+      stdio: options.bundleFd === undefined
+        ? ["ignore", "pipe", "pipe"]
+        : ["ignore", "pipe", "pipe", options.bundleFd],
+      shell: false,
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout!.setEncoding("utf8");
+    child.stderr!.setEncoding("utf8");
+    child.stdout!.on("data", (chunk: string) => { stdout = `${stdout}${chunk}`.slice(-1_000_000); });
+    child.stderr!.on("data", (chunk: string) => { stderr = `${stderr}${chunk}`.slice(-1_000_000); });
+    child.once("error", reject);
+    child.once("close", (code) => resolve({
+      stdout,
+      stderr,
+      exitCode: code ?? 1,
+    }));
+  });
+
+function assertCurrentOwner(metadata: Stats, label: string): void {
+  if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) {
+    throw importError("integrity_failed", `${label} is not owned by Dex.`, true);
+  }
+}
+
+function assertSingleLinkRegularFile(metadata: Stats, label: string): void {
+  if (!metadata.isFile()) {
+    throw importError("integrity_failed", `${label} is not a regular file.`, true);
+  }
+  if (metadata.nlink !== 1) {
+    throw importError("integrity_failed", `${label} must not be hard-linked.`, true);
+  }
+  assertCurrentOwner(metadata, label);
+}
+
+function sameFile(left: Stats, right: Stats): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs;
+}
+
+async function materializeTrustedBundle(
+  incomingPath: string,
+  trustedPath: string,
+  maxBytes: number,
+  expectedBytes?: number,
+): Promise<TrustedBundle> {
+  let source: FileHandle | undefined;
+  let destination: FileHandle | undefined;
+  let trustedPathCreated = false;
+  try {
+    try {
+      source = await open(incomingPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ELOOP") {
+        throw importError(
+          "integrity_failed",
+          "Retrieved cloud result must not be a symbolic link.",
+          true,
+        );
+      }
+      throw error;
+    }
+    const initialSource = await source.stat();
+    assertSingleLinkRegularFile(initialSource, "Retrieved cloud result");
+    await source.chmod(0o600);
+    const sourceBefore = await source.stat();
+    assertSingleLinkRegularFile(sourceBefore, "Retrieved cloud result");
+    if (sourceBefore.size > maxBytes) {
+      throw importError(
+        "integrity_failed",
+        "Cloud result bundle exceeds the allowed size.",
+        true,
+      );
+    }
+    if (expectedBytes !== undefined && sourceBefore.size !== expectedBytes) {
+      throw importError(
+        "integrity_failed",
+        "Cloud result bundle size does not match metadata.",
+        true,
+      );
+    }
+    try {
+      destination = await open(
+        trustedPath,
+        constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        0o600,
+      );
+      trustedPathCreated = true;
+    } catch (error) {
+      throw importError(
+        "integrity_failed",
+        "Could not create a private trusted result bundle.",
+        true,
+      );
+    }
+
+    const digest = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let position = 0;
+    while (true) {
+      const { bytesRead } = await source.read(buffer, 0, buffer.length, position);
+      if (bytesRead === 0) break;
+      if (position + bytesRead > maxBytes) {
+        throw importError(
+          "integrity_failed",
+          "Cloud result bundle exceeds the allowed size.",
+          true,
+        );
+      }
+      digest.update(buffer.subarray(0, bytesRead));
+      let written = 0;
+      while (written < bytesRead) {
+        const result = await destination.write(
+          buffer,
+          written,
+          bytesRead - written,
+          position + written,
+        );
+        if (result.bytesWritten === 0) {
+          throw importError(
+            "integrity_failed",
+            "Trusted result copy made no forward progress.",
+            true,
+          );
+        }
+        written += result.bytesWritten;
+      }
+      position += bytesRead;
+    }
+    await destination.sync();
+    await destination.chmod(0o400);
+
+    const [sourceAfter, trustedBeforeUnlink] = await Promise.all([
+      source.stat(),
+      destination.stat(),
+    ]);
+    assertSingleLinkRegularFile(sourceAfter, "Retrieved cloud result");
+    assertSingleLinkRegularFile(trustedBeforeUnlink, "Trusted cloud result");
+    if (!sameFile(sourceBefore, sourceAfter) || position !== sourceBefore.size) {
+      throw importError(
+        "integrity_failed",
+        "Retrieved cloud result changed while being copied.",
+        true,
+      );
+    }
+    if (trustedBeforeUnlink.size !== position) {
+      throw importError(
+        "integrity_failed",
+        "Trusted cloud result copy is incomplete.",
+        true,
+      );
+    }
+
+    await unlink(trustedPath);
+    trustedPathCreated = false;
+    const trustedAfterUnlink = await destination.stat();
+    if (
+      trustedAfterUnlink.dev !== trustedBeforeUnlink.dev
+      || trustedAfterUnlink.ino !== trustedBeforeUnlink.ino
+      || trustedAfterUnlink.size !== trustedBeforeUnlink.size
+      || trustedAfterUnlink.nlink !== 0
+    ) {
+      throw importError(
+        "integrity_failed",
+        "Trusted cloud result descriptor continuity was lost.",
+        true,
+      );
+    }
+    await source.close();
+    source = undefined;
+    const trusted = {
+      handle: destination,
+      directory: path.dirname(trustedPath),
+      dev: trustedAfterUnlink.dev,
+      ino: trustedAfterUnlink.ino,
+      size: trustedAfterUnlink.size,
+      sha256: digest.digest("hex"),
+    };
+    destination = undefined;
+    return trusted;
+  } finally {
+    await Promise.all([
+      source?.close().catch(() => undefined),
+      destination?.close().catch(() => undefined),
+    ]);
+    if (trustedPathCreated) await unlink(trustedPath).catch(() => undefined);
+  }
+}
+
+async function assertTrustedBundleContinuity(bundle: TrustedBundle): Promise<void> {
+  const metadata = await bundle.handle.stat();
+  if (
+    !metadata.isFile()
+    || metadata.dev !== bundle.dev
+    || metadata.ino !== bundle.ino
+    || metadata.size !== bundle.size
+    || metadata.nlink !== 0
+    || (metadata.mode & 0o777) !== 0o400
+  ) {
+    throw importError(
+      "integrity_failed",
+      "Trusted cloud result descriptor continuity was lost.",
+      true,
+    );
+  }
+  assertCurrentOwner(metadata, "Trusted cloud result");
+}
+
+async function createSingleUseBundleDescriptor(bundle: TrustedBundle): Promise<FileHandle> {
+  await assertTrustedBundleContinuity(bundle);
+  const transientPath = path.join(bundle.directory, `git-bundle-${randomUUID()}`);
+  let transient: FileHandle | undefined;
+  let transientPathCreated = false;
+  try {
+    transient = await open(
+      transientPath,
+      constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    transientPathCreated = true;
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let position = 0;
+    while (position < bundle.size) {
+      const requested = Math.min(buffer.length, bundle.size - position);
+      const { bytesRead } = await bundle.handle.read(buffer, 0, requested, position);
+      if (bytesRead === 0) {
+        throw importError(
+          "integrity_failed",
+          "Trusted cloud result descriptor ended unexpectedly.",
+          true,
+        );
+      }
+      let written = 0;
+      while (written < bytesRead) {
+        const result = await transient.write(
+          buffer,
+          written,
+          bytesRead - written,
+          position + written,
+        );
+        if (result.bytesWritten === 0) {
+          throw importError(
+            "integrity_failed",
+            "Single-use Git bundle copy made no forward progress.",
+            true,
+          );
+        }
+        written += result.bytesWritten;
+      }
+      position += bytesRead;
+    }
+    await transient.sync();
+    await transient.chmod(0o400);
+    const metadata = await transient.stat();
+    assertSingleLinkRegularFile(metadata, "Single-use Git bundle");
+    if (metadata.size !== bundle.size) {
+      throw importError(
+        "integrity_failed",
+        "Single-use Git bundle copy is incomplete.",
+        true,
+      );
+    }
+    await unlink(transientPath);
+    transientPathCreated = false;
+    const unlinked = await transient.stat();
+    if (unlinked.dev !== metadata.dev || unlinked.ino !== metadata.ino || unlinked.nlink !== 0) {
+      throw importError(
+        "integrity_failed",
+        "Single-use Git bundle descriptor continuity was lost.",
+        true,
+      );
+    }
+    await assertTrustedBundleContinuity(bundle);
+    const result = transient;
+    transient = undefined;
+    return result;
+  } finally {
+    await transient?.close().catch(() => undefined);
+    if (transientPathCreated) await unlink(transientPath).catch(() => undefined);
+  }
+}
 
 /**
  * Retrieves and imports a completed Modal bundle without mutating state. The
@@ -343,8 +688,9 @@ export class CloudResultImporter {
     const worktree = await this.#verifyWorktree(task);
     let directory: string | undefined;
     let sandbox: CloudResultSandbox | undefined;
+    let trustedBundle: TrustedBundle | undefined;
     let importSucceeded = false;
-    let stage: "attach" | "temporary_path" | "copy" | "verify" | "import" = "attach";
+    let stage: "attach" | "temporary_path" | "copy" | "verify" | "import" | "ownership" = "attach";
 
     try {
       sandbox = await this.#modal.fromId(expected.sandboxId);
@@ -363,36 +709,21 @@ export class CloudResultImporter {
         `dex-cloud-result-${safeTaskSegment(expected.taskId)}-`,
       ));
       await chmod(directory, 0o700);
-      const localBundlePath = path.join(directory, "result.bundle");
+      const incomingBundlePath = path.join(directory, "incoming.bundle");
+      const trustedBundlePath = path.join(directory, "trusted.bundle");
 
       stage = "copy";
-      await sandbox.copyToLocal(expected.remoteBundlePath, localBundlePath);
-      const bundleStat = await lstat(localBundlePath);
-      if (!bundleStat.isFile() || bundleStat.isSymbolicLink()) {
-        throw importError(
-          "integrity_failed",
-          "Retrieved cloud result is not a regular file.",
-          true,
-        );
-      }
-      await chmod(localBundlePath, 0o600);
-      if (bundleStat.size > this.#maxBundleBytes) {
-        throw importError(
-          "integrity_failed",
-          "Cloud result bundle exceeds the allowed size.",
-          true,
-        );
-      }
-      if (expected.bundleBytes !== undefined && bundleStat.size !== expected.bundleBytes) {
-        throw importError(
-          "integrity_failed",
-          "Cloud result bundle size does not match metadata.",
-          true,
-        );
-      }
+      await sandbox.copyToLocal(expected.remoteBundlePath, incomingBundlePath);
 
       stage = "verify";
-      const bundleSha256 = await sha256File(localBundlePath);
+      trustedBundle = await materializeTrustedBundle(
+        incomingBundlePath,
+        trustedBundlePath,
+        this.#maxBundleBytes,
+        expected.bundleBytes,
+      );
+      const bundleBytes = trustedBundle.size;
+      const bundleSha256 = trustedBundle.sha256;
       if (expected.bundleSha256 !== undefined && bundleSha256 !== expected.bundleSha256) {
         throw importError(
           "integrity_failed",
@@ -400,16 +731,23 @@ export class CloudResultImporter {
           true,
         );
       }
-      await this.#requireGit(
+      await this.#requireBundleGit(
+        trustedBundle,
         worktree.worktreePath,
-        ["bundle", "verify", localBundlePath],
+        ["bundle", "verify", BUNDLE_DESCRIPTOR_PATH],
         "integrity_failed",
         "Git rejected the cloud result bundle.",
         true,
       );
-      const listed = await this.#requireGit(
+      const listed = await this.#requireBundleGit(
+        trustedBundle,
         worktree.worktreePath,
-        ["bundle", "list-heads", localBundlePath, `refs/heads/${expected.branch}`],
+        [
+          "bundle",
+          "list-heads",
+          BUNDLE_DESCRIPTOR_PATH,
+          `refs/heads/${expected.branch}`,
+        ],
         "integrity_failed",
         "Git could not inspect the cloud result bundle.",
         true,
@@ -426,13 +764,16 @@ export class CloudResultImporter {
       }
 
       stage = "import";
-      await this.#requireGit(
+      await this.#requireBundleGit(
+        trustedBundle,
         worktree.worktreePath,
-        ["bundle", "unbundle", localBundlePath],
+        ["bundle", "unbundle", BUNDLE_DESCRIPTOR_PATH],
         "git_import_failed",
         "Git could not import the cloud result bundle.",
         true,
       );
+      await trustedBundle.handle.close();
+      trustedBundle = undefined;
       await this.#requireGit(
         worktree.worktreePath,
         ["cat-file", "-e", `${expected.commit}^{commit}`],
@@ -447,6 +788,9 @@ export class CloudResultImporter {
         "Cloud result does not fast-forward the Dex task branch.",
         true,
       );
+      stage = "ownership";
+      await input.beforeApply?.();
+      stage = "import";
       await this.#requireGit(
         worktree.worktreePath,
         ["merge", "--ff-only", "--no-edit", expected.commit],
@@ -456,14 +800,12 @@ export class CloudResultImporter {
       );
       await this.#verifyImportedState(worktree, expected);
       importSucceeded = true;
-
-      let sandboxTerminated = false;
-      try {
-        await sandbox.terminate({ wait: true });
-        sandboxTerminated = true;
-      } catch {
-        await Promise.resolve(sandbox.detach()).catch(() => undefined);
-      }
+      // Termination is a separate durable runtime effect. Returning only
+      // after terminate(wait=true) created a crash window where the branch was
+      // already applied and the sandbox was gone, but no replay journal had
+      // yet been committed. Detach here and let the caller journal cleanup
+      // before ending the sandbox.
+      await Promise.resolve(sandbox.detach()).catch(() => undefined);
 
       return {
         taskId: expected.taskId,
@@ -471,14 +813,17 @@ export class CloudResultImporter {
         branch: expected.branch,
         commit: expected.commit,
         bundleSha256,
-        bundleBytes: bundleStat.size,
-        sandboxTerminated,
+        bundleBytes,
+        sandboxTerminated: false,
       };
     } catch (error) {
       if (sandbox && !importSucceeded) {
         await Promise.resolve(sandbox.detach()).catch(() => undefined);
       }
       if (error instanceof CloudResultImportError) throw error;
+      // Ownership failures belong to the durable caller. Preserve their type
+      // so a stale result cannot be misclassified as a retryable Git failure.
+      if (stage === "ownership") throw error;
       if (stage === "attach") {
         throw importError(
           "sandbox_unavailable",
@@ -506,18 +851,69 @@ export class CloudResultImporter {
         true,
       );
     } finally {
+      await trustedBundle?.handle.close().catch(() => undefined);
       if (directory) {
         await rm(directory, { recursive: true, force: true }).catch(() => undefined);
       }
     }
   }
 
+  /**
+   * Ends a retained result sandbox when a non-retryable import validation
+   * failure means its branch can never be applied. A false result deliberately
+   * keeps the durable auth lease owned so startup recovery can retry cleanup.
+   */
+  async terminateRetainedSandbox(sandboxId: string): Promise<boolean> {
+    let sandbox: CloudResultSandbox | undefined;
+    try {
+      sandbox = await this.#modal.fromId(sandboxId);
+    } catch (error) {
+      // Only Modal's typed not-found result from the exact sandbox lookup is
+      // evidence that this durable sandbox ID no longer exists. Filesystem
+      // ENOENT and generic dependency errors are not terminal evidence.
+      if (modalSandboxNotFound(error)) return true;
+      return false;
+    }
+    if (sandbox.sandboxId !== sandboxId) return false;
+    try {
+      await sandbox.terminate({ wait: true });
+      return true;
+    } catch {
+      // A terminate failure can refer to a mounted volume, transport, or other
+      // dependency. Never reinterpret it as sandbox absence. Poll the exact
+      // sandbox instead and accept only a terminal exit or Modal's typed
+      // not-found response from that sandbox-specific operation.
+      if (sandbox.poll) {
+        try {
+          if (await sandbox.poll() !== null) return true;
+        } catch (pollError) {
+          if (modalSandboxNotFound(pollError)) return true;
+        }
+      }
+      await Promise.resolve(sandbox.detach()).catch(() => undefined);
+      return false;
+    }
+  }
+
   async #git(cwd: string, args: readonly string[]): Promise<CloudResultCommandResult> {
+    return this.#gitWithDescriptor(cwd, args);
+  }
+
+  async #gitWithDescriptor(
+    cwd: string,
+    args: readonly string[],
+    bundleFd?: number,
+    readLocalConfiguration = false,
+  ): Promise<CloudResultCommandResult> {
     try {
       return await this.#runner(
         "git",
         [...GIT_CONFIG_ARGS, ...args],
-        { cwd },
+        {
+          cwd,
+          env: safeGitEnvironment(readLocalConfiguration),
+          ...(bundleFd === undefined ? {} : { bundleFd }),
+        },
       );
     } catch {
       throw importError(
@@ -525,6 +921,40 @@ export class CloudResultImporter {
         "Git could not inspect or update the Dex task worktree.",
         true,
       );
+    }
+  }
+
+  async #requireBundleGit(
+    bundle: TrustedBundle,
+    cwd: string,
+    args: readonly string[],
+    code: CloudResultImportErrorCode,
+    message: string,
+    recoverable: boolean,
+  ): Promise<CloudResultCommandResult> {
+    await assertTrustedBundleContinuity(bundle);
+    const duplicate = await createSingleUseBundleDescriptor(bundle);
+    try {
+      const duplicateMetadata = await duplicate.stat();
+      if (
+        !duplicateMetadata.isFile()
+        || duplicateMetadata.size !== bundle.size
+        || duplicateMetadata.nlink !== 0
+        || (duplicateMetadata.mode & 0o777) !== 0o400
+      ) {
+        throw importError(
+          "integrity_failed",
+          "Trusted cloud result descriptor continuity was lost.",
+          true,
+        );
+      }
+      assertCurrentOwner(duplicateMetadata, "Single-use Git bundle");
+      const result = await this.#gitWithDescriptor(cwd, args, duplicate.fd);
+      if (result.exitCode !== 0) throw importError(code, message, recoverable);
+      await assertTrustedBundleContinuity(bundle);
+      return result;
+    } finally {
+      await duplicate.close();
     }
   }
 
@@ -538,6 +968,36 @@ export class CloudResultImporter {
     const result = await this.#git(cwd, args);
     if (result.exitCode !== 0) throw importError(code, message, recoverable);
     return result;
+  }
+
+  async #assertSafeGitConfiguration(cwd: string): Promise<void> {
+    const result = await this.#gitWithDescriptor(cwd, [
+      "config",
+      "--local",
+      "--no-includes",
+      "--name-only",
+      "--null",
+      "--list",
+    ], undefined, true);
+    if (result.exitCode !== 0) {
+      throw importError(
+        "repository_mismatch",
+        "Dex task Git configuration could not be inspected safely.",
+        true,
+      );
+    }
+    const unsafe = result.stdout
+      .split("\0")
+      .map((value) => value.trim())
+      .filter(Boolean)
+      .find((name) => UNSAFE_LOCAL_GIT_CONFIG.test(name));
+    if (unsafe) {
+      throw importError(
+        "repository_mismatch",
+        "Dex task Git configuration contains an unsafe external helper.",
+        false,
+      );
+    }
   }
 
   async #verifyWorktree(task: ImportTask): Promise<VerifiedWorktree> {
@@ -570,6 +1030,11 @@ export class CloudResultImporter {
         false,
       );
     }
+
+    await Promise.all([
+      this.#assertSafeGitConfiguration(repositoryPath),
+      this.#assertSafeGitConfiguration(worktreePath),
+    ]);
 
     const [repositoryRoot, worktreeRoot, repositoryCommon, worktreeCommon] =
       await Promise.all([
@@ -743,6 +1208,10 @@ export class CloudResultImporter {
       );
     }
   }
+}
+
+function modalSandboxNotFound(error: unknown): boolean {
+  return error instanceof ModalNotFoundError;
 }
 
 export function createCloudResultImporter(

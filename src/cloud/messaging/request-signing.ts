@@ -65,6 +65,20 @@ export class DexRequestSequencer {
     this.#lastSequence = Math.max(this.#lastSequence, nextSequence - 1);
   }
 
+  /**
+   * Resynchronize to the exact sequence expected by the paired control plane.
+   *
+   * A process-local counter can be ahead after a request was signed but never
+   * committed by the cloud (for example, a timeout or a rolled-back durable
+   * transaction). A floor-only update can never recover from that state. This
+   * method is intentionally used only for an explicit stale_sequence response
+   * from the configured HTTPS control-plane endpoint.
+   */
+  resynchronizeNextSequence(nextSequence: number): void {
+    if (!Number.isSafeInteger(nextSequence) || nextSequence < 1) return;
+    this.#lastSequence = nextSequence - 1;
+  }
+
   get lastSequence(): number {
     return this.#lastSequence;
   }

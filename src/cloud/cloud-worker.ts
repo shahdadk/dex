@@ -1,6 +1,19 @@
 import { spawn } from "node:child_process";
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { access, chmod, open, readFile, rename, stat } from "node:fs/promises";
+import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { constants, type Stats } from "node:fs";
+import {
+  access,
+  chmod,
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  unlink,
+} from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
@@ -11,7 +24,7 @@ interface HandoffDocument {
   goal: string;
   constraints: string[];
   acceptanceCriteria: string[];
-  repository: { workingBranch: string };
+  repository: { workingBranch: string; headCommit: string };
   memories: Array<{ id: string | number; title: string; facts?: string[]; narrative?: string }>;
   learnedFacts: string[];
   failedApproaches: Array<{ approach: string; reason: string; sourceMemoryId?: string | number }>;
@@ -26,42 +39,110 @@ interface CommandResult {
 
 const root = process.env.DEX_CLOUD_ROOT ?? "/dex";
 const project = process.env.DEX_CLOUD_PROJECT ?? "/workspace/project";
+const CODEX_WORKER_PROFILE = "modal-worker";
+const CODEX_BOOTSTRAP_PROFILE = "modal-bootstrap";
+const SECRET_ENVIRONMENT_NAME = /(?:^|_)(?:TOKEN|KEY|SECRET|PASSWORD|AUTH|COOKIE)(?:_|$)/i;
+const SECRET_ENVIRONMENT_GREP = "(^|_)(TOKEN|KEY|SECRET|PASSWORD|AUTH|COOKIE)(_|$)";
+const MAX_BOOTSTRAP_MANIFEST_BYTES = 16 * 1024 * 1024;
+const MAX_CODEX_AUTH_BYTES = 16 * 1024 * 1024;
+
+interface AuthCacheIdentity {
+  dev: number;
+  ino: number;
+}
+
+interface CodexRuntime {
+  persistentHome: string;
+  persistentAuthIdentity: AuthCacheIdentity;
+  workerHome: string;
+  sandboxHome: string;
+}
+
+interface AuthVolumePersistedEvidence {
+  version: 1;
+  method: "modal-volume-v2-sync";
+  mountPath: "/codex-home";
+  taskId: string;
+  handoffSha256: string;
+  authSha256: string;
+  persistedAt: string;
+}
+
+interface TerminalResultDraft {
+  taskId: string;
+  handoffSha256: string;
+  status: "succeeded" | "failed" | "cancelled";
+  summary: string;
+  validation: { commands: string[]; passed: boolean };
+  git: {
+    branch: string;
+    commit: string;
+    bundlePath?: string;
+    bundleSha256?: string;
+  };
+}
+
+let activeCodexRuntime: CodexRuntime | undefined;
 
 export async function runCloudWorker(): Promise<void> {
   let handoff: HandoffDocument | undefined;
+  let failure: unknown;
+  let terminalResult: TerminalResultDraft | undefined;
+  let authPersistenceRequired = false;
+  let authVolumePersisted: AuthVolumePersistedEvidence | undefined;
   try {
     handoff = JSON.parse(await readFile(path.join(root, "handoff.json"), "utf8")) as HandoffDocument;
     requireHandoff(handoff);
     await verifyHandoffIntegrity(handoff);
-    await run("git", ["clone", path.join(root, "repo.bundle"), project]);
-    await run("git", ["-C", project, "checkout", handoff.repository.workingBranch]);
-    await run("git", ["-C", project, "config", "user.name", "Dex Cloud"]);
-    await run("git", ["-C", project, "config", "user.email", "dex@localhost"]);
-    if (await exists(path.join(project, "package-lock.json"))) {
-      await run("npm", ["ci", "--ignore-scripts", "--no-audit", "--no-fund"], project);
+    // The HMAC is needed only to authenticate the immutable handoff. Remove it
+    // from the long-lived worker before any tool, package manager, or coding
+    // agent process can inherit or inspect the parent environment.
+    delete process.env.DEX_HANDOFF_SIGNING_KEY;
+    await mkdir(workspaceRoot(), { recursive: true, mode: 0o700 });
+    activeCodexRuntime = await createCodexRuntime();
+    authPersistenceRequired = true;
+    await run(
+      "codex",
+      ["login", "status"],
+      workspaceRoot(),
+      true,
+      codexEnvironment(activeCodexRuntime.workerHome),
+    );
+    await assertAuthOnlyCodexHome(activeCodexRuntime.workerHome);
+
+    await runSafeHostGit(["clone", path.join(root, "repo.bundle"), project], workspaceRoot());
+    await runSafeHostGit(["-C", project, "checkout", handoff.repository.workingBranch]);
+    const checkedOutHead = (
+      await runSafeHostGit(["-C", project, "rev-parse", "--verify", "HEAD^{commit}"])
+    ).stdout.trim();
+    if (!safeEqual(checkedOutHead, handoff.repository.headCommit)) {
+      throw new Error("Checked-out Git HEAD does not match the signed handoff commit");
     }
-    await verifyCodexAuthentication();
-    await run("codex", ["login", "status"], project);
+    await rejectProjectCodexConfig();
+    await verifyCodexPermissionBoundary(CODEX_WORKER_PROFILE, project);
+    await bootstrapDependencies();
+    await rejectProjectCodexConfig();
 
     const worker = spawn("codex", [
-      "-C",
-      project,
-      // Modal is the outer security boundary. Starting Codex's Linux
-      // bubblewrap sandbox inside that container fails on network namespace
-      // setup, so use the CLI mode explicitly intended for an already
-      // externally sandboxed automation runner.
-      "--dangerously-bypass-approvals-and-sandbox",
+      "--ask-for-approval",
+      "never",
       "exec",
+      "--cd",
+      project,
+      "--ignore-user-config",
+      "--ignore-rules",
+      "--ephemeral",
+      "--sandbox",
+      "workspace-write",
       "--json",
       "--color",
       "never",
-      "--ignore-user-config",
       "-",
     ], {
       cwd: project,
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
-      env: codexEnvironment(),
+      env: codexEnvironment(activeCodexRuntime.workerHome),
     });
     worker.stdin.end(buildCloudPrompt(handoff), "utf8");
     let stderr = "";
@@ -83,22 +164,38 @@ export async function runCloudWorker(): Promise<void> {
       if (!Array.isArray(command) || command.length === 0 || command.some((part) => typeof part !== "string")) {
         throw new Error("Cloud validation commands must be non-empty argv arrays");
       }
-      validations.push({ argv: command, result: await run(command[0]!, command.slice(1), project, false) });
+      validations.push({
+        argv: command,
+        result: await runCredentialDenied(command[0]!, command.slice(1), project, false),
+      });
     }
     const validationPassed = validations.every(({ result }) => result.exitCode === 0);
     const succeeded = exitCode === 0 && turnCompleted && validationPassed;
     if (succeeded) {
-      const status = await run("git", ["-C", project, "status", "--porcelain=v1"], undefined, false);
+      const status = await runCredentialDeniedGit(["status", "--porcelain=v1"], false);
       if (status.stdout.trim()) {
-        await run("git", ["-C", project, "add", "--all"]);
-        await run("git", ["-C", project, "commit", "-m", "dex: complete cloud continuation"]);
+        await runCredentialDeniedGit(["add", "--all"]);
+        await runCredentialDeniedGit(["commit", "-m", "dex: complete cloud continuation"]);
       }
     }
-    const commit = (await run("git", ["-C", project, "rev-parse", "HEAD"])).stdout.trim();
+    const commit = (await runCredentialDeniedGit(["rev-parse", "HEAD"])).stdout.trim();
     const resultBundlePath = path.join(root, "result.bundle");
-    await run("git", ["-C", project, "bundle", "create", resultBundlePath, handoff.repository.workingBranch]);
-    const resultBundleSha256 = sha256(await readFile(resultBundlePath));
-    await writeJsonAtomic(path.join(root, "result.json"), {
+    // The permission profile intentionally cannot write /dex. Git creates an
+    // untrusted staging artifact in its workspace. The trusted parent opens
+    // that artifact without following links, validates the descriptor, and
+    // copies its bytes into a newly-created /dex file.
+    const stagedResultBundlePath = path.join(project, ".dex-result.bundle");
+    await runCredentialDeniedGit([
+      "bundle",
+      "create",
+      stagedResultBundlePath,
+      handoff.repository.workingBranch,
+    ]);
+    const resultBundleSha256 = await publishTrustedResultBundle(
+      stagedResultBundlePath,
+      resultBundlePath,
+    );
+    terminalResult = {
       taskId: handoff.taskId,
       handoffSha256: handoff.contentHash,
       status: succeeded ? "succeeded" : "failed",
@@ -115,20 +212,52 @@ export async function runCloudWorker(): Promise<void> {
         bundlePath: "/dex/result.bundle",
         bundleSha256: resultBundleSha256,
       },
-    });
+    };
     if (!succeeded) process.exitCode = 1;
   } catch (error) {
-    if (handoff) {
+    failure = error;
+  } finally {
+    const runtime = activeCodexRuntime;
+    if (runtime) {
+      try {
+        if (!handoff) throw new Error("Cannot bind auth persistence to a missing handoff");
+        authVolumePersisted = await persistRefreshedCodexAuth(runtime, handoff);
+      } catch (error) {
+        failure ??= error;
+      } finally {
+        activeCodexRuntime = undefined;
+        await Promise.all([
+          rm(runtime.workerHome, { recursive: true, force: true }),
+          rm(runtime.sandboxHome, { recursive: true, force: true }),
+        ]);
+      }
+    }
+  }
+  if (terminalResult && authVolumePersisted) {
+    await writeJsonAtomic(path.join(root, "result.json"), {
+      ...terminalResult,
+      authVolumePersisted,
+    });
+  }
+  if (failure) {
+    // Once a Codex runtime may have refreshed auth, result.json is itself a
+    // terminal publication boundary. If explicit Modal v2 sync failed, leave
+    // it absent so the monitor can rely only on sandbox termination evidence.
+    if (handoff && (!authPersistenceRequired || authVolumePersisted)) {
       await writeJsonAtomic(path.join(root, "result.json"), {
         taskId: handoff.taskId,
         handoffSha256: handoff.contentHash,
         status: "failed",
-        summary: bounded(redactText(error instanceof Error ? error.message : String(error)), 500),
+        summary: bounded(redactText(failure instanceof Error ? failure.message : String(failure)), 500),
         validation: { commands: [], passed: false },
         git: { branch: handoff.repository.workingBranch, commit: "unavailable" },
+        ...(authVolumePersisted ? { authVolumePersisted } : {}),
       }).catch(() => undefined);
     }
-    throw error;
+    throw failure;
+  }
+  if (!terminalResult || !authVolumePersisted) {
+    throw new Error("Cloud worker did not publish terminal auth persistence evidence");
   }
 }
 
@@ -179,16 +308,22 @@ async function consumeCodexOutput(
 function buildCloudPrompt(handoff: HandoffDocument): string {
   const memory = handoff.memories.map((item) => `- [${item.id}] ${item.title}: ${(item.facts ?? []).join("; ") || item.narrative || ""}`).join("\n");
   const failures = handoff.failedApproaches.map((item) => `- DO NOT REPEAT: ${item.approach}. WHY: ${item.reason}`).join("\n");
-  return `You are a fresh Codex coding worker continuing a durable Dex task.\n\nTASK:\n${handoff.goal}\n\nCONSTRAINTS:\n${handoff.constraints.map((value) => `- ${value}`).join("\n")}\n\nACCEPTANCE CRITERIA:\n${handoff.acceptanceCriteria.map((value) => `- ${value}`).join("\n")}\n\nINHERITED MEMORY:\n${memory}\n\nFAILED APPROACHES:\n${failures}\n\nComplete the implementation, run appropriate validation, and do not push, deploy, merge, or repeat a failed approach without new evidence.`;
+  return `You are a fresh Codex coding worker continuing a durable Dex task.\n\nREPOSITORY:\n${project}\n\nTASK:\n${handoff.goal}\n\nCONSTRAINTS:\n${handoff.constraints.map((value) => `- ${value}`).join("\n")}\n\nACCEPTANCE CRITERIA:\n${handoff.acceptanceCriteria.map((value) => `- ${value}`).join("\n")}\n\nINHERITED MEMORY:\n${memory}\n\nFAILED APPROACHES:\n${failures}\n\nComplete the implementation in the repository above, run appropriate validation, and do not push, deploy, merge, or repeat a failed approach without new evidence.`;
 }
 
-async function run(command: string, args: string[], cwd?: string, reject = true): Promise<CommandResult> {
+async function run(
+  command: string,
+  args: string[],
+  cwd?: string,
+  reject = true,
+  environment: NodeJS.ProcessEnv = nonSecretEnvironment(),
+): Promise<CommandResult> {
   return new Promise((resolve, rejectPromise) => {
     const child = spawn(command, args, {
       cwd,
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
-      env: nonSecretEnvironment(),
+      env: environment,
     });
     let stdout = "";
     let stderr = "";
@@ -209,6 +344,120 @@ async function run(command: string, args: string[], cwd?: string, reject = true)
   });
 }
 
+function credentialDeniedSandboxArgs(
+  profile: string,
+  command: string,
+  args: readonly string[],
+  cwd: string,
+): string[] {
+  return [
+    "sandbox",
+    "--profile",
+    profile,
+    "--permission-profile",
+    profile,
+    "--cd",
+    cwd,
+    "--",
+    command,
+    ...args,
+  ];
+}
+
+/**
+ * Runs commands whose executable or inputs may be controlled by the checked
+ * out repository. The Codex sandbox launcher gets a profile-only home with no
+ * account auth, while the child is denied credential homes, parent /proc
+ * environments, secret-like environment names, and network access.
+ */
+async function runCredentialDenied(
+  command: string,
+  args: readonly string[],
+  cwd: string,
+  reject = true,
+): Promise<CommandResult> {
+  return runCredentialDeniedWithProfile(CODEX_WORKER_PROFILE, command, args, cwd, reject);
+}
+
+async function runCredentialDeniedWithProfile(
+  profile: string,
+  command: string,
+  args: readonly string[],
+  cwd: string,
+  reject = true,
+): Promise<CommandResult> {
+  const runtime = requireActiveCodexRuntime();
+  return run(
+    "codex",
+    credentialDeniedSandboxArgs(profile, command, args, cwd),
+    cwd,
+    reject,
+    codexEnvironment(runtime.sandboxHome),
+  );
+}
+
+const SAFE_GIT_CONFIGURATION = [
+  "-c", "core.hooksPath=/dev/null",
+  "-c", "core.fsmonitor=false",
+  "-c", "core.pager=cat",
+  "-c", "commit.gpgsign=false",
+  "-c", "tag.gpgsign=false",
+  "-c", "credential.helper=",
+  "-c", "core.sshCommand=/usr/bin/false",
+  "-c", "user.name=Dex Cloud",
+  "-c", "user.email=dex@localhost",
+] as const;
+
+function safeGitEnvironment(): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin",
+    LANG: process.env.LANG ?? "C",
+    LC_ALL: "C",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_ATTR_NOSYSTEM: "1",
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_ASKPASS: "/usr/bin/false",
+    SSH_ASKPASS: "/usr/bin/false",
+    GIT_SSH_COMMAND: "/usr/bin/false",
+    GIT_PAGER: "cat",
+    PAGER: "cat",
+    GIT_EDITOR: "/usr/bin/true",
+    GIT_SEQUENCE_EDITOR: "/usr/bin/true",
+    GIT_NO_REPLACE_OBJECTS: "1",
+    GIT_CONFIG: "/dev/null",
+  };
+  if (process.env.TMPDIR) environment.TMPDIR = process.env.TMPDIR;
+  return environment;
+}
+
+async function runSafeHostGit(
+  args: readonly string[],
+  cwd = project,
+  reject = true,
+): Promise<CommandResult> {
+  return run(
+    "/usr/bin/git",
+    [...SAFE_GIT_CONFIGURATION, ...args],
+    cwd,
+    reject,
+    safeGitEnvironment(),
+  );
+}
+
+async function runCredentialDeniedGit(
+  args: readonly string[],
+  reject = true,
+): Promise<CommandResult> {
+  return runCredentialDenied(
+    "git",
+    [...SAFE_GIT_CONFIGURATION, "-C", project, ...args],
+    project,
+    reject,
+  );
+}
+
 async function writeJsonAtomic(file: string, value: unknown): Promise<void> {
   const temporary = `${file}.${process.pid}.tmp`;
   const handle = await open(temporary, "w", 0o600);
@@ -219,7 +468,13 @@ async function writeJsonAtomic(file: string, value: unknown): Promise<void> {
 }
 
 function requireHandoff(value: HandoffDocument): void {
-  if (!value?.taskId || !value.goal || !value.contentHash || !value.repository?.workingBranch) {
+  if (
+    !value?.taskId
+    || !value.goal
+    || !value.contentHash
+    || !value.repository?.workingBranch
+    || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(value.repository.headCommit)
+  ) {
     throw new Error("Invalid Dex handoff document");
   }
   if (!Array.isArray(value.memories) || value.memories.length < 5) {
@@ -296,14 +551,15 @@ async function exists(file: string): Promise<boolean> {
 
 function nonSecretEnvironment(): NodeJS.ProcessEnv {
   return Object.fromEntries(Object.entries(process.env).filter(([name]) =>
-    !/(?:^|_)(?:TOKEN|KEY|SECRET|PASSWORD|AUTH|COOKIE)(?:_|$)/i.test(name),
+    !SECRET_ENVIRONMENT_NAME.test(name),
   ));
 }
 
-/** The Codex subprocess receives CODEX_HOME, but no environment credentials. */
-function codexEnvironment(): NodeJS.ProcessEnv {
+/** A Codex subprocess receives only its assigned CODEX_HOME and no environment credentials. */
+function codexEnvironment(home: string): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {
     ...nonSecretEnvironment(),
+    CODEX_HOME: home,
     NO_COLOR: "1",
   };
   delete environment.CODEX_API_KEY;
@@ -311,25 +567,609 @@ function codexEnvironment(): NodeJS.ProcessEnv {
   return environment;
 }
 
-async function verifyCodexAuthentication(): Promise<void> {
-  const codexHome = process.env.CODEX_HOME;
-  if (!codexHome) {
-    throw new Error("Codex requires a persistent CODEX_HOME account login");
+async function verifyCodexAuthentication(home: string): Promise<AuthCacheIdentity> {
+  const resolvedHome = path.resolve(home);
+  if (!path.isAbsolute(home)) {
+    throw new Error("The configured CODEX_HOME must be an absolute directory");
   }
-  const authPath = path.join(codexHome, "auth.json");
-  const homeMetadata = await stat(codexHome);
-  if (!homeMetadata.isDirectory()) throw new Error("The configured CODEX_HOME is not a directory");
-  if (!(await exists(authPath))) {
-    throw new Error("Codex account authentication is missing from the configured CODEX_HOME");
+  const authPath = path.join(resolvedHome, "auth.json");
+  if (path.dirname(authPath) !== resolvedHome) {
+    throw new Error("Codex account authentication escaped the configured CODEX_HOME");
   }
-  const metadata = await stat(authPath);
+
+  const directoryHandle = await open(
+    resolvedHome,
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  );
+  try {
+    const homeMetadata = await directoryHandle.stat();
+    if (!homeMetadata.isDirectory()) throw new Error("The configured CODEX_HOME is not a directory");
+    assertCurrentOwner(homeMetadata.uid, "CODEX_HOME");
+    await directoryHandle.chmod(0o700);
+    if (((await directoryHandle.stat()).mode & 0o777) !== 0o700) {
+      throw new Error("Codex account authentication directory permissions could not be secured");
+    }
+  } finally {
+    await directoryHandle.close();
+  }
+
+  let authHandle;
+  try {
+    authHandle = await open(authPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ELOOP") {
+      throw new Error("Codex account authentication cache must not be a symbolic link");
+    }
+    if (code === "ENOENT") {
+      throw new Error("Codex account authentication is missing from the configured CODEX_HOME");
+    }
+    throw error;
+  }
+  try {
+    const metadata = await authHandle.stat();
+    if (!metadata.isFile()) throw new Error("Codex account authentication cache is not a regular file");
+    if (metadata.nlink !== 1) throw new Error("Codex account authentication cache must not be hard-linked");
+    assertCurrentOwner(metadata.uid, "Codex account authentication cache");
+    await authHandle.chmod(0o600);
+    const securedAuth = await authHandle.stat();
+    if (!securedAuth.isFile() || securedAuth.nlink !== 1 || (securedAuth.mode & 0o777) !== 0o600) {
+      throw new Error("Codex account authentication permissions could not be secured");
+    }
+    if (securedAuth.size > MAX_CODEX_AUTH_BYTES) {
+      throw new Error("Codex account authentication cache exceeds the allowed size");
+    }
+    return { dev: securedAuth.dev, ino: securedAuth.ino };
+  } finally {
+    await authHandle.close();
+  }
+}
+
+function assertCurrentOwner(actualUid: number, label: string): void {
+  if (typeof process.getuid === "function" && actualUid !== process.getuid()) {
+    throw new Error(`${label} must be owned by the cloud worker user`);
+  }
+}
+
+function workspaceRoot(): string {
+  return path.dirname(project);
+}
+
+function codexHome(): string {
+  const value = process.env.CODEX_HOME;
+  if (!value) throw new Error("Codex requires a persistent CODEX_HOME account login");
+  return value;
+}
+
+function requireActiveCodexRuntime(): CodexRuntime {
+  if (!activeCodexRuntime) throw new Error("Codex runtime isolation is unavailable");
+  return activeCodexRuntime;
+}
+
+async function assertAuthOnlyCodexHome(home: string): Promise<void> {
+  const entries = await readdir(home);
+  if (entries.length !== 1 || entries[0] !== "auth.json") {
+    throw new Error("Temporary Codex account home contains files other than auth.json");
+  }
+}
+
+async function createCodexRuntime(): Promise<CodexRuntime> {
+  const configuredHome = codexHome();
+  const persistentHome = path.resolve(configuredHome);
+  const persistentAuthIdentity = await verifyCodexAuthentication(persistentHome);
+  const workerHome = await mkdtemp(path.join(workspaceRoot(), ".dex-codex-auth-"));
+  const sandboxHome = await mkdtemp(path.join(workspaceRoot(), ".dex-codex-sandbox-"));
+  await Promise.all([chmod(workerHome, 0o700), chmod(sandboxHome, 0o700)]);
+  try {
+    await copyTrustedAuthCache(
+      path.join(persistentHome, "auth.json"),
+      path.join(workerHome, "auth.json"),
+    );
+    await verifyCodexAuthentication(workerHome);
+    const deniedCredentialRoots = [persistentHome, workerHome];
+    await installCodexPermissionProfile(
+      sandboxHome,
+      CODEX_WORKER_PROFILE,
+      deniedCredentialRoots,
+      false,
+    );
+    await installCodexPermissionProfile(
+      sandboxHome,
+      CODEX_BOOTSTRAP_PROFILE,
+      deniedCredentialRoots,
+      true,
+    );
+    return { persistentHome, persistentAuthIdentity, workerHome, sandboxHome };
+  } catch (error) {
+    await Promise.all([
+      rm(workerHome, { recursive: true, force: true }),
+      rm(sandboxHome, { recursive: true, force: true }),
+    ]);
+    throw error;
+  }
+}
+
+async function copyTrustedAuthCache(
+  sourcePath: string,
+  destinationPath: string,
+): Promise<AuthCacheIdentity> {
+  let source;
+  try {
+    source = await open(sourcePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ELOOP") {
+      throw new Error("Codex account authentication cache must not be a symbolic link");
+    }
+    throw error;
+  }
+  let destination;
+  let destinationCreated = false;
+  try {
+    const before = await source.stat();
+    assertTrustedAuthCache(before);
+    if (before.size > MAX_CODEX_AUTH_BYTES) {
+      throw new Error("Codex account authentication cache exceeds the allowed size");
+    }
+    const contents = await source.readFile();
+    const after = await source.stat();
+    assertTrustedAuthCache(after);
+    if (!sameFileVersion(before, after)) {
+      throw new Error("Codex account authentication cache changed while being copied");
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(contents.toString("utf8"));
+    } catch (error) {
+      throw new Error("Codex account authentication cache is not valid JSON", { cause: error });
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("Codex account authentication cache must contain a JSON object");
+    }
+    destination = await open(
+      destinationPath,
+      constants.O_WRONLY |
+        constants.O_CREAT |
+        constants.O_EXCL |
+        constants.O_NOFOLLOW,
+      0o600,
+    );
+    destinationCreated = true;
+    await destination.writeFile(contents);
+    await destination.sync();
+    const copied = await destination.stat();
+    assertTrustedAuthCache(copied);
+    if ((copied.mode & 0o777) !== 0o600 || copied.size !== contents.length) {
+      throw new Error("Copied Codex account authentication cache is not secure");
+    }
+    return { dev: copied.dev, ino: copied.ino };
+  } catch (error) {
+    if (destinationCreated) await unlink(destinationPath).catch(() => undefined);
+    throw error;
+  } finally {
+    await Promise.all([
+      source.close().catch(() => undefined),
+      destination?.close().catch(() => undefined),
+    ]);
+  }
+}
+
+function assertTrustedAuthCache(metadata: Stats): void {
   if (!metadata.isFile()) throw new Error("Codex account authentication cache is not a regular file");
-  await chmod(codexHome, 0o700);
-  await chmod(authPath, 0o600);
-  const [securedHome, securedAuth] = await Promise.all([stat(codexHome), stat(authPath)]);
-  if ((securedHome.mode & 0o777) !== 0o700 || (securedAuth.mode & 0o777) !== 0o600) {
-    throw new Error("Codex account authentication permissions could not be secured");
+  if (metadata.nlink !== 1) throw new Error("Codex account authentication cache must not be hard-linked");
+  assertCurrentOwner(metadata.uid, "Codex account authentication cache");
+}
+
+function sameFileVersion(left: Stats, right: Stats): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs;
+}
+
+async function persistRefreshedCodexAuth(
+  runtime: CodexRuntime,
+  handoff: HandoffDocument,
+): Promise<AuthVolumePersistedEvidence> {
+  const persistentAuthPath = path.join(runtime.persistentHome, "auth.json");
+  const currentIdentity = await verifyCodexAuthentication(runtime.persistentHome);
+  if (
+    currentIdentity.dev !== runtime.persistentAuthIdentity.dev
+    || currentIdentity.ino !== runtime.persistentAuthIdentity.ino
+  ) {
+    throw new Error("Persistent Codex account authentication changed during the serialized run");
   }
+
+  const pendingPath = path.join(runtime.persistentHome, `.auth.${randomUUID()}.tmp`);
+  let pendingIdentity: AuthCacheIdentity | undefined;
+  try {
+    pendingIdentity = await copyTrustedAuthCache(
+      path.join(runtime.workerHome, "auth.json"),
+      pendingPath,
+    );
+    await rename(pendingPath, persistentAuthPath);
+    const installedIdentity = await verifyCodexAuthentication(runtime.persistentHome);
+    if (
+      installedIdentity.dev !== pendingIdentity.dev
+      || installedIdentity.ino !== pendingIdentity.ino
+    ) {
+      throw new Error("Persisted Codex account authentication lost inode continuity");
+    }
+    const directory = await open(
+      runtime.persistentHome,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
+    const syncResult = await run(
+      "sync",
+      [runtime.persistentHome],
+      workspaceRoot(),
+      false,
+      nonSecretEnvironment(),
+    );
+    if (syncResult.exitCode !== 0) {
+      throw new Error("Explicit Modal v2 Codex auth Volume sync failed");
+    }
+    const persisted = await readFile(persistentAuthPath);
+    return {
+      version: 1,
+      method: "modal-volume-v2-sync",
+      mountPath: "/codex-home",
+      taskId: handoff.taskId,
+      handoffSha256: handoff.contentHash,
+      authSha256: sha256(persisted),
+      persistedAt: new Date().toISOString(),
+    };
+  } finally {
+    await unlink(pendingPath).catch(() => undefined);
+  }
+}
+
+async function rejectProjectCodexConfig(): Promise<void> {
+  const directoryPath = path.join(project, ".codex");
+  let directory;
+  try {
+    directory = await open(
+      directoryPath,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return;
+    if (code === "ELOOP" || code === "ENOTDIR") {
+      throw new Error("Project-local .codex/config.toml is not allowed in cloud continuation");
+    }
+    throw error;
+  }
+  try {
+    const configPath = path.join(directoryPath, "config.toml");
+    let config;
+    try {
+      config = await open(configPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") return;
+      if (code === "ELOOP") {
+        throw new Error("Project-local .codex/config.toml is not allowed in cloud continuation");
+      }
+      throw error;
+    }
+    await config.close();
+    throw new Error("Project-local .codex/config.toml is not allowed in cloud continuation");
+  } finally {
+    await directory.close();
+  }
+}
+
+function codexPermissionProfile(
+  profile: string,
+  deniedCredentialRoots: readonly string[],
+  networkEnabled: boolean,
+): string {
+  const deniedRoots = [...new Set(["/codex-home", ...deniedCredentialRoots])]
+    .map((value) => `${JSON.stringify(value)} = "deny"`)
+    .join("\n");
+  return `default_permissions = "${profile}"
+approval_policy = "never"
+
+[permissions.${profile}]
+extends = ":workspace"
+
+[permissions.${profile}.filesystem]
+":root" = "deny"
+":minimal" = "read"
+${deniedRoots}
+
+[permissions.${profile}.filesystem.":workspace_roots"]
+"." = "write"
+
+[permissions.${profile}.network]
+enabled = ${networkEnabled ? "true" : "false"}
+
+[shell_environment_policy]
+inherit = "core"
+
+[shell_environment_policy.filters]
+CODEX_HOME = "exclude"
+OPENAI_API_KEY = "exclude"
+CODEX_API_KEY = "exclude"
+DEX_HANDOFF_SIGNING_KEY = "exclude"
+DEX_CLOUD_PROJECT = "exclude"
+DEX_CLOUD_ROOT = "exclude"
+`;
+}
+
+async function installCodexPermissionProfile(
+  sandboxHome: string,
+  profile: string,
+  deniedCredentialRoots: readonly string[],
+  networkEnabled: boolean,
+): Promise<void> {
+  const profilePath = path.join(sandboxHome, `${profile}.config.toml`);
+  await writeTextAtomic(
+    profilePath,
+    codexPermissionProfile(profile, deniedCredentialRoots, networkEnabled),
+  );
+  await chmod(profilePath, 0o600);
+  if (((await stat(profilePath)).mode & 0o777) !== 0o600) {
+    throw new Error("Codex Modal worker profile permissions could not be secured");
+  }
+}
+
+async function verifyCodexPermissionBoundary(
+  profile: string,
+  cwd: string,
+  deniedRepositoryPath?: string,
+): Promise<void> {
+  const runtime = requireActiveCodexRuntime();
+  const smokeScript = [
+    'test ! -r "$1/auth.json"',
+    'test ! -r "$2/auth.json"',
+    'test -z "${CODEX_HOME-}${OPENAI_API_KEY-}${CODEX_API_KEY-}${DEX_HANDOFF_SIGNING_KEY-}"',
+    `if env | cut -d= -f1 | grep -Eiq '${SECRET_ENVIRONMENT_GREP}'; then exit 1; fi`,
+    "test ! -r /proc/1/environ",
+    ...(deniedRepositoryPath ? ['test ! -r "$3/.git/HEAD"'] : []),
+  ].join("; ");
+  const smoke = await run("codex", credentialDeniedSandboxArgs(
+    profile,
+    "sh",
+    [
+      "-ceu",
+      smokeScript,
+      "dex-modal-boundary-smoke",
+      runtime.persistentHome,
+      runtime.workerHome,
+      ...(deniedRepositoryPath ? [deniedRepositoryPath] : []),
+    ],
+    cwd,
+  ), cwd, false, codexEnvironment(runtime.sandboxHome));
+  if (smoke.exitCode !== 0) {
+    throw new Error("Codex permission-boundary smoke failed; refusing to start the cloud task");
+  }
+}
+
+async function bootstrapDependencies(): Promise<void> {
+  const lockPath = path.join(project, "package-lock.json");
+  if (!(await exists(lockPath))) return;
+  const bootstrapDirectory = await mkdtemp(path.join(workspaceRoot(), ".dex-bootstrap-"));
+  await chmod(bootstrapDirectory, 0o700);
+  try {
+    await Promise.all([
+      copyTrustedBootstrapManifest(
+        path.join(project, "package.json"),
+        path.join(bootstrapDirectory, "package.json"),
+      ),
+      copyTrustedBootstrapManifest(
+        lockPath,
+        path.join(bootstrapDirectory, "package-lock.json"),
+      ),
+    ]);
+    await verifyCodexPermissionBoundary(
+      CODEX_BOOTSTRAP_PROFILE,
+      bootstrapDirectory,
+      project,
+    );
+    const npmCache = path.join(bootstrapDirectory, ".npm-cache");
+    await runCredentialDeniedWithProfile(
+      CODEX_BOOTSTRAP_PROFILE,
+      "/usr/bin/env",
+      [
+        "NPM_CONFIG_USERCONFIG=/dev/null",
+        "NPM_CONFIG_GLOBALCONFIG=/dev/null",
+        "NPM_CONFIG_GIT=/usr/bin/git",
+        "NPM_CONFIG_IGNORE_SCRIPTS=true",
+        "NPM_CONFIG_AUDIT=false",
+        "NPM_CONFIG_FUND=false",
+        `NPM_CONFIG_CACHE=${npmCache}`,
+        "GIT_CONFIG_NOSYSTEM=1",
+        "GIT_CONFIG_SYSTEM=/dev/null",
+        "GIT_CONFIG_GLOBAL=/dev/null",
+        "GIT_TERMINAL_PROMPT=0",
+        "GIT_ASKPASS=/usr/bin/false",
+        "SSH_ASKPASS=/usr/bin/false",
+        "GIT_SSH_COMMAND=/usr/bin/false",
+        "npm",
+        "ci",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+      ],
+      bootstrapDirectory,
+    );
+    const installedModules = path.join(bootstrapDirectory, "node_modules");
+    const modulesHandle = await open(
+      installedModules,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    try {
+      const metadata = await modulesHandle.stat();
+      if (!metadata.isDirectory()) throw new Error("Dependency bootstrap did not create node_modules");
+      assertCurrentOwner(metadata.uid, "Dependency bootstrap node_modules");
+    } finally {
+      await modulesHandle.close();
+    }
+    await rename(installedModules, path.join(project, "node_modules"));
+  } finally {
+    await rm(bootstrapDirectory, { recursive: true, force: true });
+  }
+}
+
+async function copyTrustedBootstrapManifest(sourcePath: string, destinationPath: string): Promise<void> {
+  let source;
+  try {
+    source = await open(sourcePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ELOOP") {
+      throw new Error("Dependency bootstrap manifest must not be a symbolic link");
+    }
+    throw error;
+  }
+  let destination;
+  try {
+    const before = await source.stat();
+    assertTrustedBootstrapManifest(before);
+    if (before.size > MAX_BOOTSTRAP_MANIFEST_BYTES) {
+      throw new Error("Dependency bootstrap manifest exceeds the allowed size");
+    }
+    const contents = await source.readFile();
+    const after = await source.stat();
+    assertTrustedBootstrapManifest(after);
+    if (
+      before.dev !== after.dev
+      || before.ino !== after.ino
+      || before.size !== after.size
+      || before.mtimeMs !== after.mtimeMs
+      || before.ctimeMs !== after.ctimeMs
+    ) {
+      throw new Error("Dependency bootstrap manifest changed while being copied");
+    }
+    destination = await open(
+      destinationPath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    await destination.writeFile(contents);
+    await destination.sync();
+  } finally {
+    await Promise.all([
+      source.close().catch(() => undefined),
+      destination?.close().catch(() => undefined),
+    ]);
+  }
+}
+
+function assertTrustedBootstrapManifest(metadata: Stats): void {
+  if (!metadata.isFile()) throw new Error("Dependency bootstrap manifest is not a regular file");
+  if (metadata.nlink !== 1) throw new Error("Dependency bootstrap manifest must not be hard-linked");
+  assertCurrentOwner(metadata.uid, "Dependency bootstrap manifest");
+}
+
+async function publishTrustedResultBundle(
+  stagedPath: string,
+  trustedPath: string,
+): Promise<string> {
+  let source;
+  try {
+    source = await open(stagedPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ELOOP") {
+      throw new Error("Staged result bundle must not be a symbolic link");
+    }
+    throw error;
+  }
+
+  let destination;
+  let destinationCreated = false;
+  try {
+    const sourceBefore = await source.stat();
+    assertTrustedResultFile(sourceBefore, "Staged result bundle");
+    destination = await open(
+      trustedPath,
+      constants.O_WRONLY |
+        constants.O_CREAT |
+        constants.O_EXCL |
+        constants.O_NOFOLLOW,
+      0o600,
+    );
+    destinationCreated = true;
+
+    const digest = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let position = 0;
+    while (true) {
+      const { bytesRead } = await source.read(buffer, 0, buffer.length, position);
+      if (bytesRead === 0) break;
+      digest.update(buffer.subarray(0, bytesRead));
+      let written = 0;
+      while (written < bytesRead) {
+        const result = await destination.write(
+          buffer,
+          written,
+          bytesRead - written,
+          position + written,
+        );
+        if (result.bytesWritten === 0) {
+          throw new Error("Trusted result bundle copy made no forward progress");
+        }
+        written += result.bytesWritten;
+      }
+      position += bytesRead;
+    }
+    await destination.sync();
+
+    const [sourceAfter, trustedMetadata] = await Promise.all([
+      source.stat(),
+      destination.stat(),
+    ]);
+    assertTrustedResultFile(sourceAfter, "Staged result bundle");
+    assertTrustedResultFile(trustedMetadata, "Trusted result bundle");
+    if (
+      sourceBefore.dev !== sourceAfter.dev ||
+      sourceBefore.ino !== sourceAfter.ino ||
+      sourceBefore.size !== sourceAfter.size ||
+      sourceBefore.mtimeMs !== sourceAfter.mtimeMs ||
+      sourceBefore.ctimeMs !== sourceAfter.ctimeMs
+    ) {
+      throw new Error("Staged result bundle changed while it was being copied");
+    }
+    return digest.digest("hex");
+  } catch (error) {
+    if (destinationCreated) {
+      await unlink(trustedPath).catch(() => undefined);
+    }
+    throw error;
+  } finally {
+    await Promise.all([
+      source.close().catch(() => undefined),
+      destination?.close().catch(() => undefined),
+    ]);
+    await unlink(stagedPath).catch(() => undefined);
+  }
+}
+
+function assertTrustedResultFile(
+  metadata: Stats,
+  label: string,
+): void {
+  if (!metadata.isFile()) throw new Error(`${label} is not a regular file`);
+  if (metadata.nlink !== 1) throw new Error(`${label} must not be hard-linked`);
+  assertCurrentOwner(metadata.uid, label);
+}
+
+async function writeTextAtomic(file: string, value: string): Promise<void> {
+  const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+  const handle = await open(temporary, "wx", 0o600);
+  try {
+    await handle.writeFile(value, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await rename(temporary, file);
 }
 
 function redactText(value: string): string {

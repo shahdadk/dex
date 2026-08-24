@@ -145,6 +145,9 @@ export function createTaskCloudCompletedCommand(
             : { retainedUntil: input.terminal.sandboxRetentionExpiresAt }),
         },
         handoffSha256: input.task.monitor?.handoffSha256,
+        ...(input.terminal.sandboxTerminal === undefined
+          ? {}
+          : { sandboxTerminal: input.terminal.sandboxTerminal }),
         resultPath: input.task.monitor?.resultPath ?? "/dex/result.json",
         ...(input.terminal.sandboxRetentionExpiresAt === undefined
           ? {}
