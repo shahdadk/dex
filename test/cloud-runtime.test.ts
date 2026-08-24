@@ -327,6 +327,140 @@ describe("durable outbox and monitor execution", () => {
     await secondBackend.close();
   });
 
+  it("replays rejected device events as sequence-only history across acceptance-rule changes", async () => {
+    const filePath = await stateFile();
+    const firstBackend = new AtomicFileStateBackend({ filePath });
+    const first = new DurableDexCloudRepository({ backend: firstBackend });
+    await first.commitPairingChallenge("pair-message", {
+      id: "pair-challenge",
+      codeDigest: "1".repeat(64),
+      issuedAt: NOW_ISO,
+      expiresAt: "2026-08-23T19:00:00.000Z",
+      ownerId: "owner-1",
+      conversationId: "conversation-1",
+      phoneE164: PHONE,
+      sourceMessageId: "pair-message",
+      attempts: 0,
+      maxAttempts: 5,
+    }, {
+      id: "pair-notification",
+      dedupeKey: "pair-notification",
+      ownerId: "owner-1",
+      conversationId: "conversation-1",
+      toPhone: PHONE,
+      text: "Pairing ready",
+      createdAt: NOW_ISO,
+    });
+    await first.consumePairingChallenge({
+      challengeId: "pair-challenge",
+      codeDigest: "1".repeat(64),
+      now: NOW_ISO,
+      device: {
+        id: "device-1",
+        keyId: "device-key-1",
+        publicKey: "public-key",
+        ownerId: "owner-1",
+        conversationId: "conversation-1",
+        phoneE164: PHONE,
+        deviceName: "Dex Mac",
+        createdAt: NOW_ISO,
+        lastSequence: 0,
+      },
+    });
+    await first.commitDeviceSync({
+      deviceId: "device-1",
+      sequence: 1,
+      events: [{
+        id: "task-created",
+        occurredAt: NOW_ISO,
+        type: "task.created",
+        taskId: "retryable-task",
+        payload: {
+          title: "Retryable task",
+          originalRequest: "Continue this task",
+          conversationId: "conversation-1",
+        },
+      }],
+      receipts: [],
+      commandLimit: 100,
+      now: NOW_ISO,
+    });
+    await first.registerModalMonitor({
+      taskId: "retryable-task",
+      workerId: "worker-old",
+      sandboxId: "sandbox-old",
+      handoffSha256: "a".repeat(64),
+      startedAt: NOW_ISO,
+      resultPath: "/dex/result.json",
+    }, NOW_ISO);
+    await first.completeModalTaskAndEnqueue(
+      "retryable-task",
+      "old-completion",
+      "failed",
+      "The first attempt failed",
+      {
+        id: "old-completion-message",
+        dedupeKey: "old-completion-message",
+        ownerId: "owner-1",
+        conversationId: "conversation-1",
+        toPhone: PHONE,
+        text: "The first attempt failed",
+        createdAt: "2026-08-23T18:01:00.000Z",
+        taskId: "retryable-task",
+      },
+      "2026-08-23T18:01:00.000Z",
+    );
+
+    await firstBackend.mutate((state) => {
+      state.controlPlaneOperations.push({
+        kind: "commit_device_sync",
+        input: {
+          deviceId: "device-1",
+          sequence: 2,
+          events: [{
+            id: "historically-rejected-monitor",
+            occurredAt: "2026-08-23T18:02:00.000Z",
+            type: "modal.monitor.registered",
+            taskId: "retryable-task",
+            workerId: "worker-new",
+            payload: {
+              taskId: "retryable-task",
+              workerId: "worker-new",
+              sandboxId: "sandbox-new",
+              handoffSha256: "b".repeat(64),
+              startedAt: "2026-08-23T18:02:00.000Z",
+              resultPath: "/dex/result.json",
+            },
+          }],
+          receipts: [],
+          commandLimit: 100,
+          now: "2026-08-23T18:02:00.000Z",
+        },
+        expectedInvalidEvent: {
+          eventId: "historically-rejected-monitor",
+          message: "Task is already terminal",
+        },
+      });
+    });
+    await firstBackend.close();
+
+    const secondBackend = new AtomicFileStateBackend({ filePath });
+    const second = new DurableDexCloudRepository({ backend: secondBackend });
+    await expect(second.getTask("retryable-task")).resolves.toMatchObject({
+      status: "failed",
+      monitor: { sandboxId: "sandbox-old", handoffSha256: "a".repeat(64) },
+    });
+    await expect(second.commitDeviceSync({
+      deviceId: "device-1",
+      sequence: 3,
+      events: [],
+      receipts: [],
+      commandLimit: 100,
+      now: "2026-08-23T18:03:00.000Z",
+    })).resolves.toMatchObject({ nextSequence: 4 });
+    await secondBackend.close();
+  });
+
   it("retries a definitive 429 as a new bounded send attempt", async () => {
     const backend = new AtomicFileStateBackend({ filePath: await stateFile() });
     const repository = new DurableDexCloudRepository({

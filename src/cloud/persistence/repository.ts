@@ -97,18 +97,18 @@ async function applyOperation(
         await repository.commitDeviceSync(operation.input);
         return;
       }
-      try {
-        await repository.commitDeviceSync(operation.input);
-      } catch (error) {
-        if (
-          error instanceof InvalidTransportEventError &&
-          error.eventId === operation.expectedInvalidEvent.eventId
-        ) {
-          return;
-        }
-        throw error;
-      }
-      throw new Error("A persisted rejected device event no longer rejects during replay");
+      // A rejected transport event consumes only the signed anti-replay
+      // sequence. Revalidating the rejected payload during hydration makes
+      // persisted history depend on today's acceptance rules: a later schema
+      // or state-machine change could turn an old rejection into a mutation.
+      // Replay the durable sequence advancement directly and leave both the
+      // rejected events and receipts unapplied, matching the original commit.
+      await repository.commitDeviceSync({
+        ...operation.input,
+        events: [],
+        receipts: [],
+      });
+      return;
     case "claim_monitor_jobs":
       await repository.claimPendingMonitorJobs(
         operation.limit,
