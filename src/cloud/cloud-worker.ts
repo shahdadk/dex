@@ -166,7 +166,11 @@ async function consumeCodexOutput(
     if (event.type === "turn.completed") turnCompleted = true;
     const item = event.item as Record<string, unknown> | undefined;
     if (event.type === "item.completed" && item?.type === "agent_message" && typeof item.text === "string") {
-      summary = bounded(redactText(item.text.replace(/\s+/g, " ").trim()), 500);
+      // User-facing status should keep the beginning of the worker's semantic
+      // result. The log accumulator below intentionally keeps the tail, but
+      // applying that policy here turned "Fixed …" into "xed …" whenever a
+      // response exceeded the 500-character result limit.
+      summary = boundedStart(redactText(item.text.replace(/\s+/g, " ").trim()), 500);
     }
   }
   return { ...(threadId ? { threadId } : {}), turnCompleted, summary };
@@ -275,6 +279,10 @@ function safeEqual(left: string, right: string): boolean {
 
 function bounded(value: string, max: number): string {
   return value.length > max ? value.slice(value.length - max) : value;
+}
+
+function boundedStart(value: string, max: number): string {
+  return value.length > max ? value.slice(0, max) : value;
 }
 
 async function exists(file: string): Promise<boolean> {

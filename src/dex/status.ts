@@ -9,7 +9,7 @@ export function buildStatusMessage(tasks: DexTask[], workers: WorkerSession[] = 
   const heading = active.length > 0 ? `${active.length} ${active.length === 1 ? "thing" : "things"} active:` : "recent work:";
   const lines = tasks.slice(0, 6).map((task) => {
     const worker = task.currentWorkerId ? workerById.get(task.currentWorkerId) : undefined;
-    const detail = task.latestSummary || stageText(task);
+    const detail = task.latestSummary ? semanticSummary(task.latestSummary) : stageText(task);
     const owner = worker && task.metadata.showAgent === true ? ` (${worker.agent})` : "";
     return `${displayTitle(task.title)}${owner} — ${detail}`;
   });
@@ -23,6 +23,26 @@ export function buildStatusMessage(tasks: DexTask[], workers: WorkerSession[] = 
       ? `${blocked.length === 1 ? blocked[0]?.title : `${blocked.length} tasks`} needs your input.`
       : "nothing needs you right now.",
   ].join("\n");
+}
+
+function semanticSummary(value: string): string {
+  const clean = value
+    .replace(/\[([^\]]+)]\([^\s)]+\)/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+  const testEvidence = clean.match(/\b(\d+)\s*\/\s*(\d+)\s+tests?\s+passed\b/i);
+  const narrative = clean.split(/\bValidation\s*:/i)[0]?.trim() || clean;
+  const detail = truncateAtWord(narrative, 210);
+  if (!testEvidence || detail.toLowerCase().includes(testEvidence[0]!.toLowerCase())) return detail;
+  return `${detail.replace(/[.;:,\s]+$/g, "")} — ${testEvidence[1]}/${testEvidence[2]} tests passed`;
+}
+
+function truncateAtWord(value: string, maximum: number): string {
+  if (value.length <= maximum) return value;
+  const candidate = value.slice(0, maximum - 1);
+  const boundary = candidate.lastIndexOf(" ");
+  return `${candidate.slice(0, boundary >= maximum * 0.65 ? boundary : candidate.length).trimEnd()}…`;
 }
 
 function stageText(task: DexTask): string {

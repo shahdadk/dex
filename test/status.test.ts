@@ -30,4 +30,34 @@ describe("status persona", () => {
     expect(message).toContain("nothing needs you");
     expect(message).not.toContain("%");
   });
+
+  it("turns cloud-worker output into concise text instead of leaking workspace paths or validation logs", () => {
+    const now = new Date().toISOString();
+    const task: DexTask = {
+      id: "checkout-a81f",
+      kind: "dex",
+      projectId: "p1",
+      title: "checkout",
+      originalRequest: "fix checkout",
+      repositoryPath: "/repo",
+      baseBranch: "main",
+      dexBranch: "dex/checkout-a81f",
+      worktreePath: "/worktree",
+      status: "completed",
+      stage: "done",
+      createdAt: now,
+      updatedAt: now,
+      latestSummary: "Fixed in [src/checkout.js](/workspace/project/src/checkout.js:11). Early `invoice.paid` events now wait safely. Validation: - `npm test`: 2/2 tests passed - `git diff --check`: passed",
+      workerHistory: [],
+      memoryQueries: [],
+      metadata: {},
+    };
+
+    const message = buildStatusMessage([task]);
+
+    expect(message).toContain("checkout — Fixed in src/checkout.js. Early invoice.paid events now wait safely — 2/2 tests passed");
+    expect(message).not.toContain("/workspace/project");
+    expect(message).not.toContain("git diff");
+    expect(message).not.toContain("`");
+  });
 });

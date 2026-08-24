@@ -132,7 +132,11 @@ export async function dexCloudCheck(config: DexConfig): Promise<DoctorCheck> {
   }
   try {
     const health = new URL("/readyz", config.cloudUrl);
-    const response = await fetch(health, { signal: AbortSignal.timeout(2_000) });
+    // Readiness performs a real durable-store read. Cloud SQL's IAM connector
+    // can occasionally take several seconds to refresh even while the warm
+    // service remains healthy, so a two-second probe produced false failures
+    // during an otherwise successful end-to-end run.
+    const response = await fetch(health, { signal: AbortSignal.timeout(8_000) });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     return {
       name: "Dex Cloud",

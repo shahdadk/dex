@@ -138,7 +138,7 @@ process.stdin.on("end", () => {
     modalToken: process.env.MODAL_TOKEN_SECRET,
   }), "utf8");
   process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "thread-cloud-123" }) + "\\n");
-  process.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "Cloud work completed. DEX_HANDOFF_SIGNING_KEY=must-not-persist" } }) + "\\n");
+  process.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: process.env.FAKE_CODEX_MESSAGE || "Cloud work completed. DEX_HANDOFF_SIGNING_KEY=must-not-persist" } }) + "\\n");
   process.stdout.write(JSON.stringify({ type: "turn.completed" }) + "\\n");
 });
 `,
@@ -148,7 +148,7 @@ process.stdin.on("end", () => {
   return binaryDirectory;
 }
 
-async function runWorker(fixture: WorkerFixture) {
+async function runWorker(fixture: WorkerFixture, message?: string) {
   const binaryDirectory = await installFakeCodex(fixture.directory);
   const codexHome = path.join(fixture.directory, "codex-home");
   await mkdir(codexHome, { mode: 0o755 });
@@ -168,6 +168,7 @@ async function runWorker(fixture: WorkerFixture) {
       FAKE_CODEX_PROMPT_PATH: fixture.promptPath,
       FAKE_CODEX_ENV_PATH: fixture.environmentPath,
       FAKE_CODEX_ARGUMENTS_PATH: fixture.argumentsPath,
+      ...(message === undefined ? {} : { FAKE_CODEX_MESSAGE: message }),
     },
   });
 }
@@ -262,5 +263,19 @@ describe("Modal cloud worker", () => {
       status: "succeeded",
       summary: "Cloud work completed. DEX_HANDOFF_SIGNING_KEY=[REDACTED]",
     });
+  });
+
+  it("preserves the beginning of long semantic completion summaries", async () => {
+    const fixture = await createWorkerFixture();
+    const message = `Fixed checkout ordering and preserved idempotency. ${"evidence ".repeat(80)}`;
+
+    const execution = await runWorker(fixture, message);
+
+    expect(execution, execution.stderr).toMatchObject({ exitCode: 0 });
+    const result = JSON.parse(
+      await readFile(path.join(fixture.cloudRoot, "result.json"), "utf8"),
+    ) as { summary: string };
+    expect(result.summary).toHaveLength(500);
+    expect(result.summary).toMatch(/^Fixed checkout ordering and preserved idempotency\./);
   });
 });
