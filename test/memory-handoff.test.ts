@@ -9,6 +9,7 @@ import {
   MemoryContinuity,
   assertNoSecrets,
   buildGitCheckpointCommands,
+  collectClaudeMemMemories,
   createGitCheckpoint,
   discoverClaudeMem,
   extractObservationIds,
@@ -323,6 +324,41 @@ describe("Claude-Mem integration", () => {
     ]);
     expect(requests.filter((request) => request.url.endsWith("/api/observations/batch"))).toHaveLength(1);
   });
+
+  it("falls back to global retrieval when a derived project label has no observations", async () => {
+    const memories = Array.from({ length: 5 }, (_, index): MemoryObservation => ({
+      id: 100 + index,
+      source: "claude-mem",
+      project: "normalized-parent-project",
+      type: index === 0 ? "failed-approach" : "discovery",
+      title: index === 0 ? "Do not charge before idempotency" : `Checkout fact ${index}`,
+      narrative: `Durable checkout context ${index}`,
+      facts: [],
+      concepts: ["checkout"],
+      filesRead: [],
+      filesModified: [],
+    }));
+    const client: MemoryClient = {
+      recordObservation: vi.fn(async () => ({ status: "queued" as const })),
+      summarizeSession: vi.fn(async () => ({ status: "queued" as const })),
+      search: vi.fn(async (options) => options.project
+        ? { content: [{ type: "text", text: "No results found" }] }
+        : { content: [{ type: "text", text: "#100 #101 #102 #103 #104" }] }),
+      timeline: vi.fn(async (options) => "project" in options
+        ? { content: [] }
+        : { content: [{ type: "text", text: "#100 #101 #102 #103 #104" }] }),
+      getObservations: vi.fn(async (options) => options.project ? [] : memories),
+    };
+
+    await expect(collectClaudeMemMemories(client, {
+      query: "checkout idempotency",
+      project: "worktree-derived-name",
+    })).resolves.toEqual(memories);
+    expect(client.search).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      project: "worktree-derived-name",
+    }));
+    expect(client.search).toHaveBeenNthCalledWith(2, expect.not.objectContaining({ project: expect.anything() }));
+  });
 });
 
 describe("memory selection and safety", () => {
@@ -428,6 +464,36 @@ describe("memory selection and safety", () => {
 });
 
 describe("handoff package", () => {
+  it("materializes an explicit failed approach even when Claude-Mem classifies it as a discovery", async () => {
+    const memories = Array.from({ length: 5 }, (_, index): MemoryObservation => ({
+      id: 6000 + index,
+      source: "claude-mem",
+      type: "discovery",
+      title: index === 0 ? "Webhook ordering constraint" : `Checkout context ${index}`,
+      narrative: `Durable checkout observation ${index}`,
+      facts: index === 0
+        ? ["Performing the external charge before the idempotency lookup risks duplicate charges on duplicate delivery"]
+        : [`Checkout fact ${index}`],
+      concepts: ["checkout"],
+      filesRead: [],
+      filesModified: [],
+    }));
+
+    const handoff = await createHandoff({
+      taskId: "checkout-memory-classification",
+      goal: "Fix checkout webhook ordering",
+      repository: { baseCommit: "abc123", workingBranch: "dex/checkout-memory" },
+      memories,
+    }, { discoverMemory: false });
+
+    expect(handoff.failedApproaches).toContainEqual({
+      approach: "Performing the external charge before the idempotency lookup",
+      reason: "risks duplicate charges on duplicate delivery",
+      doNotRepeat: true,
+      sourceMemoryId: 6000,
+    });
+  });
+
   it("creates, signs, writes, and verifies a memory-complete package", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "dex-handoff-"));
     const file = path.join(directory, "handoff.json");

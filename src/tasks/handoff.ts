@@ -201,14 +201,44 @@ function normalizeFailedApproaches(
     );
   }
   for (const memory of memories) {
-    if (memory.type !== "failed-approach") continue;
-    const [approach = memory.title, ...rest] = memory.narrative.split(/\r?\n/);
-    const outcome = rest.find((line) => line.startsWith("Outcome:"));
-    add(
-      approach,
-      outcome?.slice("Outcome:".length).trim() || memory.facts[0] || "The prior worker recorded this approach as unsuccessful.",
-      memory.id,
-    );
+    if (memory.type === "failed-approach") {
+      const [approach = memory.title, ...rest] = memory.narrative.split(/\r?\n/);
+      const outcome = rest.find((line) => line.startsWith("Outcome:"));
+      add(
+        approach,
+        outcome?.slice("Outcome:".length).trim() || memory.facts[0] || "The prior worker recorded this approach as unsuccessful.",
+        memory.id,
+      );
+      continue;
+    }
+
+    // Claude-Mem's semantic classifier may store an explicitly documented
+    // failed approach as a broader "discovery". Preserve the engineering
+    // meaning instead of depending on that classifier label alone. Do not
+    // reinterpret deterministic TaskKnowledge constraints as failed attempts.
+    if (memory.source !== "claude-mem") continue;
+    const evidence = [...memory.facts, memory.title, memory.narrative]
+      .flatMap((value) => value.split(/\r?\n/))
+      .map((value) => value.trim())
+      .filter(Boolean);
+    for (const line of evidence) {
+      const causal = line.match(/^(.{5,240}?)\s+(risks?|causes?|caused|leads? to|resulted in)\s+(.{5,400})$/i);
+      if (causal && /\b(?:duplicate|twice|failure|failed|regression|unsafe|breaks?|corrupts?)\b/i.test(causal[3]!)) {
+        add(causal[1]!, `${causal[2]} ${causal[3]}`, memory.id);
+        break;
+      }
+      const prohibition = line.match(/\bdo not\s+(.{5,300}?)(?:[.;]|$)/i);
+      if (prohibition) {
+        const reason = evidence.find((candidate) =>
+          candidate !== line && /\b(?:duplicate|twice|failure|failed|regression|unsafe|breaks?|corrupts?|risk)\b/i.test(candidate));
+        add(
+          prohibition[1]!,
+          reason ?? "The prior memory explicitly prohibited this approach.",
+          memory.id,
+        );
+        break;
+      }
+    }
   }
   return results;
 }

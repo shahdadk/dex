@@ -208,29 +208,39 @@ export async function collectClaudeMemMemories(
   client: MemoryClient,
   options: CollectMemoryOptions,
 ): Promise<MemoryObservation[]> {
-  const search = await client.search({
-    query: options.query,
-    type: "observations",
-    limit: Math.min(options.searchLimit ?? 30, 100),
-    orderBy: "relevance",
-    ...(options.project === undefined ? {} : { project: options.project }),
-  });
-  const searchIds = extractObservationIds(search);
-  const timeline = await client.timeline({
-    ...(searchIds[0] === undefined ? { query: options.query } : { anchor: searchIds[0] }),
-    depthBefore: options.timelineDepth ?? 4,
-    depthAfter: options.timelineDepth ?? 4,
-    ...(options.project === undefined ? {} : { project: options.project }),
-  });
-  const ids = [...new Set([...searchIds, ...extractObservationIds(timeline)])].slice(
-    0,
-    options.batchLimit ?? 40,
-  );
-  if (ids.length === 0) return [];
-  return client.getObservations({
-    ids,
-    orderBy: "date_desc",
-    limit: options.batchLimit ?? 40,
-    ...(options.project === undefined ? {} : { project: options.project }),
-  });
+  const collect = async (project?: string): Promise<MemoryObservation[]> => {
+    const search = await client.search({
+      query: options.query,
+      type: "observations",
+      limit: Math.min(options.searchLimit ?? 30, 100),
+      orderBy: "relevance",
+      ...(project === undefined ? {} : { project }),
+    });
+    const searchIds = extractObservationIds(search);
+    const timeline = await client.timeline({
+      ...(searchIds[0] === undefined ? { query: options.query } : { anchor: searchIds[0] }),
+      depthBefore: options.timelineDepth ?? 4,
+      depthAfter: options.timelineDepth ?? 4,
+      ...(project === undefined ? {} : { project }),
+    });
+    const ids = [...new Set([...searchIds, ...extractObservationIds(timeline)])].slice(
+      0,
+      options.batchLimit ?? 40,
+    );
+    if (ids.length === 0) return [];
+    return client.getObservations({
+      ids,
+      orderBy: "date_desc",
+      limit: options.batchLimit ?? 40,
+      ...(project === undefined ? {} : { project }),
+    });
+  };
+
+  const scoped = await collect(options.project);
+  // Claude-Mem project labels can differ from a repository basename (for
+  // example, worktrees may inherit the parent Git project). Preserve scoped
+  // retrieval when it works, but do not silently discard a relevant durable
+  // memory solely because that derived label has no observations.
+  if (scoped.length > 0 || options.project === undefined) return scoped;
+  return collect();
 }
