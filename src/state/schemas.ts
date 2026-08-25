@@ -201,6 +201,14 @@ export const QuarantinedTransportEventSchema = z.object({
   quarantinedAt: z.string().datetime(),
 }).strict();
 
+export const QuarantinedTransportReceiptSchema = z.object({
+  commandId: z.string().min(1).max(512),
+  status: z.enum(["processed", "rejected", "failed", "duplicate"]),
+  occurredAt: z.string().datetime(),
+  disposition: z.literal("unknown_command"),
+  quarantinedAt: z.string().datetime(),
+}).strict();
+
 export const SignedTransportErrorSchema = z.enum([
   "network",
   "http",
@@ -242,6 +250,10 @@ export const DexStateSchema = z.object({
   pendingTransportEvents: z.array(PendingTransportEventSchema).max(5000).default([]),
   pendingTransportReceipts: z.array(PendingTransportReceiptSchema).max(5000).default([]),
   quarantinedTransportEvents: z.array(QuarantinedTransportEventSchema).max(1000).default([]),
+  quarantinedTransportReceipts: z
+    .array(QuarantinedTransportReceiptSchema)
+    .max(1000)
+    .default([]),
   signedTransportHealth: SignedTransportHealthSchema.optional(),
 });
 export type DexState = z.infer<typeof DexStateSchema>;
@@ -260,6 +272,7 @@ export function emptyState(): DexState {
     pendingTransportEvents: [],
     pendingTransportReceipts: [],
     quarantinedTransportEvents: [],
+    quarantinedTransportReceipts: [],
   };
 }
 

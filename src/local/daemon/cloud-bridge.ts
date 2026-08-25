@@ -22,6 +22,7 @@ const MAX_SYNC_REQUEST_BYTES = DEFAULT_CONTROL_PLANE_BODY_LIMIT - 1;
 const MAX_CURSOR_CHARS = 4_096;
 const MAX_CONSECUTIVE_SYNC_FAILURES = 10_000;
 const MAX_QUARANTINED_TRANSPORT_EVENTS = 1_000;
+const MAX_QUARANTINED_TRANSPORT_RECEIPTS = 1_000;
 
 interface BoundedSyncBatch {
   payload: DexSyncPayload;
@@ -247,6 +248,16 @@ export class DexCloudBridge {
       const acceptedReceipts = new Set(
         result.acceptedReceiptIds.filter((id) => submittedReceiptIds.has(id)),
       );
+      const rejectedReceipts = new Set(
+        (result.rejectedReceiptIds ?? []).filter((id) => submittedReceiptIds.has(id)),
+      );
+      for (const commandId of acceptedReceipts) {
+        if (rejectedReceipts.has(commandId)) {
+          throw new DexCloudProtocolError("Dex cloud returned conflicting receipt dispositions", {
+            code: "conflicting_receipt_disposition",
+          });
+        }
+      }
 
       for (const command of result.commands) {
         if (!commands.has(command.id)) commands.set(command.id, command);
@@ -256,9 +267,46 @@ export class DexCloudBridge {
         state.pendingTransportEvents = state.pendingTransportEvents.filter(
           (event) => !acceptedEvents.has(event.id),
         );
+        const quarantinedAt = rejectedReceipts.size === 0
+          ? undefined
+          : this.#now().toISOString();
+        for (const commandId of rejectedReceipts) {
+          const submitted = submittedReceipts.get(commandId);
+          const current = state.pendingTransportReceipts.find(
+            (receipt) => receipt.commandId === commandId,
+          );
+          if (
+            submitted === undefined ||
+            current === undefined ||
+            !sameReceiptRevision(current, submitted)
+          ) continue;
+          if (!state.quarantinedTransportReceipts.some((receipt) =>
+            sameReceiptRevision(receipt, submitted))) {
+            state.quarantinedTransportReceipts.push({
+              commandId: current.commandId,
+              status: current.status,
+              occurredAt: current.occurredAt,
+              disposition: "unknown_command",
+              quarantinedAt: quarantinedAt!,
+            });
+            if (
+              state.quarantinedTransportReceipts.length >
+                MAX_QUARANTINED_TRANSPORT_RECEIPTS
+            ) {
+              state.quarantinedTransportReceipts.splice(
+                0,
+                state.quarantinedTransportReceipts.length -
+                  MAX_QUARANTINED_TRANSPORT_RECEIPTS,
+              );
+            }
+          }
+        }
         state.pendingTransportReceipts = state.pendingTransportReceipts.filter(
           (receipt) => {
-            if (!acceptedReceipts.has(receipt.commandId)) return true;
+            if (
+              !acceptedReceipts.has(receipt.commandId) &&
+              !rejectedReceipts.has(receipt.commandId)
+            ) return true;
             const submitted = submittedReceipts.get(receipt.commandId);
             return submitted === undefined || !sameReceiptRevision(receipt, submitted);
           },
@@ -274,7 +322,9 @@ export class DexCloudBridge {
       cursor = result.cursor;
       pendingEvents = pendingEvents.filter((event) => !acceptedEvents.has(event.id));
       pendingReceipts = pendingReceipts.filter(
-        (receipt) => !acceptedReceipts.has(receipt.commandId),
+        (receipt) =>
+          !acceptedReceipts.has(receipt.commandId) &&
+          !rejectedReceipts.has(receipt.commandId),
       );
       if (completesPoll) completedPoll = true;
 
@@ -282,7 +332,11 @@ export class DexCloudBridge {
         if (completedPoll) break;
         continue;
       }
-      if (acceptedEvents.size === 0 && acceptedReceipts.size === 0) break;
+      if (
+        acceptedEvents.size === 0 &&
+        acceptedReceipts.size === 0 &&
+        rejectedReceipts.size === 0
+      ) break;
     }
 
     return [...commands.values()];

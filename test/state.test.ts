@@ -36,6 +36,19 @@ describe("durable state", () => {
     })).toThrow();
   });
 
+  it("retains a bounded receipt quarantine without treating it as accepted", () => {
+    expect(DexStateSchema.parse({
+      ...emptyState(),
+      quarantinedTransportReceipts: [{
+        commandId: "unknown-command",
+        status: "processed",
+        occurredAt: "2026-08-24T12:00:00.000Z",
+        disposition: "unknown_command",
+        quarantinedAt: "2026-08-24T12:01:00.000Z",
+      }],
+    }).quarantinedTransportReceipts).toHaveLength(1);
+  });
+
   it("atomically persists validated revisions", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "dex-state-"));
     const store = new DexStateStore(path.join(directory, "state.json"));

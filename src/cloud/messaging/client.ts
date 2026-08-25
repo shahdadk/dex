@@ -53,6 +53,7 @@ export interface DexSyncResult {
   cursor: string;
   acceptedEventIds: string[];
   acceptedReceiptIds: string[];
+  rejectedReceiptIds?: string[];
   retryAfterMs?: number;
   nextSequence?: number;
   commands: DexVerifiedCommand[];
@@ -243,6 +244,7 @@ export class DexCloudMessagingClient {
         cursor: response.cursor,
         acceptedEventIds: response.acceptedEventIds,
         acceptedReceiptIds: response.acceptedReceiptIds,
+        rejectedReceiptIds: response.rejectedReceiptIds,
         ...(response.retryAfterMs === undefined ? {} : { retryAfterMs: response.retryAfterMs }),
         ...(response.nextSequence === undefined ? {} : { nextSequence: response.nextSequence }),
         commands,

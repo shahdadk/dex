@@ -463,8 +463,40 @@ describe("deterministic device command protocol", () => {
       }],
     }));
     expect(second.acceptedReceiptIds).toEqual([first.commands[0]!.id]);
+    expect(second.rejectedReceiptIds).toEqual([]);
     expect(second.commands).toEqual([]);
     expect(await state.repository.listPendingDeviceCommands(paired.deviceId, 500)).toEqual([]);
+  });
+
+  it("returns a terminal rejection for a receipt whose command is unknown", async () => {
+    const state = fixture();
+    const paired = await pairDevice(state);
+    const client = new DexCloudMessagingClient({
+      baseUrl: "https://cloud.dex.test",
+      deviceId: paired.deviceId,
+      ownerId: OWNER,
+      keyPair: paired.deviceKey,
+      pinnedServerKeys: [{
+        algorithm: "ed25519",
+        keyId: state.signingKey.keyId,
+        publicKey: state.signingKey.publicKey,
+      }],
+      initialSequence: paired.nextSequence - 1,
+      fetch: localFetch(state.service),
+      now: () => state.now.value,
+      nonce: (sequence) => `unknown-receipt-${sequence}`,
+    });
+
+    const result = await client.sync(createDexSyncPayload({
+      receipts: [{
+        commandId: "command-that-never-existed",
+        status: "processed",
+        occurredAt: NOW_ISO,
+      }],
+    }));
+
+    expect(result.acceptedReceiptIds).toEqual([]);
+    expect(result.rejectedReceiptIds).toEqual(["command-that-never-existed"]);
   });
 
   it("long-polls read-only until a new device command arrives", async () => {

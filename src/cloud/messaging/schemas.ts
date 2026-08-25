@@ -92,6 +92,7 @@ export const DexSyncResponseSchema = z.object({
   commands: z.array(DexSignedCommandSchema).max(500),
   acceptedEventIds: z.array(IdentifierSchema).max(500).default([]),
   acceptedReceiptIds: z.array(IdentifierSchema).max(500).default([]),
+  rejectedReceiptIds: z.array(IdentifierSchema).max(500).default([]),
   retryAfterMs: z.number().int().min(0).max(300_000).optional(),
   nextSequence: z.number().int().positive().optional(),
 }).passthrough();

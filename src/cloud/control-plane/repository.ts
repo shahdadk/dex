@@ -774,6 +774,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       }
 
       const acceptedReceiptIds: string[] = [];
+      const rejectedReceiptIds: string[] = [];
       for (const receipt of input.receipts) {
         const record = [...commands.values()].find(
           (candidate) =>
@@ -784,6 +785,13 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
           if (record.acknowledgedAt === undefined) {
             commands.set(record.id, { ...record, acknowledgedAt: input.now });
           }
+        } else {
+          // A signed device may retain a receipt after cloud state was restored,
+          // compacted, or a diagnostic command was injected locally. Give the
+          // client a terminal disposition instead of making it retry forever.
+          // Rejection is deliberately distinct from acknowledgement: callers
+          // must never use it as proof that a power-critical command was accepted.
+          rejectedReceiptIds.push(receipt.commandId);
         }
       }
 
@@ -810,6 +818,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
         commands: pendingCommands,
         acceptedEventIds: [...new Set(input.events.map((event) => event.id))],
         acceptedReceiptIds,
+        rejectedReceiptIds,
         cursor: `device:${input.sequence}`,
         nextSequence: input.sequence + 1,
       };

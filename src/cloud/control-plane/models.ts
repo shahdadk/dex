@@ -334,6 +334,7 @@ export interface DeviceSyncCommitResult {
   commands: Array<z.infer<typeof DexSignedCommandSchema>>;
   acceptedEventIds: string[];
   acceptedReceiptIds: string[];
+  rejectedReceiptIds: string[];
   cursor: string;
   nextSequence: number;
 }

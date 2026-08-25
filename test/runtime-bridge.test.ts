@@ -81,6 +81,7 @@ function acceptedResult(
     commands,
     acceptedEventIds: payload.events.map(({ id }) => id),
     acceptedReceiptIds: payload.receipts.map(({ commandId }) => commandId),
+    rejectedReceiptIds: [],
     transport: {
       kind: "polling" as const,
       survivesHostSleep: true as const,
@@ -261,6 +262,38 @@ describe("DexCloudBridge", () => {
       reason: "newer status",
     });
     expect((await store.read()).pendingTransportReceipts).toEqual([]);
+  });
+
+  it("quarantines an explicitly rejected unknown receipt and stops retrying it", async () => {
+    const { store, events } = await fixture();
+    await store.updateState((state) => {
+      state.pendingTransportReceipts.push(queuedReceipt(1));
+    });
+    const payloads: DexSyncPayload[] = [];
+    const client = {
+      sync: vi.fn(async (payload: DexSyncPayload) => {
+        payloads.push(payload);
+        return {
+          ...acceptedResult(payload, "cursor-after-rejection"),
+          acceptedReceiptIds: [],
+          rejectedReceiptIds: payload.receipts.map(({ commandId }) => commandId),
+        };
+      }),
+      health: () => ({ kind: "polling", survivesHostSleep: true }),
+    } as unknown as DexCloudMessagingClient;
+
+    await expect(new DexCloudBridge(client, store, events).syncOnce(0)).resolves.toEqual([]);
+
+    expect(payloads).toHaveLength(1);
+    const state = await store.read();
+    expect(state.pendingTransportReceipts).toEqual([]);
+    expect(state.quarantinedTransportReceipts).toEqual([{
+      commandId: "receipt-1",
+      status: "processed",
+      occurredAt: QUEUED_AT,
+      disposition: "unknown_command",
+      quarantinedAt: expect.any(String),
+    }]);
   });
 
   it("fails the power barrier closed while a durable event or receipt remains pending", async () => {
