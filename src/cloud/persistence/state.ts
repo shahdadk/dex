@@ -114,8 +114,9 @@ export interface DexCloudStateDocument {
   controlPlaneOperations: ControlPlaneOperation[];
   /**
    * Materialized control-plane state plus the operation prefix it includes.
-   * The operation log remains for zero-downtime compatibility with older
-   * revisions; current revisions replay only the tail after this prefix.
+   * A bounded operation tail remains for zero-downtime handoff between
+   * snapshot-aware revisions; current revisions replay only operations added
+   * after this snapshot prefix.
    */
   controlPlaneSnapshot?: {
     appliedOperationCount: number;

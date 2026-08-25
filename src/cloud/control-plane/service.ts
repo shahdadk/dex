@@ -410,10 +410,14 @@ export class DexControlPlaneService {
   async #waitForDeviceCommand(deviceId: string, waitMs: number): Promise<void> {
     let remaining = waitMs;
     while (remaining > 0) {
+      const readStartedAt = Date.now();
       if ((await this.#repository.listPendingDeviceCommands(deviceId, 1)).length > 0) return;
+      remaining -= Math.max(0, Date.now() - readStartedAt);
+      if (remaining <= 0) return;
       const step = Math.min(this.#commandPollIntervalMs, remaining);
+      const waitStartedAt = Date.now();
       await this.#wait(step);
-      remaining -= step;
+      remaining -= Math.max(step, Date.now() - waitStartedAt);
     }
   }
 

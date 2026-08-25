@@ -145,10 +145,15 @@ function append(state: DexCloudStateDocument, operation: ControlPlaneOperation):
 function refreshSnapshot(
   state: DexCloudStateDocument,
   repository: InMemoryControlPlaneRepository,
+  maxOperationTail: number,
 ): void {
+  const snapshot = repository.snapshot();
+  if (state.controlPlaneOperations.length > maxOperationTail) {
+    state.controlPlaneOperations = state.controlPlaneOperations.slice(-maxOperationTail);
+  }
   state.controlPlaneSnapshot = {
     appliedOperationCount: state.controlPlaneOperations.length,
-    repository: repository.snapshot(),
+    repository: snapshot,
   };
 }
 
@@ -156,6 +161,7 @@ export interface DurableDexCloudRepositoryOptions {
   backend: DexCloudStateBackend;
   sendblueReconciliationRetryMs?: number;
   sendblueRetryMs?: number;
+  maxControlPlaneOperationTail?: number;
 }
 
 export interface ScheduledMonitorClaim {
@@ -165,27 +171,37 @@ export interface ScheduledMonitorClaim {
 
 /**
  * Durable adapter around the existing, already-tested control-plane state
- * machine. Persisting its operation history keeps that implementation fixed
- * while the JSONB row supplies atomicity and process-crash recovery.
+ * machine. A materialized snapshot plus bounded operation tail supplies
+ * atomicity and process-crash recovery without rewriting unbounded history.
  */
 export class DurableDexCloudRepository
 implements ControlPlaneRepository, SendblueDeliveryStore {
   readonly #backend: DexCloudStateBackend;
   readonly #sendblueReconciliationRetryMs: number;
   readonly #sendblueRetryMs: number;
+  readonly #maxControlPlaneOperationTail: number;
 
   constructor(options: DurableDexCloudRepositoryOptions) {
     const retryMs = options.sendblueReconciliationRetryMs ?? 10_000;
     const sendRetryMs = options.sendblueRetryMs ?? 10_000;
+    const maxOperationTail = options.maxControlPlaneOperationTail ?? 128;
     if (!Number.isSafeInteger(retryMs) || retryMs < 1_000 || retryMs > 60 * 60_000) {
       throw new RangeError("Sendblue reconciliation retry must be between one second and one hour");
     }
     if (!Number.isSafeInteger(sendRetryMs) || sendRetryMs < 1_000 || sendRetryMs > 60 * 60_000) {
       throw new RangeError("Sendblue retry must be between one second and one hour");
     }
+    if (
+      !Number.isSafeInteger(maxOperationTail) ||
+      maxOperationTail < 1 ||
+      maxOperationTail > 10_000
+    ) {
+      throw new RangeError("Control-plane operation tail must contain between one and 10,000 records");
+    }
     this.#backend = options.backend;
     this.#sendblueReconciliationRetryMs = retryMs;
     this.#sendblueRetryMs = sendRetryMs;
+    this.#maxControlPlaneOperationTail = maxOperationTail;
   }
 
   hasProcessedInbound(providerMessageId: string): Promise<boolean> {
@@ -222,7 +238,7 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
           notification: input.unpairedNotification,
         });
       }
-      refreshSnapshot(state, repository);
+      refreshSnapshot(state, repository, this.#maxControlPlaneOperationTail);
       return copy(result);
     });
   }
@@ -343,7 +359,7 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
       try {
         const result = await repository.commitDeviceSync(input);
         append(state, { kind: "commit_device_sync", input });
-        refreshSnapshot(state, repository);
+        refreshSnapshot(state, repository, this.#maxControlPlaneOperationTail);
         return { kind: "accepted" as const, result };
       } catch (error) {
         if (!(error instanceof InvalidTransportEventError)) throw error;
@@ -352,7 +368,7 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
           input,
           expectedInvalidEvent: { eventId: error.eventId, message: error.message },
         });
-        refreshSnapshot(state, repository);
+        refreshSnapshot(state, repository, this.#maxControlPlaneOperationTail);
         return {
           kind: "invalid_event" as const,
           eventId: error.eventId,
@@ -385,7 +401,7 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
         if (claimed.length > 0) {
           append(state, { kind: "claim_monitor_jobs", limit, claimedAt, leaseMs });
         }
-        refreshSnapshot(state, repository);
+        refreshSnapshot(state, repository, this.#maxControlPlaneOperationTail);
         return copy(claimed);
       });
     })();
@@ -396,7 +412,7 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
       const repository = await hydrate(state);
       const marked = await repository.markMonitorJobDispatched(jobId, dispatchedAt);
       if (marked) append(state, { kind: "mark_monitor_job_dispatched", jobId, dispatchedAt });
-      refreshSnapshot(state, repository);
+      refreshSnapshot(state, repository, this.#maxControlPlaneOperationTail);
       return marked;
     });
   }
@@ -406,7 +422,7 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
       const repository = await hydrate(state);
       const released = await repository.releaseMonitorJob(jobId);
       if (released) append(state, { kind: "release_monitor_job", jobId });
-      refreshSnapshot(state, repository);
+      refreshSnapshot(state, repository, this.#maxControlPlaneOperationTail);
       return released;
     });
   }
@@ -443,7 +459,7 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
     if (!hasEligibleItem) return null;
     return this.#backend.mutate(async (state) => {
       const repository = await hydrate(state);
-      refreshSnapshot(state, repository);
+      refreshSnapshot(state, repository, this.#maxControlPlaneOperationTail);
       const items = await repository.listSendblueOutbox();
       for (const item of items) {
         const current = state.sendblueDeliveries[item.id];
@@ -710,7 +726,7 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
       const repository = await hydrate(state);
       const result = await mutation(repository);
       append(state, operation);
-      refreshSnapshot(state, repository);
+      refreshSnapshot(state, repository, this.#maxControlPlaneOperationTail);
       return copy(result);
     });
   }

@@ -451,6 +451,60 @@ describe("durable outbox and monitor execution", () => {
     await backend.close();
   });
 
+  it("compacts unbounded history into a snapshot while replaying a bounded revision tail", async () => {
+    const backend = new AtomicFileStateBackend({ filePath: await stateFile() });
+    const repository = new DurableDexCloudRepository({
+      backend,
+      maxControlPlaneOperationTail: 2,
+    });
+    const notification = (id: string) => ({
+      id: `compact-outbox-${id}`,
+      dedupeKey: `compact:${id}`,
+      ownerId: "owner-1",
+      conversationId: "conversation-1",
+      toPhone: PHONE,
+      text: `Compact ${id}`,
+      createdAt: NOW_ISO,
+    });
+
+    await repository.commitUnpairedMessage("compact-1", notification("1"));
+    await repository.commitUnpairedMessage("compact-2", notification("2"));
+    await repository.commitUnpairedMessage("compact-3", notification("3"));
+    await backend.read((state) => {
+      expect(state.controlPlaneOperations).toHaveLength(2);
+      expect(state.controlPlaneSnapshot?.appliedOperationCount).toBe(2);
+      expect(state.controlPlaneSnapshot?.repository.processedInbound).toEqual([
+        "compact-1",
+        "compact-2",
+        "compact-3",
+      ]);
+    });
+
+    await backend.mutate((state) => {
+      // A snapshot-aware previous revision can append after compaction. The
+      // next revision must replay that exact tail before refreshing again.
+      state.controlPlaneOperations.push({
+        kind: "commit_unpaired_message",
+        providerMessageId: "compact-4",
+        notification: notification("4"),
+      });
+    });
+    expect(await repository.hasProcessedInbound("compact-4")).toBe(true);
+    await repository.commitUnpairedMessage("compact-5", notification("5"));
+    await backend.read((state) => {
+      expect(state.controlPlaneOperations).toHaveLength(2);
+      expect(state.controlPlaneSnapshot?.appliedOperationCount).toBe(2);
+      expect(state.controlPlaneSnapshot?.repository.processedInbound).toEqual([
+        "compact-1",
+        "compact-2",
+        "compact-3",
+        "compact-4",
+        "compact-5",
+      ]);
+    });
+    await backend.close();
+  });
+
   it("keeps idle monitor and Sendblue polling read-only", async () => {
     const file = new AtomicFileStateBackend({ filePath: await stateFile() });
     const calls = { read: 0, mutate: 0 };
