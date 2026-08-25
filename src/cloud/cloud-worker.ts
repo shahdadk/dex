@@ -195,10 +195,15 @@ export async function runCloudWorker(): Promise<void> {
     const validationPassed = failedValidation === undefined;
     const succeeded = exitCode === 0 && turnCompleted && validationPassed;
     if (succeeded) {
-      const status = await runCredentialDeniedGit(["status", "--porcelain=v1"], false);
+      // The worker's permission profile deliberately keeps .git read-only.
+      // Once untrusted task execution and validation have ended, Dex inspects
+      // local Git configuration and snapshots the changed tree through its
+      // credential-free, hook-free trusted Git boundary.
+      await assertSafeRepositoryGitConfiguration();
+      const status = await runSafeHostGit(["-C", project, "status", "--porcelain=v1"]);
       if (status.stdout.trim()) {
-        await runCredentialDeniedGit(["add", "--all"]);
-        await runCredentialDeniedGit(["commit", "-m", "dex: complete cloud continuation"]);
+        await runSafeHostGit(["-C", project, "add", "--all"]);
+        await runSafeHostGit(["-C", project, "commit", "-m", "dex: complete cloud continuation"]);
       }
     }
     const commit = (await runCredentialDeniedGit(["rev-parse", "HEAD"])).stdout.trim();
@@ -333,7 +338,7 @@ async function consumeCodexOutput(
 function buildCloudPrompt(handoff: HandoffDocument): string {
   const memory = handoff.memories.map((item) => `- [${item.id}] ${item.title}: ${(item.facts ?? []).join("; ") || item.narrative || ""}`).join("\n");
   const failures = handoff.failedApproaches.map((item) => `- DO NOT REPEAT: ${item.approach}. WHY: ${item.reason}`).join("\n");
-  return `You are a fresh Codex coding worker continuing a durable Dex task.\n\nREPOSITORY:\n${project}\n\nTASK:\n${handoff.goal}\n\nCONSTRAINTS:\n${handoff.constraints.map((value) => `- ${value}`).join("\n")}\n\nACCEPTANCE CRITERIA:\n${handoff.acceptanceCriteria.map((value) => `- ${value}`).join("\n")}\n\nINHERITED MEMORY:\n${memory}\n\nFAILED APPROACHES:\n${failures}\n\nComplete the implementation in the repository above, run appropriate validation, and do not push, deploy, merge, or repeat a failed approach without new evidence.`;
+  return `You are a fresh Codex coding worker continuing a durable Dex task.\n\nREPOSITORY:\n${project}\n\nTASK:\n${handoff.goal}\n\nCONSTRAINTS:\n${handoff.constraints.map((value) => `- ${value}`).join("\n")}\n\nACCEPTANCE CRITERIA:\n${handoff.acceptanceCriteria.map((value) => `- ${value}`).join("\n")}\n\nINHERITED MEMORY:\n${memory}\n\nFAILED APPROACHES:\n${failures}\n\nComplete the implementation in the repository above and run appropriate validation. Edit working-tree files directly. Do not run git add, git commit, git checkout, git reset, git clean, or any other command that mutates Git metadata; Dex will snapshot the working tree after validation. Read-only Git commands are allowed. Do not push, deploy, merge, or repeat a failed approach without new evidence.`;
 }
 
 async function run(
@@ -425,6 +430,7 @@ const SAFE_GIT_CONFIGURATION = [
   "-c", "core.hooksPath=/dev/null",
   "-c", "core.fsmonitor=false",
   "-c", "core.pager=cat",
+  "-c", "core.attributesFile=/dev/null",
   "-c", "commit.gpgsign=false",
   "-c", "tag.gpgsign=false",
   "-c", "credential.helper=",
@@ -433,7 +439,9 @@ const SAFE_GIT_CONFIGURATION = [
   "-c", "user.email=dex@localhost",
 ] as const;
 
-function safeGitEnvironment(): NodeJS.ProcessEnv {
+const UNSAFE_LOCAL_GIT_CONFIG = /^(?:include(?:if\..+)?\.path|core\.(?:hookspath|fsmonitor|worktree|sshcommand|pager|editor|gitproxy)|filter\..+|credential\..+|diff\.external|diff\..+\.command|difftool\..+\.cmd|merge\..+\.driver|mergetool\..+\.cmd|gpg\..+|user\.signingkey|commit\.gpgsign|tag\.gpgsign|pager\..+|sequence\.editor)$/i;
+
+function safeGitEnvironment(readLocalConfiguration = false): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {
     PATH: process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin",
     LANG: process.env.LANG ?? "C",
@@ -451,8 +459,8 @@ function safeGitEnvironment(): NodeJS.ProcessEnv {
     GIT_EDITOR: "/usr/bin/true",
     GIT_SEQUENCE_EDITOR: "/usr/bin/true",
     GIT_NO_REPLACE_OBJECTS: "1",
-    GIT_CONFIG: "/dev/null",
   };
+  if (!readLocalConfiguration) environment.GIT_CONFIG = "/dev/null";
   if (process.env.TMPDIR) environment.TMPDIR = process.env.TMPDIR;
   return environment;
 }
@@ -469,6 +477,27 @@ async function runSafeHostGit(
     reject,
     safeGitEnvironment(),
   );
+}
+
+async function assertSafeRepositoryGitConfiguration(): Promise<void> {
+  const result = await run(
+    "/usr/bin/git",
+    ["-C", project, "config", "--local", "--no-includes", "--name-only", "--null", "--list"],
+    project,
+    false,
+    safeGitEnvironment(true),
+  );
+  if (result.exitCode !== 0) {
+    throw new Error("Repository Git configuration could not be inspected safely");
+  }
+  const unsafe = result.stdout
+    .split("\0")
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .find((name) => UNSAFE_LOCAL_GIT_CONFIG.test(name));
+  if (unsafe) {
+    throw new Error(`Repository Git configuration is unsafe for cloud result snapshotting: ${unsafe}`);
+  }
 }
 
 async function runCredentialDeniedGit(
@@ -661,6 +690,7 @@ function codexEnvironment(home: string): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {
     ...nonSecretEnvironment(),
     CODEX_HOME: home,
+    GIT_OPTIONAL_LOCKS: "0",
     NO_COLOR: "1",
   };
   delete environment.CODEX_API_KEY;
@@ -1131,6 +1161,7 @@ enabled = ${networkEnabled ? "true" : "false"}
 
 [shell_environment_policy]
 inherit = "core"
+set = { GIT_OPTIONAL_LOCKS = "0" }
 
 [shell_environment_policy.filters]
 CODEX_HOME = "exclude"

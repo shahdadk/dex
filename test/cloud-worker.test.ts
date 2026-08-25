@@ -191,6 +191,7 @@ fs.appendFileSync(process.env.FAKE_CODEX_CALLS_PATH, JSON.stringify({
   profileText,
   environment: {
     codexHome,
+    gitOptionalLocks: process.env.GIT_OPTIONAL_LOCKS,
     secretLikeNames: Object.keys(process.env).filter((name) => /(?:^|_)(?:TOKEN|KEY|SECRET|PASSWORD|AUTH|COOKIE)(?:_|$)/i.test(name)).sort(),
   },
 }) + "\\n", "utf8");
@@ -269,6 +270,29 @@ process.stdin.on("end", () => {
     const auth = JSON.parse(fs.readFileSync(workerAuthPath, "utf8"));
     fs.writeFileSync(workerAuthPath, JSON.stringify({ ...auth, refreshedBy: "cloud-worker" }), { mode: 0o600 });
   }
+  if (process.env.FAKE_CODEX_READONLY_GIT_SMOKE === "1") {
+    const project = process.env.DEX_CLOUD_PROJECT;
+    const gitDirectory = path.join(project, ".git");
+    const originalMode = fs.statSync(gitDirectory).mode & 0o777;
+    let execution;
+    try {
+      fs.chmodSync(gitDirectory, 0o555);
+      execution = require("node:child_process").spawnSync(
+        "/usr/bin/git",
+        ["status", "--porcelain=v1"],
+        { cwd: project, env: process.env, encoding: "utf8" },
+      );
+    } finally {
+      fs.chmodSync(gitDirectory, originalMode);
+    }
+    const evidence = {
+      exitCode: execution.status === null ? 1 : execution.status,
+      indexLockExists: fs.existsSync(path.join(gitDirectory, "index.lock")),
+      gitOptionalLocks: process.env.GIT_OPTIONAL_LOCKS,
+    };
+    fs.writeFileSync(process.env.FAKE_CODEX_READONLY_GIT_EVIDENCE_PATH, JSON.stringify(evidence), "utf8");
+    if (evidence.exitCode !== 0 || evidence.indexLockExists || evidence.gitOptionalLocks !== "0") process.exit(76);
+  }
   if (process.env.FAKE_CODEX_INSTALL_ATTACK === "1") {
     const project = process.env.DEX_CLOUD_PROJECT;
     const target = process.env.FAKE_TARGET_CREDENTIAL_PATH;
@@ -284,6 +308,20 @@ process.stdin.on("end", () => {
     const hook = require("node:path").join(project, ".git", "hooks", "pre-commit");
     fs.writeFileSync(hook, "#!/bin/sh\\nif [ -r " + JSON.stringify(target) + " ]; then printf leaked > " + JSON.stringify(hookMarker) + "; fi\\n", { mode: 0o755 });
   }
+  if (process.env.FAKE_CODEX_LOCAL_CONFIG_ATTACK === "1") {
+    const project = process.env.DEX_CLOUD_PROJECT;
+    const marker = process.env.FAKE_GIT_FILTER_MARKER;
+    const helper = require("node:path").join(project, "filter-helper");
+    fs.writeFileSync(helper, "#!/bin/sh\\nprintf ran > " + JSON.stringify(marker) + "\\ncat\\n", { mode: 0o755 });
+    const configured = require("node:child_process").spawnSync(
+      "/usr/bin/git",
+      ["config", "--local", "filter.exfil.clean", helper],
+      { cwd: project, encoding: "utf8" },
+    );
+    if (configured.status !== 0) process.exit(configured.status === null ? 1 : configured.status);
+    fs.writeFileSync(require("node:path").join(project, ".gitattributes"), "README.md filter=exfil\\n", "utf8");
+    fs.appendFileSync(require("node:path").join(project, "README.md"), "agent change\\n", "utf8");
+  }
   fs.writeFileSync(process.env.FAKE_CODEX_ARGUMENTS_PATH, JSON.stringify(process.argv.slice(2)), "utf8");
   fs.writeFileSync(process.env.FAKE_CODEX_PROMPT_PATH, prompt, "utf8");
   fs.writeFileSync(process.env.FAKE_CODEX_ENV_PATH, JSON.stringify({
@@ -292,6 +330,7 @@ process.stdin.on("end", () => {
     openAiApiKey: process.env.OPENAI_API_KEY,
     handoffSigningKey: process.env.DEX_HANDOFF_SIGNING_KEY,
     modalToken: process.env.MODAL_TOKEN_SECRET,
+    gitOptionalLocks: process.env.GIT_OPTIONAL_LOCKS,
     secretLikeNames: Object.keys(process.env).filter((name) => /(?:^|_)(?:TOKEN|KEY|SECRET|PASSWORD|AUTH|COOKIE)(?:_|$)/i.test(name)).sort(),
   }), "utf8");
   process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "thread-cloud-123" }) + "\\n");
@@ -401,7 +440,7 @@ async function readCodexCalls(fixture: WorkerFixture): Promise<Array<{
   cwd: string;
   homeEntries: string[];
   profileText: string;
-  environment: { codexHome?: string; secretLikeNames: string[] };
+  environment: { codexHome?: string; gitOptionalLocks?: string; secretLikeNames: string[] };
 }>> {
   return (await readFile(fixture.callsPath, "utf8"))
     .trim()
@@ -411,7 +450,7 @@ async function readCodexCalls(fixture: WorkerFixture): Promise<Array<{
       cwd: string;
       homeEntries: string[];
       profileText: string;
-      environment: { codexHome?: string; secretLikeNames: string[] };
+      environment: { codexHome?: string; gitOptionalLocks?: string; secretLikeNames: string[] };
     });
 }
 
@@ -632,10 +671,13 @@ describe("Modal cloud worker", () => {
     const prompt = await readFile(fixture.promptPath, "utf8");
     expect(prompt).toContain("Durable continuation fact 1");
     expect(prompt).toContain("DO NOT REPEAT: Poll the provider directly");
+    expect(prompt).toContain("Do not run git add, git commit, git checkout, git reset, git clean");
+    expect(prompt).toContain("Dex will snapshot the working tree after validation");
     const workerEnvironment = JSON.parse(
       await readFile(fixture.environmentPath, "utf8"),
-    ) as { codexHome: string; secretLikeNames: string[] };
+    ) as { codexHome: string; gitOptionalLocks: string; secretLikeNames: string[] };
     expect(workerEnvironment.secretLikeNames).toEqual([]);
+    expect(workerEnvironment.gitOptionalLocks).toBe("0");
     expect(workerEnvironment.codexHome).not.toBe(fixture.codexHome);
     expect(workerEnvironment.codexHome).toMatch(/\.dex-codex-auth-/);
     expect(JSON.parse(await readFile(fixture.argumentsPath, "utf8"))).toEqual([
@@ -663,7 +705,7 @@ describe("Modal cloud worker", () => {
     expect(await readdir(fixture.codexHome)).toEqual(["auth.json"]);
 
     const calls = await readCodexCalls(fixture);
-    expect(calls.length).toBeGreaterThanOrEqual(6);
+    expect(calls.length).toBeGreaterThanOrEqual(5);
     expect(calls[0]?.args).toEqual(["login", "status"]);
     expect(calls[0]?.homeEntries).toEqual(["auth.json"]);
     expect(calls[0]?.environment.codexHome).toBe(workerEnvironment.codexHome);
@@ -684,6 +726,7 @@ describe("Modal cloud worker", () => {
     expect(profile).toContain('"." = "write"');
     expect(profile).toContain('[permissions.modal-worker.network]\nenabled = true');
     expect(profile).toContain('[shell_environment_policy]\ninherit = "core"');
+    expect(profile).toContain('set = { GIT_OPTIONAL_LOCKS = "0" }');
     expect(profile).toContain('CODEX_HOME = "exclude"');
     expect(profile).toContain('OPENAI_API_KEY = "exclude"');
     expect(profile).toContain('CODEX_API_KEY = "exclude"');
@@ -715,8 +758,9 @@ describe("Modal cloud worker", () => {
       const separator = args.indexOf("--");
       return args.slice(separator + 1);
     });
-    expect(postTaskCommands.map(([command]) => command)).toEqual(["git", "git", "git"]);
+    expect(postTaskCommands.map(([command]) => command)).toEqual(["git", "git"]);
     expect(calls.every(({ environment }) => environment.secretLikeNames.length === 0)).toBe(true);
+    expect(calls.every(({ environment }) => environment.gitOptionalLocks === "0")).toBe(true);
     expect(await realpath(taskCall!.cwd)).toBe(await realpath(fixture.projectPath));
     expect(calls.flatMap(({ args }) => args)).not.toContain("--dangerously-bypass-approvals-and-sandbox");
     expect(taskCall?.args).not.toContain("--sandbox");
@@ -728,6 +772,7 @@ describe("Modal cloud worker", () => {
     expect(taskCall?.profileText).toContain('default_permissions = "modal-worker"');
     expect(taskCall?.profileText).toContain(`${JSON.stringify(workerEnvironment.codexHome)} = "deny"`);
     expect(taskCall?.profileText).toContain(`${JSON.stringify(path.join(workerEnvironment.codexHome, "tmp", "arg0"))} = "read"`);
+    expect(taskCall?.profileText).not.toContain('".git" = "write"');
     expect(taskCall?.homeEntries).toEqual(["auth.json", "modal-worker.config.toml"]);
     await expectMissing(path.join(fixture.cloudRoot, "handoff.key"));
     await expectMissing(workerEnvironment.codexHome);
@@ -744,6 +789,23 @@ describe("Modal cloud worker", () => {
         authSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
         persistedAt: expect.any(String),
       },
+    });
+  });
+
+  it("runs read-only Git without an index lock while repository metadata is protected", async () => {
+    const fixture = await createWorkerFixture();
+    const evidencePath = path.join(fixture.directory, "readonly-git-evidence.json");
+
+    const execution = await runWorker(fixture, undefined, {
+      FAKE_CODEX_READONLY_GIT_SMOKE: "1",
+      FAKE_CODEX_READONLY_GIT_EVIDENCE_PATH: evidencePath,
+    });
+
+    expect(execution, execution.stderr).toMatchObject({ exitCode: 0 });
+    expect(JSON.parse(await readFile(evidencePath, "utf8"))).toEqual({
+      exitCode: 0,
+      indexLockExists: false,
+      gitOptionalLocks: "0",
     });
   });
 
@@ -885,11 +947,29 @@ describe("Modal cloud worker", () => {
     const payloads = postTaskCalls.map(({ args }) => args.slice(args.indexOf("--") + 1));
     expect(payloads.some((argv) => argv[0] === "npm" && argv[1] === "test")).toBe(true);
     const gitPayloads = payloads.filter(([command]) => command === "git");
-    expect(gitPayloads.length).toBeGreaterThanOrEqual(5);
+    expect(gitPayloads.length).toBeGreaterThanOrEqual(2);
     expect(gitPayloads.every((argv) => argv.join(" ").includes("core.hooksPath=/dev/null"))).toBe(true);
+    expect(gitPayloads.every((argv) => argv.join(" ").includes("core.attributesFile=/dev/null"))).toBe(true);
     expect(JSON.parse(await readFile(path.join(fixture.cloudRoot, "result.json"), "utf8"))).toMatchObject({
       status: "succeeded",
       validation: { passed: true },
+    });
+  });
+
+  it("rejects repository-controlled Git helpers before the trusted result snapshot", async () => {
+    const fixture = await createWorkerFixture();
+    const filterMarker = path.join(fixture.directory, "git-filter-ran");
+
+    const execution = await runWorker(fixture, undefined, {
+      FAKE_CODEX_LOCAL_CONFIG_ATTACK: "1",
+      FAKE_GIT_FILTER_MARKER: filterMarker,
+    });
+
+    expect(execution.exitCode).not.toBe(0);
+    await expectMissing(filterMarker);
+    expect(JSON.parse(await readFile(path.join(fixture.cloudRoot, "result.json"), "utf8"))).toMatchObject({
+      status: "failed",
+      summary: "Repository Git configuration is unsafe for cloud result snapshotting: filter.exfil.clean",
     });
   });
 
