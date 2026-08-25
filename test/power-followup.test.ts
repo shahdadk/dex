@@ -555,7 +555,7 @@ describe("low-battery conversation follow-up", () => {
     );
   });
 
-  it("does not resolve a battery prompt from another conversation", async () => {
+  it("does not resolve or reroute a battery answer from another conversation", async () => {
     const { directory, store, events } = await fixture();
     await addTask(store, "conversation-bound");
     await store.updateState((state) => {
@@ -568,10 +568,11 @@ describe("low-battery conversation follow-up", () => {
         expiresAt: new Date(Date.now() + 60_000).toISOString(),
       });
     });
-    const route = vi.fn(async () => ({ actions: [{ type: "STATUS" as const }], source: "deterministic" as const }));
-    const handle = vi.fn(async () => "normal routed reply");
+    const route = vi.fn(async () => { throw new Error("bare yes must stay contextual"); });
+    const handle = vi.fn(async () => "unexpected routed reply");
+    const notify = vi.fn(async () => undefined);
     const runtime = new DexDaemonRuntime({
-      bridge: { notify: vi.fn(async () => undefined), receipt: vi.fn(async () => undefined), syncOnce: vi.fn(async () => []) } as unknown as DexCloudBridge,
+      bridge: { notify, receipt: vi.fn(async () => undefined), syncOnce: vi.fn(async () => []) } as unknown as DexCloudBridge,
       router: { route } as unknown as MessageRouter,
       orchestrator: { handle } as unknown as DexOrchestrator,
       store,
@@ -583,9 +584,46 @@ describe("low-battery conversation follow-up", () => {
 
     await runtime.handleCommand(messageCommand("yes", "chat-2"));
 
-    expect(route).toHaveBeenCalledWith("yes");
-    expect(handle).toHaveBeenCalledWith([{ type: "STATUS" }], expect.objectContaining({ conversationId: "chat-2" }));
+    expect(route).not.toHaveBeenCalled();
+    expect(handle).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledWith(
+      "chat-2",
+      "nothing is waiting for a yes or no right now",
+      false,
+    );
     expect((await store.read()).pendingConversationPrompts).toHaveLength(1);
+  });
+
+  it.each(["yes", "no"])("never turns a bare %s into an engineering task", async (answer) => {
+    const { directory, store, events } = await fixture();
+    const route = vi.fn(async () => { throw new Error("bare confirmation must not be routed"); });
+    const handle = vi.fn(async () => "unexpected routed reply");
+    const notify = vi.fn(async () => undefined);
+    const runtime = new DexDaemonRuntime({
+      bridge: {
+        notify,
+        receipt: vi.fn(async () => undefined),
+        syncOnce: vi.fn(async () => []),
+      } as unknown as DexCloudBridge,
+      router: { route } as unknown as MessageRouter,
+      orchestrator: { handle } as unknown as DexOrchestrator,
+      store,
+      events,
+      battery: { start: vi.fn(), stop: vi.fn() } as unknown as BatteryMonitor,
+      power: new DexPowerController({ store, events, notify: async () => undefined }),
+      codexAuthLeasePath: path.join(directory, "lease"),
+    });
+
+    await runtime.handleCommand(messageCommand(answer));
+
+    expect(route).not.toHaveBeenCalled();
+    expect(handle).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledWith(
+      "chat-1",
+      "nothing is waiting for a yes or no right now",
+      false,
+    );
+    expect(Object.values((await store.read()).tasks)).toEqual([]);
   });
 
   it("expires a prompt without moving its captured tasks", async () => {

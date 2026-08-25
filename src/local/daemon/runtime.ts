@@ -1120,7 +1120,7 @@ export class DexDaemonRuntime {
     const prompt = state.pendingConversationPrompts
       .filter((candidate) => candidate.conversationId === context.conversationId)
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
-    if (!prompt) return undefined;
+    if (!prompt) return "nothing is waiting for a yes or no right now";
     const removePrompt = async (): Promise<void> => {
       await this.#store.updateState((draft) => {
         draft.pendingConversationPrompts = draft.pendingConversationPrompts.filter(
