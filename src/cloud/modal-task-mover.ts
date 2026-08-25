@@ -1596,7 +1596,9 @@ function cloudCompletionEffectsComplete(value: unknown, taskId: string): boolean
       (typeof candidate.operationToken !== "string" ||
         !/^[a-f0-9]{64}$/.test(candidate.operationToken))) ||
     (candidate.leaseReleaseEvidence !== undefined &&
-      !isCodexAuthLeaseReleaseEvidence(candidate.leaseReleaseEvidence))
+      (!isCodexAuthLeaseReleaseEvidence(candidate.leaseReleaseEvidence) ||
+        candidate.operationToken === undefined ||
+        candidate.leaseReleaseEvidence.operationToken !== candidate.operationToken))
   ) {
     return false;
   }
@@ -1647,6 +1649,15 @@ function isCodexAuthLeaseReleaseEvidence(
   }
   if (candidate.kind === "terminal-poll") {
     return typeof candidate.exitCode === "number" && Number.isInteger(candidate.exitCode);
+  }
+  if (candidate.kind === "auth-volume-sync") {
+    return (
+      typeof candidate.handoffSha256 === "string" &&
+      /^[a-f0-9]{64}$/.test(candidate.handoffSha256) &&
+      typeof candidate.authSha256 === "string" &&
+      /^[a-f0-9]{64}$/.test(candidate.authSha256) &&
+      isIsoTimestamp(candidate.persistedAt)
+    );
   }
   return candidate.kind === "terminate-wait" && candidate.volumePersisted === true;
 }

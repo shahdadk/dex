@@ -139,6 +139,15 @@ async function createMoverFixture(): Promise<MoverFixture> {
         completion: { taskId: "task-modal" },
         finalStatus: "succeeded",
         summary: "previous cloud handoff completed",
+        operationToken: "a".repeat(64),
+        leaseReleaseEvidence: {
+          kind: "auth-volume-sync",
+          sandboxId: "sb-previous",
+          handoffSha256: "b".repeat(64),
+          authSha256: "c".repeat(64),
+          persistedAt: now,
+          operationToken: "a".repeat(64),
+        },
         eventId: "event-previous-cloud-completion",
         phase: "complete",
         createdAt: now,
@@ -429,6 +438,34 @@ describe("ModalTaskMover", () => {
       };
       effects.phase = "pending";
       effects.effects.receiptAccepted = false;
+    });
+    const before = await fixture.store.read();
+    const harness = createModalHarness(() => ({}));
+    const mover = new ModalTaskMover({
+      store: fixture.store,
+      events: fixture.events,
+      tasks: fixture.tasks,
+      handoffsRoot: fixture.handoffsRoot,
+      workerScriptPath: fixture.workerScriptPath,
+      signingKey: SIGNING_KEY,
+      modal: harness.modal,
+      scheduleMonitor: async () => undefined,
+    });
+
+    await expect(mover.moveToCloud(fixture.task)).rejects.toThrow(
+      "still has unfinished cloud completion effects",
+    );
+    expect(harness.calls).not.toContain("create");
+    expect(await fixture.store.read()).toEqual(before);
+  });
+
+  it("rejects cloud completion evidence from a different Modal operation", async () => {
+    const fixture = await createMoverFixture();
+    await fixture.store.updateState((state) => {
+      const effects = state.tasks[fixture.task.id]!.metadata.cloudCompletionEffects as {
+        leaseReleaseEvidence: { operationToken: string };
+      };
+      effects.leaseReleaseEvidence.operationToken = "d".repeat(64);
     });
     const before = await fixture.store.read();
     const harness = createModalHarness(() => ({}));
