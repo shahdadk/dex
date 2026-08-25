@@ -375,15 +375,20 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
     claimedAt: string,
     leaseMs: number,
   ): Promise<MonitorJobRecord[]> {
-    return this.#backend.mutate(async (state) => {
-      const repository = await hydrate(state);
-      const claimed = await repository.claimPendingMonitorJobs(limit, claimedAt, leaseMs);
-      if (claimed.length > 0) {
-        append(state, { kind: "claim_monitor_jobs", limit, claimedAt, leaseMs });
-      }
-      refreshSnapshot(state, repository);
-      return copy(claimed);
-    });
+    return (async () => {
+      const due = await this.#read((repository) =>
+        repository.claimPendingMonitorJobs(limit, claimedAt, leaseMs));
+      if (due.length === 0) return [];
+      return this.#backend.mutate(async (state) => {
+        const repository = await hydrate(state);
+        const claimed = await repository.claimPendingMonitorJobs(limit, claimedAt, leaseMs);
+        if (claimed.length > 0) {
+          append(state, { kind: "claim_monitor_jobs", limit, claimedAt, leaseMs });
+        }
+        refreshSnapshot(state, repository);
+        return copy(claimed);
+      });
+    })();
   }
 
   markMonitorJobDispatched(jobId: string, dispatchedAt: string): Promise<boolean> {
@@ -422,6 +427,20 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
     if (!Number.isSafeInteger(input.leaseMs) || input.leaseMs < 1_000) {
       throw new RangeError("Sendblue claim lease is invalid");
     }
+    const hasEligibleItem = await this.#backend.read(async (state) => {
+      const repository = await hydrate(state);
+      const items = await repository.listSendblueOutbox();
+      return items.some((item) => {
+        const current = state.sendblueDeliveries[item.id];
+        return current?.state !== "delivered" &&
+          current?.state !== "rejected" &&
+          (current?.claimExpiresAt === undefined ||
+            Date.parse(current.claimExpiresAt) <= claimedAtMs) &&
+          (current?.nextAttemptAt === undefined ||
+            Date.parse(current.nextAttemptAt) <= claimedAtMs);
+      });
+    });
+    if (!hasEligibleItem) return null;
     return this.#backend.mutate(async (state) => {
       const repository = await hydrate(state);
       refreshSnapshot(state, repository);

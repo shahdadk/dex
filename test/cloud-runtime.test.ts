@@ -451,6 +451,33 @@ describe("durable outbox and monitor execution", () => {
     await backend.close();
   });
 
+  it("keeps idle monitor and Sendblue polling read-only", async () => {
+    const file = new AtomicFileStateBackend({ filePath: await stateFile() });
+    const calls = { read: 0, mutate: 0 };
+    const backend: DexCloudStateBackend = {
+      ready: () => file.ready(),
+      read: (reader) => {
+        calls.read += 1;
+        return file.read(reader);
+      },
+      mutate: (mutation) => {
+        calls.mutate += 1;
+        return file.mutate(mutation);
+      },
+      close: () => file.close(),
+    };
+    const repository = new DurableDexCloudRepository({ backend });
+
+    await expect(repository.claimPendingMonitorJobs(25, NOW_ISO, 30_000)).resolves.toEqual([]);
+    await expect(repository.claimNext({
+      workerId: "idle-worker",
+      claimedAt: NOW_ISO,
+      leaseMs: 30_000,
+    })).resolves.toBeNull();
+    expect(calls).toEqual({ read: 2, mutate: 0 });
+    await backend.close();
+  });
+
   it("replays rejected device events as sequence-only history across acceptance-rule changes", async () => {
     const filePath = await stateFile();
     const firstBackend = new AtomicFileStateBackend({ filePath });
