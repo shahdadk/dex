@@ -9,6 +9,8 @@ import {
   type DeviceRecord,
   type DeviceSyncCommitInput,
   type DeviceSyncCommitResult,
+  type EngineeringInboundCommitInput,
+  type EngineeringInboundCommitResult,
   type InboundCommitResult,
   type ModalMonitorRegistration,
   type MonitorJobRecord,
@@ -125,8 +127,12 @@ async function applyOperation(
 }
 
 async function hydrate(state: DexCloudStateDocument): Promise<InMemoryControlPlaneRepository> {
-  const repository = new InMemoryControlPlaneRepository();
-  for (const operation of state.controlPlaneOperations) {
+  const snapshot = state.controlPlaneSnapshot;
+  const repository = snapshot === undefined
+    ? new InMemoryControlPlaneRepository()
+    : InMemoryControlPlaneRepository.fromSnapshot(snapshot.repository);
+  const start = snapshot?.appliedOperationCount ?? 0;
+  for (const operation of state.controlPlaneOperations.slice(start)) {
     await applyOperation(repository, operation);
   }
   return repository;
@@ -134,6 +140,16 @@ async function hydrate(state: DexCloudStateDocument): Promise<InMemoryControlPla
 
 function append(state: DexCloudStateDocument, operation: ControlPlaneOperation): void {
   state.controlPlaneOperations.push(copy(operation));
+}
+
+function refreshSnapshot(
+  state: DexCloudStateDocument,
+  repository: InMemoryControlPlaneRepository,
+): void {
+  state.controlPlaneSnapshot = {
+    appliedOperationCount: state.controlPlaneOperations.length,
+    repository: repository.snapshot(),
+  };
 }
 
 export interface DurableDexCloudRepositoryOptions {
@@ -174,6 +190,41 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
 
   hasProcessedInbound(providerMessageId: string): Promise<boolean> {
     return this.#read((repository) => repository.hasProcessedInbound(providerMessageId));
+  }
+
+  commitEngineeringInbound(
+    input: EngineeringInboundCommitInput,
+  ): Promise<EngineeringInboundCommitResult> {
+    return this.#backend.mutate(async (state) => {
+      const repository = await hydrate(state);
+      let created: ReturnType<EngineeringInboundCommitInput["createForDevice"]> | undefined;
+      const result = await repository.commitEngineeringInbound({
+        ...input,
+        createForDevice: (device) => {
+          created = input.createForDevice(device);
+          return created;
+        },
+      });
+      if (result.kind === "accepted") {
+        if (created === undefined) {
+          throw new RepositoryConflictError("Accepted engineering ingress has no task records");
+        }
+        append(state, {
+          kind: "commit_engineering_message",
+          providerMessageId: input.providerMessageId,
+          task: created.task,
+          command: created.command,
+        });
+      } else if (result.kind === "unpaired") {
+        append(state, {
+          kind: "commit_unpaired_message",
+          providerMessageId: input.providerMessageId,
+          notification: input.unpairedNotification,
+        });
+      }
+      refreshSnapshot(state, repository);
+      return copy(result);
+    });
   }
 
   commitPairingChallenge(
@@ -292,6 +343,7 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
       try {
         const result = await repository.commitDeviceSync(input);
         append(state, { kind: "commit_device_sync", input });
+        refreshSnapshot(state, repository);
         return { kind: "accepted" as const, result };
       } catch (error) {
         if (!(error instanceof InvalidTransportEventError)) throw error;
@@ -300,6 +352,7 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
           input,
           expectedInvalidEvent: { eventId: error.eventId, message: error.message },
         });
+        refreshSnapshot(state, repository);
         return {
           kind: "invalid_event" as const,
           eventId: error.eventId,
@@ -322,24 +375,35 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
     claimedAt: string,
     leaseMs: number,
   ): Promise<MonitorJobRecord[]> {
-    return this.#mutate(
-      { kind: "claim_monitor_jobs", limit, claimedAt, leaseMs },
-      (repository) => repository.claimPendingMonitorJobs(limit, claimedAt, leaseMs),
-    );
+    return this.#backend.mutate(async (state) => {
+      const repository = await hydrate(state);
+      const claimed = await repository.claimPendingMonitorJobs(limit, claimedAt, leaseMs);
+      if (claimed.length > 0) {
+        append(state, { kind: "claim_monitor_jobs", limit, claimedAt, leaseMs });
+      }
+      refreshSnapshot(state, repository);
+      return copy(claimed);
+    });
   }
 
   markMonitorJobDispatched(jobId: string, dispatchedAt: string): Promise<boolean> {
-    return this.#mutate(
-      { kind: "mark_monitor_job_dispatched", jobId, dispatchedAt },
-      (repository) => repository.markMonitorJobDispatched(jobId, dispatchedAt),
-    );
+    return this.#backend.mutate(async (state) => {
+      const repository = await hydrate(state);
+      const marked = await repository.markMonitorJobDispatched(jobId, dispatchedAt);
+      if (marked) append(state, { kind: "mark_monitor_job_dispatched", jobId, dispatchedAt });
+      refreshSnapshot(state, repository);
+      return marked;
+    });
   }
 
   releaseMonitorJob(jobId: string): Promise<boolean> {
-    return this.#mutate(
-      { kind: "release_monitor_job", jobId },
-      (repository) => repository.releaseMonitorJob(jobId),
-    );
+    return this.#backend.mutate(async (state) => {
+      const repository = await hydrate(state);
+      const released = await repository.releaseMonitorJob(jobId);
+      if (released) append(state, { kind: "release_monitor_job", jobId });
+      refreshSnapshot(state, repository);
+      return released;
+    });
   }
 
   listPendingDeviceCommands(
@@ -360,6 +424,7 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
     }
     return this.#backend.mutate(async (state) => {
       const repository = await hydrate(state);
+      refreshSnapshot(state, repository);
       const items = await repository.listSendblueOutbox();
       for (const item of items) {
         const current = state.sendblueDeliveries[item.id];
@@ -623,8 +688,10 @@ implements ControlPlaneRepository, SendblueDeliveryStore {
     mutation: (repository: InMemoryControlPlaneRepository) => Promise<T>,
   ): Promise<T> {
     return this.#backend.mutate(async (state) => {
-      const result = await mutation(await hydrate(state));
+      const repository = await hydrate(state);
+      const result = await mutation(repository);
       append(state, operation);
+      refreshSnapshot(state, repository);
       return copy(result);
     });
   }

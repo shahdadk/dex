@@ -157,9 +157,6 @@ export class DexControlPlaneService {
   ): Promise<SendblueWebhookOutcome> {
     this.verifySendblueRequest(headers);
     const message = parseSendblueInboundWebhook(input);
-    if (await this.#repository.hasProcessedInbound(message.message_handle)) {
-      return { kind: "duplicate", providerMessageId: message.message_handle };
-    }
     const providerConversationId = message.group_id?.trim();
     const association = await this.#associationVerifier.verify({
       provider: "sendblue",
@@ -175,6 +172,9 @@ export class DexControlPlaneService {
     const now = this.#now();
 
     if (parsed.kind === "pair") {
+      if (await this.#repository.hasProcessedInbound(message.message_handle)) {
+        return { kind: "duplicate", providerMessageId: message.message_handle };
+      }
       if (parsed.setupCode === undefined) {
         const notification: SendblueOutboxRecord = {
           id: deterministicControlPlaneId("sendblue_out", `pair-help:${message.message_handle}`),
@@ -231,12 +231,11 @@ export class DexControlPlaneService {
       };
     }
 
-    const device = await this.#repository.findDeviceByAssociation(
-      association.ownerId,
-      association.conversationId,
-    );
-    if (!device) {
-      const notification: SendblueOutboxRecord = {
+    const committed = await this.#repository.commitEngineeringInbound({
+      providerMessageId: message.message_handle,
+      ownerId: association.ownerId,
+      conversationId: association.conversationId,
+      unpairedNotification: {
         id: deterministicControlPlaneId("sendblue_out", `unpaired:${message.message_handle}`),
         dedupeKey: `sendblue:unpaired:${message.message_handle}`,
         ownerId: association.ownerId,
@@ -244,36 +243,29 @@ export class DexControlPlaneService {
         toPhone: association.phoneE164,
         text: "Dex needs a paired Mac before it can accept engineering work. Run dex setup to begin.",
         createdAt: iso(now),
-      };
-      const committed = await this.#repository.commitUnpairedMessage(
-        message.message_handle,
-        notification,
-      );
-      return committed.accepted
-        ? { kind: "pairing_required", providerMessageId: message.message_handle }
-        : { kind: "duplicate", providerMessageId: message.message_handle };
-    }
-
-    const created = createEngineeringTaskAndCommand({
-      message,
-      text: parsed.text,
-      association,
-      device,
-      signingKey: this.#signingKey,
+      },
+      createForDevice: (device) => {
+        const created = createEngineeringTaskAndCommand({
+          message,
+          text: parsed.text,
+          association,
+          device,
+          signingKey: this.#signingKey,
+        });
+        return { task: created.task, command: created.outbox };
+      },
     });
-    const committed = await this.#repository.commitEngineeringMessage(
-      message.message_handle,
-      created.task,
-      created.outbox,
-    );
-    if (!committed.accepted) {
+    if (committed.kind === "duplicate") {
       return { kind: "duplicate", providerMessageId: message.message_handle };
+    }
+    if (committed.kind === "unpaired") {
+      return { kind: "pairing_required", providerMessageId: message.message_handle };
     }
     return {
       kind: "engineering_command",
       providerMessageId: message.message_handle,
-      taskId: created.task.id,
-      commandId: created.outbox.command.id,
+      taskId: committed.taskId,
+      commandId: committed.commandId,
     };
   }
 

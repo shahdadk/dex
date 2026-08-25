@@ -7,6 +7,7 @@ import type {
   PairingConsumeInput,
   SendblueOutboxRecord,
 } from "../control-plane/index.js";
+import type { ControlPlaneRepositorySnapshot } from "../control-plane/index.js";
 import type {
   SendblueProviderErrorCode,
   SendblueProviderStatus,
@@ -111,6 +112,15 @@ export interface MonitorEffectState {
 export interface DexCloudStateDocument {
   version: 1;
   controlPlaneOperations: ControlPlaneOperation[];
+  /**
+   * Materialized control-plane state plus the operation prefix it includes.
+   * The operation log remains for zero-downtime compatibility with older
+   * revisions; current revisions replay only the tail after this prefix.
+   */
+  controlPlaneSnapshot?: {
+    appliedOperationCount: number;
+    repository: ControlPlaneRepositorySnapshot;
+  };
   sendblueDeliveries: Record<string, SendblueDeliveryState>;
   scheduledMonitorJobs: Record<string, ScheduledMonitorJobState>;
   monitorEffects: Record<string, MonitorEffectState>;
@@ -130,6 +140,23 @@ function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function validControlPlaneSnapshot(value: unknown, operationCount: number): boolean {
+  if (!record(value) || !Number.isSafeInteger(value.appliedOperationCount)) return false;
+  const applied = value.appliedOperationCount as number;
+  if (applied < 0 || applied > operationCount || !record(value.repository)) return false;
+  const repository = value.repository;
+  return [
+    "challenges",
+    "devices",
+    "processedInbound",
+    "tasks",
+    "deviceCommands",
+    "sendblueOutbox",
+    "monitorJobs",
+    "acceptedEvents",
+  ].every((key) => Array.isArray(repository[key]));
+}
+
 /** Rejects incompatible/corrupt roots before repository code consumes them. */
 export function parseDexCloudState(value: unknown): DexCloudStateDocument {
   if (!record(value) || value.version !== 1) {
@@ -142,6 +169,12 @@ export function parseDexCloudState(value: unknown): DexCloudStateDocument {
     !record(value.monitorEffects)
   ) {
     throw new Error("Dex cloud persistence contains a malformed state document");
+  }
+  if (
+    value.controlPlaneSnapshot !== undefined &&
+    !validControlPlaneSnapshot(value.controlPlaneSnapshot, value.controlPlaneOperations.length)
+  ) {
+    throw new Error("Dex cloud persistence contains a malformed control-plane snapshot");
   }
   return structuredClone(value) as unknown as DexCloudStateDocument;
 }

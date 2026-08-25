@@ -107,6 +107,9 @@ export interface PairingDeviceRepository {
 
 export interface InboundMessageRepository {
   hasProcessedInbound(providerMessageId: string): Promise<boolean>;
+  commitEngineeringInbound(
+    input: EngineeringInboundCommitInput,
+  ): Promise<EngineeringInboundCommitResult>;
   commitEngineeringMessage(
     providerMessageId: string,
     task: CloudTaskRecord,
@@ -116,6 +119,33 @@ export interface InboundMessageRepository {
     providerMessageId: string,
     notification: SendblueOutboxRecord,
   ): Promise<InboundCommitResult>;
+}
+
+export interface EngineeringInboundCommitInput {
+  providerMessageId: string;
+  ownerId: string;
+  conversationId: string;
+  unpairedNotification: SendblueOutboxRecord;
+  createForDevice: (device: DeviceRecord) => {
+    task: CloudTaskRecord;
+    command: DeviceCommandOutboxRecord;
+  };
+}
+
+export type EngineeringInboundCommitResult =
+  | { kind: "duplicate" }
+  | { kind: "unpaired" }
+  | { kind: "accepted"; taskId: string; commandId: string };
+
+export interface ControlPlaneRepositorySnapshot {
+  challenges: PairingChallengeRecord[];
+  devices: DeviceRecord[];
+  processedInbound: string[];
+  tasks: CloudTaskRecord[];
+  deviceCommands: DeviceCommandOutboxRecord[];
+  sendblueOutbox: SendblueOutboxRecord[];
+  monitorJobs: MonitorJobRecord[];
+  acceptedEvents: string[];
 }
 
 export interface DeviceSyncRepository {
@@ -242,6 +272,71 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
   readonly #acceptedEvents = new Set<string>();
   #tail: Promise<void> = Promise.resolve();
 
+  static fromSnapshot(snapshot: ControlPlaneRepositorySnapshot): InMemoryControlPlaneRepository {
+    const repository = new InMemoryControlPlaneRepository();
+    const load = <T extends { id: string }>(
+      target: Map<string, T>,
+      values: readonly T[],
+      label: string,
+    ): void => {
+      for (const value of values) {
+        if (
+          typeof value !== "object" ||
+          value === null ||
+          typeof value.id !== "string" ||
+          value.id.length === 0
+        ) {
+          throw new RepositoryConflictError(`${label} snapshot contains an invalid record`);
+        }
+        if (target.has(value.id)) throw new RepositoryConflictError(`${label} snapshot has duplicate IDs`);
+        target.set(value.id, copy(value));
+      }
+    };
+    load(repository.#challenges, snapshot.challenges, "Pairing challenge");
+    load(repository.#devices, snapshot.devices, "Device");
+    load(repository.#tasks, snapshot.tasks, "Task");
+    load(repository.#deviceCommands, snapshot.deviceCommands, "Device command");
+    load(repository.#sendblueOutbox, snapshot.sendblueOutbox, "Sendblue outbox");
+    load(repository.#monitorJobs, snapshot.monitorJobs, "Monitor job");
+    for (const providerMessageId of snapshot.processedInbound) {
+      if (typeof providerMessageId !== "string" || providerMessageId.length === 0) {
+        throw new RepositoryConflictError("Processed-inbound snapshot contains an invalid ID");
+      }
+      repository.#processedInbound.add(providerMessageId);
+    }
+    for (const eventId of snapshot.acceptedEvents) {
+      if (typeof eventId !== "string" || eventId.length === 0) {
+        throw new RepositoryConflictError("Accepted-event snapshot contains an invalid ID");
+      }
+      repository.#acceptedEvents.add(eventId);
+    }
+    for (const message of repository.#sendblueOutbox.values()) {
+      const existing = repository.#sendblueDedupe.get(message.dedupeKey);
+      if (existing !== undefined && existing !== message.id) {
+        throw new RepositoryConflictError("Sendblue snapshot has conflicting dedupe keys");
+      }
+      repository.#sendblueDedupe.set(message.dedupeKey, message.id);
+    }
+    return repository;
+  }
+
+  snapshot(): ControlPlaneRepositorySnapshot {
+    const values = <T extends { id: string }>(source: Map<string, T>): T[] =>
+      [...source.values()]
+        .sort((left, right) => left.id.localeCompare(right.id))
+        .map(copy);
+    return {
+      challenges: values(this.#challenges),
+      devices: values(this.#devices),
+      processedInbound: [...this.#processedInbound].sort(),
+      tasks: values(this.#tasks),
+      deviceCommands: values(this.#deviceCommands),
+      sendblueOutbox: values(this.#sendblueOutbox),
+      monitorJobs: values(this.#monitorJobs),
+      acceptedEvents: [...this.#acceptedEvents].sort(),
+    };
+  }
+
   async #locked<T>(work: () => T | Promise<T>): Promise<T> {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
@@ -259,6 +354,36 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
 
   hasProcessedInbound(providerMessageId: string): Promise<boolean> {
     return this.#locked(() => this.#processedInbound.has(providerMessageId));
+  }
+
+  commitEngineeringInbound(
+    input: EngineeringInboundCommitInput,
+  ): Promise<EngineeringInboundCommitResult> {
+    return this.#locked(() => {
+      if (this.#processedInbound.has(input.providerMessageId)) return { kind: "duplicate" };
+      const device = [...this.#devices.values()]
+        .filter((candidate) =>
+          candidate.ownerId === input.ownerId &&
+          candidate.conversationId === input.conversationId)
+        .sort((left, right) => left.id.localeCompare(right.id))[0];
+      if (device === undefined) {
+        this.#processedInbound.add(input.providerMessageId);
+        this.#enqueueSendblue(input.unpairedNotification);
+        return { kind: "unpaired" };
+      }
+      const created = input.createForDevice(copy(device));
+      if (created.command.deviceId !== device.id) {
+        throw new RepositoryConflictError("Command target does not match the paired device");
+      }
+      this.#processedInbound.add(input.providerMessageId);
+      this.#tasks.set(created.task.id, copy(created.task));
+      this.#enqueueDeviceCommand(created.command);
+      return {
+        kind: "accepted",
+        taskId: created.task.id,
+        commandId: created.command.command.id,
+      };
+    });
   }
 
   commitPairingChallenge(

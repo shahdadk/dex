@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { generateDexDeviceKeyPair } from "../src/cloud/messaging/index.js";
+import { DexControlPlaneService } from "../src/cloud/control-plane/index.js";
 import type { ModalAdapter, ModalSandbox } from "../src/cloud/modal/index.js";
 import { ModalMonitorLeaseBusyError } from "../src/cloud/modal-monitor/index.js";
 import {
@@ -11,6 +12,7 @@ import {
   DurableDexCloudRepository,
   DurableModalMonitorOnce,
   PostgresStateBackend,
+  type DexCloudStateBackend,
 } from "../src/cloud/persistence/index.js";
 import {
   ConfiguredAssociationVerifier,
@@ -325,6 +327,128 @@ describe("durable outbox and monitor execution", () => {
     });
     expect(reconcile?.claimToken).not.toBe(send?.claimToken);
     await secondBackend.close();
+  });
+
+  it("accepts paired engineering ingress in one durable backend transaction", async () => {
+    const file = new AtomicFileStateBackend({ filePath: await stateFile() });
+    const calls = { read: 0, mutate: 0 };
+    const backend: DexCloudStateBackend = {
+      ready: () => file.ready(),
+      read: (reader) => {
+        calls.read += 1;
+        return file.read(reader);
+      },
+      mutate: (mutation) => {
+        calls.mutate += 1;
+        return file.mutate(mutation);
+      },
+      close: () => file.close(),
+    };
+    const repository = new DurableDexCloudRepository({ backend });
+    await repository.commitPairingChallenge("pair-fast", {
+      id: "pair-fast-challenge",
+      codeDigest: "1".repeat(64),
+      issuedAt: NOW_ISO,
+      expiresAt: "2026-08-23T19:00:00.000Z",
+      ownerId: "owner-1",
+      conversationId: "conversation-1",
+      phoneE164: PHONE,
+      sourceMessageId: "pair-fast",
+      attempts: 0,
+      maxAttempts: 5,
+    }, {
+      id: "pair-fast-notification",
+      dedupeKey: "pair-fast-notification",
+      ownerId: "owner-1",
+      conversationId: "conversation-1",
+      toPhone: PHONE,
+      text: "Pairing ready",
+      createdAt: NOW_ISO,
+    });
+    await repository.consumePairingChallenge({
+      challengeId: "pair-fast-challenge",
+      codeDigest: "1".repeat(64),
+      now: NOW_ISO,
+      device: {
+        id: "device-fast",
+        keyId: "device-key-fast",
+        publicKey: "public-key",
+        ownerId: "owner-1",
+        conversationId: "conversation-1",
+        phoneE164: PHONE,
+        deviceName: "Dex Mac",
+        createdAt: NOW_ISO,
+        lastSequence: 0,
+      },
+    });
+    calls.read = 0;
+    calls.mutate = 0;
+    const signingKey = generateDexDeviceKeyPair();
+    const service = new DexControlPlaneService({
+      repository,
+      associationVerifier: new ConfiguredAssociationVerifier({
+        associations: [{
+          ownerId: "owner-1",
+          conversationId: "conversation-1",
+          phoneE164: PHONE,
+        }],
+        sendblueNumber: DEX_LINE,
+      }),
+      signingKey,
+      sendblueWebhookSecret: "webhook-secret",
+      internalSecret: "internal-secret-at-least-sixteen",
+      now: () => NOW,
+    });
+
+    await expect(service.processSendblueWebhook({
+      content: "fix checkout",
+      is_outbound: false,
+      message_handle: "fast-ingress-1",
+      date_sent: NOW_ISO,
+      from_number: PHONE,
+      to_number: DEX_LINE,
+    }, new Headers({ "sb-signing-secret": "webhook-secret" }))).resolves.toMatchObject({
+      kind: "engineering_command",
+    });
+    expect(calls).toEqual({ read: 0, mutate: 1 });
+    await backend.close();
+  });
+
+  it("keeps the legacy operation log while materializing and replaying a newer snapshot", async () => {
+    const backend = new AtomicFileStateBackend({ filePath: await stateFile() });
+    const repository = new DurableDexCloudRepository({ backend });
+    const notification = (id: string) => ({
+      id: `outbox-${id}`,
+      dedupeKey: `sendblue:${id}`,
+      ownerId: "owner-1",
+      conversationId: "conversation-1",
+      toPhone: PHONE,
+      text: `Message ${id}`,
+      createdAt: NOW_ISO,
+    });
+    await repository.commitUnpairedMessage("snapshot-1", notification("snapshot-1"));
+    await backend.mutate((state) => {
+      // Simulate an older live revision that knows only the operation log.
+      state.controlPlaneOperations.push({
+        kind: "commit_unpaired_message",
+        providerMessageId: "snapshot-2",
+        notification: notification("snapshot-2"),
+      });
+    });
+
+    expect(await repository.hasProcessedInbound("snapshot-2")).toBe(true);
+    await repository.commitUnpairedMessage("snapshot-3", notification("snapshot-3"));
+    await expect(repository.claimPendingMonitorJobs(25, NOW_ISO, 30_000)).resolves.toEqual([]);
+    await backend.read((state) => {
+      expect(state.controlPlaneOperations).toHaveLength(3);
+      expect(state.controlPlaneSnapshot?.appliedOperationCount).toBe(3);
+      expect(state.controlPlaneSnapshot?.repository.processedInbound).toEqual([
+        "snapshot-1",
+        "snapshot-2",
+        "snapshot-3",
+      ]);
+    });
+    await backend.close();
   });
 
   it("replays rejected device events as sequence-only history across acceptance-rule changes", async () => {
