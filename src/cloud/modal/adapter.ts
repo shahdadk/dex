@@ -12,7 +12,13 @@ export interface ModalReadStreamLike {
   readText(): Promise<string>;
 }
 
+export interface ModalWriteStreamLike {
+  getWriter(): WritableStreamDefaultWriter<string>;
+}
+
 export interface ModalProcessLike {
+  /** Modal always exposes stdin; optional keeps injected legacy test doubles source-compatible. */
+  readonly stdin?: ModalWriteStreamLike;
   readonly stdout: ModalReadStreamLike;
   readonly stderr: ModalReadStreamLike;
   wait(): Promise<number>;

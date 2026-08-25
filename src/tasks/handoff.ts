@@ -6,6 +6,7 @@ import {
   createGitCheckpoint,
   createManifest,
   discoverClaudeMem,
+  extractExplicitFailedApproaches,
   MAX_HANDOFF_MEMORIES,
   MIN_HANDOFF_MEMORIES,
   redactMemoryValue,
@@ -199,6 +200,21 @@ function normalizeFailedApproaches(
       attempt.approach,
       attempt.reason || attempt.outcome || "Recorded as unsuccessful; do not retry without new evidence.",
     );
+  }
+  // Older Dex workers stored their explicit final-summary failure labels only
+  // as learned facts. Recover those durable records at handoff time so an
+  // upgrade does not require rerunning the source worker to preserve context.
+  for (const fact of [...(knowledge.learnedFacts ?? []), ...(knowledge.facts ?? [])]) {
+    for (const attempt of extractExplicitFailedApproaches(fact)) {
+      if (typeof attempt === "string") {
+        add(attempt, "Recorded as unsuccessful in a prior worker summary.");
+      } else {
+        add(
+          attempt.approach,
+          attempt.reason || attempt.outcome || "Recorded as unsuccessful in a prior worker summary.",
+        );
+      }
+    }
   }
   for (const memory of memories) {
     if (memory.type === "failed-approach") {

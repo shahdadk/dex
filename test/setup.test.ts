@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const originalArgv = [...process.argv];
 const originalExitCode = process.exitCode;
 const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+const CANONICAL_ROOT_HANDOFF_KEY = Buffer.from("0123456789abcdef0123456789abcdef").toString("base64url");
+const LEGACY_ROOT_HANDOFF_KEY = "e".repeat(32);
 
 const mockedModules = [
   "node:fs/promises",
@@ -300,6 +302,80 @@ describe("Modal Codex auth setup", () => {
   });
 });
 
+describe("root handoff signing key", () => {
+  it("generates exactly 32 random bytes as canonical unpadded base64url", async () => {
+    const { ensureRootHandoffKey, isStrongRootHandoffKey } = await import("../src/setup/handoff-key.js");
+    const env: NodeJS.ProcessEnv = {};
+
+    expect(ensureRootHandoffKey(env)).toBe("generated");
+    expect(env.DEX_HANDOFF_SIGNING_KEY).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(Buffer.from(env.DEX_HANDOFF_SIGNING_KEY!, "base64url")).toHaveLength(32);
+    expect(Buffer.from(env.DEX_HANDOFF_SIGNING_KEY!, "base64url").toString("base64url"))
+      .toBe(env.DEX_HANDOFF_SIGNING_KEY);
+    expect(isStrongRootHandoffKey(env.DEX_HANDOFF_SIGNING_KEY!)).toBe(true);
+  });
+
+  it("preserves canonical keys and rotates unsupported legacy values", async () => {
+    const { ensureRootHandoffKey, isStrongRootHandoffKey } = await import("../src/setup/handoff-key.js");
+    const env: NodeJS.ProcessEnv = { DEX_HANDOFF_SIGNING_KEY: CANONICAL_ROOT_HANDOFF_KEY };
+
+    expect(ensureRootHandoffKey(env)).toBe("existing");
+    expect(env.DEX_HANDOFF_SIGNING_KEY).toBe(CANONICAL_ROOT_HANDOFF_KEY);
+
+    env.DEX_HANDOFF_SIGNING_KEY = LEGACY_ROOT_HANDOFF_KEY;
+    expect(ensureRootHandoffKey(env)).toBe("rotated");
+    expect(env.DEX_HANDOFF_SIGNING_KEY).not.toBe(LEGACY_ROOT_HANDOFF_KEY);
+    expect(isStrongRootHandoffKey(env.DEX_HANDOFF_SIGNING_KEY!)).toBe(true);
+  });
+
+  it("rejects noncanonical root keys before runtime use or Keychain persistence", async () => {
+    const runner = vi.fn(async () => ({ stdout: "", stderr: "", exitCode: 0 }));
+    const { assertStrongRootHandoffKey, isStrongRootHandoffKey } = await import("../src/setup/handoff-key.js");
+    const { MacOSDexRuntimeSecrets } = await import("../src/local/pairing/secrets.js");
+    const secrets = new MacOSDexRuntimeSecrets({ runner, platform: "darwin" });
+    const unsupported = [
+      LEGACY_ROOT_HANDOFF_KEY,
+      `${CANONICAL_ROOT_HANDOFF_KEY}=`,
+      `${CANONICAL_ROOT_HANDOFF_KEY.slice(0, -1)}+`,
+      `${"A".repeat(42)}B`,
+    ];
+
+    expect(unsupported.map(isStrongRootHandoffKey)).toEqual([false, false, false, false]);
+    expect(() => assertStrongRootHandoffKey(LEGACY_ROOT_HANDOFF_KEY)).toThrow(
+      "DEX_HANDOFF_SIGNING_KEY must be 43 unpadded base64url characters encoding exactly 32 bytes",
+    );
+
+    await expect(secrets.save({
+      DEX_HANDOFF_SIGNING_KEY: LEGACY_ROOT_HANDOFF_KEY,
+    })).rejects.toThrow(
+      "DEX_HANDOFF_SIGNING_KEY must be 43 unpadded base64url characters encoding exactly 32 bytes",
+    );
+    expect(runner).not.toHaveBeenCalled();
+  });
+
+  it("ignores an unsupported Keychain value so setup can replace it", async () => {
+    const execFile = vi.fn(async () => ({
+      stdout: JSON.stringify({
+        version: 1,
+        DEX_HANDOFF_SIGNING_KEY: LEGACY_ROOT_HANDOFF_KEY,
+      }),
+      stderr: "",
+      exitCode: 0,
+    }));
+    vi.doMock("../src/utils/exec.js", () => ({ execFile }));
+    Object.defineProperty(process, "platform", { ...originalPlatform, value: "darwin" });
+    vi.stubEnv("DEX_HANDOFF_SIGNING_KEY", "");
+    const { hydrateRuntimeSecrets } = await import("../src/local/pairing/secrets.js");
+    const { ensureRootHandoffKey, isStrongRootHandoffKey } = await import("../src/setup/handoff-key.js");
+
+    await hydrateRuntimeSecrets();
+    expect(process.env.DEX_HANDOFF_SIGNING_KEY).toBe("");
+    expect(ensureRootHandoffKey()).toBe("generated");
+    expect(isStrongRootHandoffKey(process.env.DEX_HANDOFF_SIGNING_KEY!)).toBe(true);
+    expect(execFile).toHaveBeenCalledOnce();
+  });
+});
+
 describe("setup command", () => {
   it("completes the skip-smoke/no-service path entirely through fakes", async () => {
     const paths = {
@@ -339,7 +415,10 @@ describe("setup command", () => {
       ownerId: "owner-1",
       pairedConversationId: "conversation-1",
     }));
-    const persistRuntimeSecrets = vi.fn(async () => undefined);
+    const persistedHandoffKeys: string[] = [];
+    const persistRuntimeSecrets = vi.fn(async () => {
+      persistedHandoffKeys.push(process.env.DEX_HANDOFF_SIGNING_KEY ?? "");
+    });
     const deviceVolume = "dex-codex-auth-aabbccddeeff00112233";
     const seedModalCodexAuth = vi.fn(async () => {
       expect(writeFile).not.toHaveBeenCalled();
@@ -411,7 +490,7 @@ describe("setup command", () => {
       seedModalCodexAuth,
     }));
 
-    vi.stubEnv("DEX_HANDOFF_SIGNING_KEY", "handoff-signing-key");
+    vi.stubEnv("DEX_HANDOFF_SIGNING_KEY", LEGACY_ROOT_HANDOFF_KEY);
     vi.stubEnv("GEMINI_API_KEY", "gemini-key");
     vi.stubEnv("DEX_MODAL_CODEX_AUTH_VOLUME", "");
     process.argv = [
@@ -448,6 +527,10 @@ describe("setup command", () => {
       leasePath: path.join(paths.handoffs, ".codex-account-auth.lease"),
     });
     expect(persistRuntimeSecrets).toHaveBeenCalledOnce();
+    const generatedHandoffKey = persistedHandoffKeys[0]!;
+    expect(generatedHandoffKey).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(Buffer.from(generatedHandoffKey, "base64url")).toHaveLength(32);
+    expect(generatedHandoffKey).not.toBe(LEGACY_ROOT_HANDOFF_KEY);
     expect(modalConstructor).not.toHaveBeenCalled();
     expect(machineConstructor).not.toHaveBeenCalled();
     expect(installRuntime).not.toHaveBeenCalled();
@@ -460,6 +543,8 @@ describe("setup command", () => {
     );
     expect(process.env.DEX_MODAL_CODEX_AUTH_VOLUME).toBe(deviceVolume);
     expect(log.mock.calls.flat().join("\n")).toContain("signed transport were not started");
+    expect(log.mock.calls.flat().join("\n")).not.toContain(generatedHandoffKey);
+    expect(error.mock.calls.flat().join("\n")).not.toContain(generatedHandoffKey);
     expect(log.mock.calls.flat().join("\n")).not.toContain("You're done. Close Terminal and text Dex.");
   });
 
@@ -503,6 +588,156 @@ describe("setup command", () => {
     expect(result.log.mock.calls.flat().join("\n")).not.toContain(
       "You're done. Close Terminal and text Dex.",
     );
+  });
+});
+
+describe("Modal cloud smoke", () => {
+  it("verifies account-backed Codex auth before the scoped-file Modal lifecycle", async () => {
+    const lifecycle: string[] = [];
+    const writeText = vi.fn(async () => { lifecycle.push("write-file"); });
+    const exec = vi.fn(async () => {
+      lifecycle.push("exec");
+      return {
+        stdout: { readText: async () => process.version },
+        stderr: { readText: async () => "" },
+        wait: async () => 0,
+      };
+    });
+    const detach = vi.fn(async () => { lifecycle.push("detach"); });
+    const terminate = vi.fn(async () => { lifecycle.push("terminate"); });
+    const sandbox = {
+      sandboxId: "sb-smoke-direct-file",
+      raw: { filesystem: { writeText } },
+      exec,
+      detach,
+      terminate: vi.fn(async () => { lifecycle.push("fallback-terminate"); }),
+    };
+    const create = vi.fn(async () => {
+      lifecycle.push("create");
+      return sandbox;
+    });
+    const fromId = vi.fn(async () => {
+      lifecycle.push("reconnect");
+      return { terminate };
+    });
+    const close = vi.fn(async () => undefined);
+    const hydrateRuntimeSecrets = vi.fn(async () => undefined);
+    const volumeName = "dex-codex-auth-aabbccddeeff00112233";
+    const cloudPaths = {
+      home: "/tmp/dex-cloud-doctor",
+      config: "/tmp/dex-cloud-doctor/config.json",
+      state: "/tmp/dex-cloud-doctor/state.json",
+      events: "/tmp/dex-cloud-doctor/events.jsonl",
+      daemonPid: "/tmp/dex-cloud-doctor/daemon.pid",
+      daemonLog: "/tmp/dex-cloud-doctor/daemon.log",
+      powerState: "/tmp/dex-cloud-doctor/power-state.json",
+      worktrees: "/tmp/dex-cloud-doctor/worktrees",
+      handoffs: "/tmp/dex-cloud-doctor/handoffs",
+      runtime: "/tmp/dex-cloud-doctor/runtime",
+      controlSocket: "/tmp/dex-cloud-doctor/runtime/control.sock",
+    };
+    const loadConfig = vi.fn(async () => ({ ...config(), modalCodexAuthVolume: volumeName }));
+    const seedModalCodexAuth = vi.fn(async () => {
+      lifecycle.push("account-auth");
+      return { volumeName, disposition: "reused" as const };
+    });
+
+    vi.doMock("../src/cloud/modal/adapter.js", () => ({
+      ModalAdapter: class FakeModalAdapter {
+        create = create;
+        fromId = fromId;
+        close = close;
+      },
+    }));
+    vi.doMock("../src/local/pairing/secrets.js", () => ({
+      hydrateRuntimeSecrets,
+      persistRuntimeSecrets: vi.fn(),
+    }));
+    vi.doMock("../src/config/config.js", async () => ({
+      ...await vi.importActual<typeof import("../src/config/config.js")>("../src/config/config.js"),
+      loadConfig,
+    }));
+    vi.doMock("../src/config/paths.js", () => ({ resolveDexPaths: () => cloudPaths }));
+    vi.doMock("../src/setup/modal-auth.js", () => ({ seedModalCodexAuth }));
+    vi.stubEnv("DEX_HANDOFF_SIGNING_KEY", CANONICAL_ROOT_HANDOFF_KEY);
+    vi.stubEnv("DEX_MODAL_SECRET_NAME", "must-not-be-used");
+    process.argv = [process.execPath, "dex", "cloud", "doctor"];
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await import("../src/cli.js");
+
+    expect(error).not.toHaveBeenCalled();
+    expect(process.exitCode).not.toBe(1);
+    expect(hydrateRuntimeSecrets).toHaveBeenCalledOnce();
+    expect(loadConfig).toHaveBeenCalledWith(cloudPaths);
+    expect(seedModalCodexAuth).toHaveBeenCalledWith({
+      volumeName,
+      leasePath: path.join(cloudPaths.handoffs, ".codex-account-auth.lease"),
+    });
+    expect(create).toHaveBeenCalledWith({
+      params: {
+        timeoutMs: 120_000,
+        command: ["sleep", "120"],
+      },
+    });
+    expect(create.mock.calls[0]![0]).not.toHaveProperty("secretNames");
+    expect(create.mock.calls[0]![0]).not.toHaveProperty("requiredSecretKeys");
+    expect(writeText).toHaveBeenCalledWith(
+      expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
+      "/tmp/dex-handoff-smoke.key",
+    );
+    expect(exec).toHaveBeenCalledWith([
+      "node",
+      "-e",
+      expect.stringMatching(/dex-handoff-smoke\.key.*DEX_HANDOFF_SIGNING_KEY.*sha256/),
+    ]);
+    expect(fromId).toHaveBeenCalledWith("sb-smoke-direct-file");
+    expect(terminate).toHaveBeenCalledWith({ wait: true });
+    expect(sandbox.terminate).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledOnce();
+    expect(lifecycle).toEqual([
+      "account-auth",
+      "create",
+      "write-file",
+      "exec",
+      "detach",
+      "reconnect",
+      "terminate",
+    ]);
+    expect(log.mock.calls.flat().join("\n")).toContain(
+      `Codex ChatGPT account auth verified in private Modal Volume ${volumeName} (reused)`,
+    );
+    expect(log.mock.calls.flat().join("\n")).toContain(
+      "Modal create/write-file/exec/detach/reconnect/terminate: sb-smoke-direct-file",
+    );
+  });
+
+  it("rejects a weak root key before checking account auth or creating a Sandbox", async () => {
+    const seedModalCodexAuth = vi.fn();
+    const create = vi.fn();
+    vi.doMock("../src/local/pairing/secrets.js", () => ({
+      hydrateRuntimeSecrets: vi.fn(async () => undefined),
+      persistRuntimeSecrets: vi.fn(),
+    }));
+    vi.doMock("../src/setup/modal-auth.js", () => ({ seedModalCodexAuth }));
+    vi.doMock("../src/cloud/modal/adapter.js", () => ({
+      ModalAdapter: class FakeModalAdapter {
+        create = create;
+      },
+    }));
+    vi.stubEnv("DEX_HANDOFF_SIGNING_KEY", LEGACY_ROOT_HANDOFF_KEY);
+    process.argv = [process.execPath, "dex", "cloud", "doctor"];
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await import("../src/cli.js");
+
+    expect(process.exitCode).toBe(1);
+    expect(error.mock.calls.flat().join("\n")).toContain(
+      "DEX_HANDOFF_SIGNING_KEY must be 43 unpadded base64url characters encoding exactly 32 bytes",
+    );
+    expect(seedModalCodexAuth).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
   });
 });
 
@@ -614,7 +849,7 @@ async function runServiceSetupCommand(options: { waitError?: Error } = {}) {
     seedModalCodexAuth: vi.fn(async () => ({ volumeName: deviceVolume, disposition: "reused" })),
   }));
 
-  vi.stubEnv("DEX_HANDOFF_SIGNING_KEY", "handoff-signing-key");
+  vi.stubEnv("DEX_HANDOFF_SIGNING_KEY", CANONICAL_ROOT_HANDOFF_KEY);
   vi.stubEnv("GEMINI_API_KEY", "gemini-key");
   process.exitCode = undefined;
   process.argv = [
@@ -738,7 +973,7 @@ describe("runtime and LaunchAgent installation", () => {
     vi.stubEnv("PATH", '/opt/Dex & Tools/"bin"/<current>');
     vi.stubEnv("DEX_DEVICE_KEY_ID", "device-key-custom");
     vi.stubEnv("DEX_MODAL_CODEX_AUTH_VOLUME", "auth-volume-custom");
-    vi.stubEnv("DEX_MODAL_SECRET_NAME", "worker-secret-custom");
+    vi.stubEnv("DEX_MODAL_SECRET_NAME", "obsolete-worker-secret");
     vi.stubEnv("CLAUDE_MEM_WORKER_URL", "http://127.0.0.1:47777/a&b");
     const { installLaunchAgent, mkdir, writeFile, execFile } = await mockServiceDependencies();
     const runtime = "/Users/tester/Dex & Runtime/current";
@@ -764,7 +999,7 @@ describe("runtime and LaunchAgent installation", () => {
     expect(body).toContain("<key>DEX_HOME</key><string>/Users/tester/.dex</string>");
     expect(body).toContain("<key>DEX_DEVICE_KEY_ID</key><string>device-key-custom</string>");
     expect(body).toContain("<key>DEX_MODAL_CODEX_AUTH_VOLUME</key><string>auth-volume-device-specific</string>");
-    expect(body).toContain("<key>DEX_MODAL_SECRET_NAME</key><string>worker-secret-custom</string>");
+    expect(body).not.toContain("DEX_MODAL_SECRET_NAME");
     expect(body).toContain("<key>CLAUDE_MEM_WORKER_URL</key><string>http://127.0.0.1:47777/a&amp;b</string>");
     expect(body).toContain("<string>daemon</string>");
     expect(probeControlSocket).toHaveBeenCalledWith(paths.controlSocket);
@@ -849,7 +1084,8 @@ describe("persisted LaunchAgent runtime settings", () => {
     Object.defineProperty(process, "platform", { ...originalPlatform, value: "darwin" });
     vi.stubEnv("MODAL_TOKEN_ID", "modal-key-id");
     vi.stubEnv("MODAL_TOKEN_SECRET", "modal-secret");
-    vi.stubEnv("DEX_MODAL_SECRET_NAME", "workers-custom");
+    vi.stubEnv("DEX_HANDOFF_SIGNING_KEY", CANONICAL_ROOT_HANDOFF_KEY);
+    vi.stubEnv("DEX_MODAL_SECRET_NAME", "obsolete-workers-custom");
     vi.stubEnv("DEX_MODAL_CODEX_AUTH_VOLUME", "auth-custom");
     vi.stubEnv("CLAUDE_MEM_WORKER_URL", "http://127.0.0.1:48888");
     vi.stubEnv("CLAUDE_MEM_DATA_DIR", "/Users/tester/claude-mem-custom");
@@ -860,11 +1096,12 @@ describe("persisted LaunchAgent runtime settings", () => {
     expect(saved).toEqual([expect.objectContaining({
       MODAL_TOKEN_ID: "modal-key-id",
       MODAL_TOKEN_SECRET: "modal-secret",
-      DEX_MODAL_SECRET_NAME: "workers-custom",
+      DEX_HANDOFF_SIGNING_KEY: CANONICAL_ROOT_HANDOFF_KEY,
       DEX_MODAL_CODEX_AUTH_VOLUME: "auth-custom",
       CLAUDE_MEM_WORKER_URL: "http://127.0.0.1:48888",
       CLAUDE_MEM_DATA_DIR: "/Users/tester/claude-mem-custom",
     })]);
+    expect(saved[0]).not.toHaveProperty("DEX_MODAL_SECRET_NAME");
   });
 });
 

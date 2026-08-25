@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createHash, randomBytes } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Command } from "commander";
@@ -26,6 +27,7 @@ import { detectMacName, pairMac } from "./setup/onboarding.js";
 import { sendControlCommand } from "./local/daemon/control-socket.js";
 import { hydrateRuntimeSecrets, persistRuntimeSecrets } from "./local/pairing/secrets.js";
 import { seedModalCodexAuth } from "./setup/modal-auth.js";
+import { assertStrongRootHandoffKey, ensureRootHandoffKey } from "./setup/handoff-key.js";
 import {
   discoverClaudeMem,
   extractObservationIds,
@@ -43,10 +45,11 @@ program
   .option("--project <path>", "default repository", process.cwd())
   .option("--pairing-code <code>", "use a specific phone pairing code")
   .option("--device-name <name>", "name shown for this Mac")
-  .option("--skip-modal-smoke", "skip the real Modal create/reconnect smoke test")
+  .option("--skip-modal-smoke", "skip the real Modal lifecycle smoke test")
   .action(async (options: { service: boolean; project: string; pairingCode?: string; deviceName?: string; skipModalSmoke?: boolean }) => {
     assertNode22();
     await hydrateRuntimeSecrets();
+    ensureRootHandoffKey();
     const paths = resolveDexPaths();
     const store = new DexStateStore(paths.state);
     // Validate the repository before creating a cloud pairing or mutating Dex
@@ -80,9 +83,7 @@ program
     if (checks.find((check) => check.name === "Modal")?.status !== "pass") {
       throw new Error("An authenticated Modal environment or CLI profile is required for Dex cloud continuity");
     }
-    if (!process.env.DEX_HANDOFF_SIGNING_KEY) {
-      throw new Error("DEX_HANDOFF_SIGNING_KEY is required and must also exist in the configured Modal secret");
-    }
+    assertStrongRootHandoffKey(process.env.DEX_HANDOFF_SIGNING_KEY);
     if (!process.env.GEMINI_API_KEY) {
       throw new Error("GEMINI_API_KEY is required for Dex's ambiguous routing lane");
     }
@@ -97,7 +98,7 @@ program
     console.log(`✓ Codex ChatGPT account auth ${auth.disposition} in private Modal Volume ${auth.volumeName}`);
     if (!options.skipModalSmoke) {
       const smoke = await modalSmokeTest();
-      console.log(`✓ Modal create/execute/detach/reconnect: ${smoke.id} (${smoke.version})`);
+      console.log(`✓ Modal create/write-file/exec/detach/reconnect/terminate: ${smoke.id} (${smoke.version})`);
     }
     await persistRuntimeSecrets();
     if (options.service) {
@@ -257,9 +258,21 @@ program
   .description("Internal cloud diagnostics")
   .command("doctor")
   .action(async () => {
+    assertNode22();
     await hydrateRuntimeSecrets();
+    assertStrongRootHandoffKey(process.env.DEX_HANDOFF_SIGNING_KEY);
+    const paths = resolveDexPaths();
+    const config = await loadConfig(paths);
+    if (!config.modalCodexAuthVolume) {
+      throw new Error("A paired device-specific Modal Codex auth Volume is required; run dex setup");
+    }
+    const auth = await seedModalCodexAuth({
+      volumeName: config.modalCodexAuthVolume,
+      leasePath: path.join(paths.handoffs, ".codex-account-auth.lease"),
+    });
+    console.log(`✓ Codex ChatGPT account auth verified in private Modal Volume ${auth.volumeName} (${auth.disposition})`);
     const smoke = await modalSmokeTest();
-    console.log(`✓ Modal create/execute/detach/reconnect: ${smoke.id} (${smoke.version})`);
+    console.log(`✓ Modal create/write-file/exec/detach/reconnect/terminate: ${smoke.id} (${smoke.version})`);
   });
 
 await program.parseAsync(process.argv).catch((error: unknown) => {
@@ -371,30 +384,36 @@ async function waitForSeededMemory(client: ClaudeMemClient, timeoutMs = 90_000):
 
 async function modalSmokeTest(): Promise<{ id: string; version: string }> {
   const modal = new ModalAdapter();
-  const signingKey = process.env.DEX_HANDOFF_SIGNING_KEY;
-  if (!signingKey) throw new Error("DEX_HANDOFF_SIGNING_KEY is required for the Modal worker check");
   const sandbox = await modal.create({
-    secretNames: [process.env.DEX_MODAL_SECRET_NAME ?? "dex-workers"],
-    requiredSecretKeys: ["DEX_HANDOFF_SIGNING_KEY"],
     params: {
       timeoutMs: 120_000,
       command: ["sleep", "120"],
     },
   });
+  let terminated = false;
   try {
+    const keyPath = "/tmp/dex-handoff-smoke.key";
+    const scopedKey = randomBytes(32).toString("base64url");
+    const expectedDigest = createHash("sha256").update(scopedKey).digest("hex");
+    await sandbox.raw.filesystem.writeText(scopedKey, keyPath);
     const process = await sandbox.exec([
       "node",
       "-e",
-      "if (!process.env.DEX_HANDOFF_SIGNING_KEY) process.exit(9); process.stdout.write(process.version)",
+      `const { createHash } = require("node:crypto"); const { readFileSync } = require("node:fs"); const key = readFileSync(${JSON.stringify(keyPath)}); if (process.env.DEX_HANDOFF_SIGNING_KEY || createHash("sha256").update(key).digest("hex") !== ${JSON.stringify(expectedDigest)}) process.exit(9); process.stdout.write(process.version)`,
     ]);
     const [exitCode, output] = await Promise.all([process.wait(), process.stdout.readText()]);
     if (exitCode !== 0) throw new Error(`Modal command exited ${exitCode}: ${await process.stderr.readText()}`);
     const id = sandbox.sandboxId;
     await sandbox.detach();
     const reconnected = await modal.fromId(id);
-    await reconnected.terminate();
+    await reconnected.terminate({ wait: true });
+    terminated = true;
     return { id, version: output.trim() };
   } finally {
-    await modal.close();
+    try {
+      if (!terminated) await sandbox.terminate({ wait: true });
+    } finally {
+      await modal.close();
+    }
   }
 }

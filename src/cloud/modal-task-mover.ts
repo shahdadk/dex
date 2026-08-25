@@ -1,29 +1,37 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { TaskMover } from "../dex/orchestrator.js";
-import type { TaskKnowledge } from "../memory/index.js";
+import {
+  createGitCheckpoint,
+  listTrackedFiles,
+  readTrackedTextFilesAtRevision,
+  resolveGitRevision,
+  type TaskKnowledge,
+} from "../memory/index.js";
 import {
   acquireCodexAuthLease,
   isCodexAuthLeaseBusyError,
   releaseCodexAuthLease,
   type CodexAuthLeaseReleaseEvidence,
 } from "../setup/modal-auth.js";
+import { assertStrongRootHandoffKey } from "../setup/handoff-key.js";
 import type { EventLog } from "../state/events.js";
 import { WorkerSessionSchema, type AgentKind, type DexTask } from "../state/schemas.js";
 import type { DexStateStore } from "../state/store.js";
 import type { TaskManager } from "../tasks/task-manager.js";
 import {
+  assertValidHandoff,
   createHandoff,
-  readHandoff,
   writeHandoff,
   type HandoffDocument,
 } from "../tasks/handoff.js";
-import { execFile } from "../utils/exec.js";
 import { workerId } from "../utils/ids.js";
+import { redactString } from "../utils/redact.js";
 import { ModalAdapter } from "./modal/adapter.js";
 import {
+  ModalResultArtifactSchema,
   ModalStartupAcknowledgementSchema,
   type ModalStartupAcknowledgement,
 } from "./modal/schemas.js";
@@ -34,6 +42,83 @@ export const MODAL_HANDOFF_JOURNAL_KEY = "modalHandoffJournal";
 const DEFAULT_RECOVERY_MAX_ATTEMPTS = 4;
 const DEFAULT_RECOVERY_BACKOFF_MS = 1_000;
 const MAX_RECOVERY_BACKOFF_MS = 30_000;
+const DEFAULT_MODAL_STARTUP_TIMEOUT_MS = 3 * 60_000;
+const HANDOFF_DERIVATION_DOMAIN = "dex-handoff-v1";
+const MAX_REPOSITORY_INSTRUCTION_FILES = 32;
+const MAX_REPOSITORY_INSTRUCTION_FILE_BYTES = 64 * 1024;
+const MAX_REPOSITORY_INSTRUCTION_TOTAL_BYTES = 128 * 1024;
+const MAX_HANDOFF_KEY_INSTALL_ERROR_BYTES = 2_000;
+const INSTALL_HANDOFF_KEY_SCRIPT = String.raw`
+const {
+  closeSync,
+  constants,
+  fsyncSync,
+  lstatSync,
+  openSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} = require("node:fs");
+const { randomUUID } = require("node:crypto");
+const target = "/dex/handoff.key";
+const temporary = target + ".tmp-" + process.pid + "-" + randomUUID();
+let descriptor;
+let key;
+(async () => {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of process.stdin) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += bytes.length;
+    if (size > 4096) throw new Error("Dex handoff key exceeds the secure installer limit");
+    chunks.push(bytes);
+  }
+  key = Buffer.concat(chunks);
+  if (key.length < 16) throw new Error("Dex handoff key is too short");
+  descriptor = openSync(
+    temporary,
+    constants.O_WRONLY |
+      constants.O_CREAT |
+      constants.O_EXCL |
+      constants.O_NOFOLLOW |
+      constants.O_CLOEXEC,
+    0o600,
+  );
+  writeFileSync(descriptor, key);
+  fsyncSync(descriptor);
+  closeSync(descriptor);
+  descriptor = undefined;
+  const before = lstatSync(temporary);
+  if (!before.isFile() || before.nlink !== 1 || (before.mode & 0o777) !== 0o600) {
+    throw new Error("Dex handoff key temporary file failed security validation");
+  }
+  renameSync(temporary, target);
+  const after = lstatSync(target);
+  if (!after.isFile() || after.nlink !== 1 || (after.mode & 0o777) !== 0o600) {
+    throw new Error("Dex handoff key failed post-rename security validation");
+  }
+})().catch((error) => {
+  process.stderr.write(error instanceof Error ? error.message : String(error));
+  process.exitCode = 1;
+}).finally(() => {
+  if (key) key.fill(0);
+  if (descriptor !== undefined) {
+    try { closeSync(descriptor); } catch {}
+  }
+  try { unlinkSync(temporary); } catch {}
+});
+`;
+const MODAL_WORKER_OUTBOUND_DOMAINS = [
+  "openai.com",
+  "*.openai.com",
+  "chatgpt.com",
+  "*.chatgpt.com",
+  "oaistatic.com",
+  "*.oaistatic.com",
+  "oaiusercontent.com",
+  "*.oaiusercontent.com",
+  "registry.npmjs.org",
+] as const;
 
 type ModalSandbox = Awaited<ReturnType<ModalAdapter["fromId"]>>;
 
@@ -84,7 +169,6 @@ export interface ModalTaskMoverOptions {
   tasks: TaskManager;
   handoffsRoot: string;
   modal?: ModalAdapter;
-  modalSecretName?: string;
   codexAuthVolumeName?: string;
   codexAuthLeasePath?: string;
   signingKey?: string;
@@ -253,8 +337,7 @@ export class ModalTaskMover implements TaskMover {
   ): Promise<void> {
     if (preferredAgent !== "codex") throw new Error("Dex P0 cloud continuation requires Codex");
     const codexAuthVolumeName = this.#codexAuthVolumeName();
-    const signingKey = this.#signingKey();
-    if (!signingKey) throw new Error("DEX_HANDOFF_SIGNING_KEY is required for cloud handoff");
+    const rootSigningKey = this.#rootSigningKey();
     throwIfAborted(signal);
 
     const directory = path.join(this.#options.handoffsRoot, task.id);
@@ -265,6 +348,7 @@ export class ModalTaskMover implements TaskMover {
     await this.#options.store.updateState((state) => {
       const current = state.tasks[task.id];
       if (!current) throw new Error(`Task disappeared before cloud handoff: ${task.id}`);
+      clearFinishedCloudRunMetadata(current);
       current.metadata.cloudMonitorAcknowledged = false;
       delete current.metadata.cloudFailure;
       delete current.metadata.reconciledAt;
@@ -272,7 +356,6 @@ export class ModalTaskMover implements TaskMover {
       delete current.metadata.handoffHash;
       delete current.metadata.memoryCount;
       delete current.metadata.failedApproachCount;
-      delete current.metadata[MODAL_HANDOFF_JOURNAL_KEY];
       current.updatedAt = new Date().toISOString();
     });
     throwIfAborted(signal);
@@ -288,23 +371,38 @@ export class ModalTaskMover implements TaskMover {
       payload: { source: "local", destination: "modal", agent: "codex" },
     });
 
-    const baseCommitResult = await execFile("git", [
-      "-C",
-      task.worktreePath,
-      "rev-parse",
-      task.baseBranch,
-    ]);
-    if (baseCommitResult.exitCode !== 0) {
-      throw new Error(`Could not resolve handoff base commit: ${baseCommitResult.stderr}`);
-    }
+    const baseCommit = await resolveGitRevision({
+      repositoryPath: task.worktreePath,
+      revision: task.baseBranch,
+    });
     const validation = await validationCommands(task.worktreePath, task);
+    const checkpoint = await createGitCheckpoint({
+      repositoryPath: task.worktreePath,
+      bundlePath,
+      baseCommit,
+      branch: task.dexBranch,
+      commitDirty: true,
+      commitMessage: "dex: checkpoint before cloud handoff",
+    });
+    const repositoryInstructions = await repositoryInstructionConstraints(
+      task.worktreePath,
+      checkpoint.headCommit,
+    );
+    const handoffCreatedAt = new Date().toISOString();
+    const handoffSigningKey = deriveHandoffSigningKey(
+      rootSigningKey,
+      task.id,
+      handoffCreatedAt,
+    );
     const handoff = await createHandoff(
       {
         taskId: task.id,
+        createdAt: handoffCreatedAt,
         goal: task.originalRequest,
         constraints: [
           "Do not push, deploy, merge, or modify protected branches.",
           "Preserve inherited failures and validate the completed implementation.",
+          ...repositoryInstructions,
         ],
         acceptanceCriteria: [
           task.nextStep ?? "Complete the requested engineering outcome",
@@ -313,8 +411,9 @@ export class ModalTaskMover implements TaskMover {
         repository: {
           ...(task.repositoryRemote ? { url: task.repositoryRemote } : {}),
           path: task.worktreePath,
-          baseCommit: baseCommitResult.stdout.trim(),
+          baseCommit,
           workingBranch: task.dexBranch,
+          checkpoint,
           project: path.basename(task.repositoryPath),
         },
         validation: {
@@ -331,12 +430,7 @@ export class ModalTaskMover implements TaskMover {
         },
       },
       {
-        gitCheckpoint: {
-          bundlePath,
-          commitDirty: true,
-          commitMessage: "dex: checkpoint before cloud handoff",
-        },
-        signingKey,
+        signingKey: handoffSigningKey,
         signingKeyId: process.env.DEX_HANDOFF_KEY_ID ?? "dex-device",
         ...(this.#options.taskKnowledge
           ? { taskKnowledgeProvider: () => this.#options.taskKnowledge!(task.id) }
@@ -392,14 +486,8 @@ export class ModalTaskMover implements TaskMover {
           image: "node:22-bookworm",
           imageCommands: [
             "RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*",
-            "RUN npm install --global @openai/codex@0.149.0",
+            "RUN npm install --global @openai/codex@0.149.1",
           ],
-          secretNames: [
-            this.#options.modalSecretName ??
-              process.env.DEX_MODAL_SECRET_NAME ??
-              "dex-workers",
-          ],
-          requiredSecretKeys: ["DEX_HANDOFF_SIGNING_KEY"],
           volumeNames: {
             "/codex-home": codexAuthVolumeName,
           },
@@ -410,6 +498,7 @@ export class ModalTaskMover implements TaskMover {
             timeoutMs: 24 * 60 * 60_000,
             workdir: "/workspace",
             env: { CODEX_HOME: "/codex-home" },
+            outboundDomainAllowlist: [...MODAL_WORKER_OUTBOUND_DOMAINS],
             name: modalSandboxName(operationToken),
             command: [
               "/bin/sh",
@@ -448,7 +537,7 @@ export class ModalTaskMover implements TaskMover {
       const startup = await waitForStartup(
         sandbox,
         expectedStartup(handoff),
-        this.#options.startupTimeoutMs ?? 60_000,
+        this.#options.startupTimeoutMs ?? DEFAULT_MODAL_STARTUP_TIMEOUT_MS,
         signal,
       );
       await this.#persistStartupAcknowledgement(task.id, registration, startup);
@@ -626,7 +715,7 @@ export class ModalTaskMover implements TaskMover {
       const startup = await waitForStartup(
         sandbox,
         expectedStartup(handoff),
-        this.#options.startupTimeoutMs ?? 60_000,
+        this.#options.startupTimeoutMs ?? DEFAULT_MODAL_STARTUP_TIMEOUT_MS,
       );
       await this.#persistStartupAcknowledgement(taskId, registration, startup);
       await this.#options.scheduleMonitor(registration);
@@ -656,26 +745,42 @@ export class ModalTaskMover implements TaskMover {
     taskId: string,
     journal: ModalHandoffJournal,
   ): Promise<HandoffDocument> {
-    const signingKey = this.#signingKey();
-    if (!signingKey) {
-      throw new Error("DEX_HANDOFF_SIGNING_KEY is required to validate a recovered handoff");
-    }
-    const directory = path.join(this.#options.handoffsRoot, taskId);
-    const handoff = await readHandoff(path.join(directory, "handoff.json"), signingKey);
-    if (handoff.taskId !== taskId) throw new Error("Recovered handoff belongs to the wrong task");
+    const { handoff } = await this.#readHandoffPackage(taskId);
     if (handoff.contentHash !== journal.handoffSha256) {
       throw new Error("Recovered handoff does not match the journaled content hash");
     }
+    return handoff;
+  }
+
+  async #readHandoffPackage(
+    taskId: string,
+  ): Promise<{ handoff: HandoffDocument; signingKey: string }> {
+    const rootSigningKey = this.#rootSigningKey();
+    const directory = path.join(this.#options.handoffsRoot, taskId);
+    const handoffPath = path.join(directory, "handoff.json");
+    let candidate: unknown;
+    try {
+      candidate = JSON.parse(await readFile(handoffPath, "utf8"));
+    } catch (error) {
+      throw new Error("Could not parse the local Modal handoff package", { cause: error });
+    }
+    const handoff = handoffSigningEnvelope(candidate, taskId);
+    const signingKey = deriveHandoffSigningKey(
+      rootSigningKey,
+      handoff.taskId,
+      handoff.createdAt,
+    );
+    await assertValidHandoff(handoff, signingKey);
 
     const artifact = handoff.integrity.artifacts.find(
-      (candidate) => candidate.path === "repo.bundle",
+      (entry) => entry.path === "repo.bundle",
     );
     if (!artifact) throw new Error("Recovered handoff manifest does not contain repo.bundle");
     const bundle = await readFile(path.join(directory, "repo.bundle"));
     if (sha256(bundle) !== artifact.sha256) {
       throw new Error("Recovered repo.bundle does not match the signed handoff package");
     }
-    return handoff;
+    return { handoff, signingKey };
   }
 
   async #persistSandboxCreated(
@@ -853,12 +958,14 @@ export class ModalTaskMover implements TaskMover {
   ): Promise<void> {
     const directory = path.join(this.#options.handoffsRoot, taskId);
     if (!readyOnly) {
+      const { signingKey } = await this.#readHandoffPackage(taskId);
       const workerScript =
         this.#options.workerScriptPath ??
         path.join(path.dirname(fileURLToPath(import.meta.url)), "cloud-worker.js");
       await sandbox.copyFromLocal(path.join(directory, "repo.bundle"), "/dex/repo.bundle");
       await sandbox.copyFromLocal(path.join(directory, "handoff.json"), "/dex/handoff.json");
       await sandbox.copyFromLocal(workerScript, "/dex/cloud-worker.js");
+      await installScopedHandoffKey(sandbox, signingKey);
     }
     if (includeReady) {
       await sandbox.copyFromLocal(path.join(directory, "ready"), "/dex/ready");
@@ -1283,8 +1390,10 @@ export class ModalTaskMover implements TaskMover {
     return journal;
   }
 
-  #signingKey(): string | undefined {
-    return this.#options.signingKey ?? process.env.DEX_HANDOFF_SIGNING_KEY;
+  #rootSigningKey(): string {
+    const value = this.#options.signingKey ?? process.env.DEX_HANDOFF_SIGNING_KEY;
+    assertStrongRootHandoffKey(value);
+    return value;
   }
 
   #leasePath(): string {
@@ -1328,6 +1437,41 @@ export class ModalTaskMover implements TaskMover {
 
   #sleep(milliseconds: number): Promise<void> {
     return this.#options.sleep?.(milliseconds) ?? delay(milliseconds);
+  }
+}
+
+async function installScopedHandoffKey(
+  sandbox: ModalSandbox,
+  signingKey: string,
+): Promise<void> {
+  const installer = await sandbox.exec(
+    ["node", "-e", INSTALL_HANDOFF_KEY_SCRIPT],
+    { mode: "text", timeoutMs: 30_000 },
+  );
+  if (!installer.stdin) {
+    throw new Error("The Modal SDK did not expose stdin for secure handoff-key delivery");
+  }
+  const writer = installer.stdin.getWriter();
+  try {
+    await writer.write(signingKey);
+    await writer.close();
+  } catch (error) {
+    await writer.abort(error).catch(() => undefined);
+    throw new Error("Could not deliver the scoped handoff key through Modal stdin", {
+      cause: error,
+    });
+  } finally {
+    writer.releaseLock();
+  }
+  const exitCode = await installer.wait();
+  if (exitCode !== 0) {
+    const stderr = redactString(await installer.stderr.readText().catch(() => ""))
+      .slice(0, MAX_HANDOFF_KEY_INSTALL_ERROR_BYTES);
+    throw new Error(
+      stderr
+        ? `Modal rejected the scoped handoff key installation: ${stderr}`
+        : `Modal rejected the scoped handoff key installation with exit code ${exitCode}`,
+    );
   }
 }
 
@@ -1384,6 +1528,103 @@ function modalHandoffJournal(value: unknown): ModalHandoffJournal | undefined {
     if (evidence.operationToken !== operationToken) return undefined;
   }
   return candidate as unknown as ModalHandoffJournal;
+}
+
+function clearFinishedCloudRunMetadata(task: DexTask): void {
+  if (task.metadata.pendingCloudResultImport !== undefined) {
+    throw new Error(
+      `Task ${task.id} still has a pending cloud result import; finish recovery before another handoff`,
+    );
+  }
+
+  const rawEffects = task.metadata.cloudCompletionEffects;
+  const completedEffects = rawEffects === undefined
+    ? false
+    : cloudCompletionEffectsComplete(rawEffects, task.id);
+  if (rawEffects !== undefined && !completedEffects) {
+    throw new Error(
+      `Task ${task.id} still has unfinished cloud completion effects; finish recovery before another handoff`,
+    );
+  }
+
+  const rawJournal = task.metadata[MODAL_HANDOFF_JOURNAL_KEY];
+  if (rawJournal !== undefined) {
+    const journal = modalHandoffJournal(rawJournal);
+    if (!journal) {
+      throw new Error(`Task ${task.id} has an invalid Modal handoff journal`);
+    }
+    const cleanupFinished =
+      (journal.phase === "failed" || journal.phase === "stopped") &&
+      journal.cleanupPending !== true;
+    const priorCompletionFinished = journal.phase === "completed" && completedEffects;
+    if (!cleanupFinished && !priorCompletionFinished) {
+      throw new Error(
+        `Task ${task.id} still has an active or unfinished Modal handoff; recover it before starting another`,
+      );
+    }
+    delete task.metadata[MODAL_HANDOFF_JOURNAL_KEY];
+  }
+
+  if (completedEffects) {
+    delete task.metadata.cloudCompletionEffects;
+    delete task.metadata.resultImport;
+  }
+}
+
+function cloudCompletionEffectsComplete(value: unknown, taskId: string): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  if (
+    candidate.version !== 1 ||
+    candidate.phase !== "complete" ||
+    typeof candidate.commandId !== "string" ||
+    candidate.commandId.length < 1 ||
+    candidate.commandId.length > 512 ||
+    !candidate.completion ||
+    typeof candidate.completion !== "object" ||
+    Array.isArray(candidate.completion) ||
+    (candidate.completion as Record<string, unknown>).taskId !== taskId ||
+    !["succeeded", "failed", "cancelled"].includes(String(candidate.finalStatus)) ||
+    typeof candidate.summary !== "string" ||
+    candidate.summary.length < 1 ||
+    candidate.summary.length > 20_000 ||
+    typeof candidate.eventId !== "string" ||
+    candidate.eventId.length < 1 ||
+    !isIsoTimestamp(candidate.createdAt) ||
+    !isIsoTimestamp(candidate.updatedAt) ||
+    (candidate.operationToken !== undefined &&
+      (typeof candidate.operationToken !== "string" ||
+        !/^[a-f0-9]{64}$/.test(candidate.operationToken))) ||
+    (candidate.leaseReleaseEvidence !== undefined &&
+      !isCodexAuthLeaseReleaseEvidence(candidate.leaseReleaseEvidence))
+  ) {
+    return false;
+  }
+  if (!candidate.effects || typeof candidate.effects !== "object" || Array.isArray(candidate.effects)) {
+    return false;
+  }
+  const effects = candidate.effects as Record<string, unknown>;
+  const requiredEffects = [
+    "sandboxTerminated",
+    "eventAppended",
+    "leaseReleased",
+    "queueDrained",
+    "receiptQueued",
+    "receiptAccepted",
+    "powerChecked",
+  ];
+  return (
+    Object.keys(effects).length === requiredEffects.length &&
+    requiredEffects.every((name) => effects[name] === true)
+  );
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value) &&
+    !Number.isNaN(Date.parse(value))
+  );
 }
 
 function isCodexAuthLeaseReleaseEvidence(
@@ -1518,32 +1759,161 @@ async function waitForStartup(
   let lastError: unknown;
   while (Date.now() < deadline) {
     throwIfAborted(signal);
+    let raw: string;
     try {
-      const parsed = ModalStartupAcknowledgementSchema.parse(
-        JSON.parse(await sandbox.raw.filesystem.readText("/dex/startup.json")),
-      );
-      if (parsed.taskId !== expected.taskId) {
-        throw new Error("Modal startup acknowledged the wrong task");
-      }
-      if (parsed.handoffSha256 !== expected.handoffSha256) {
-        throw new Error("Modal startup acknowledged the wrong handoff hash");
-      }
-      if (!sameIds(parsed.loadedMemoryIds, expected.memoryIds)) {
-        throw new Error("Modal startup did not load the exact memory package");
-      }
-      if (!sameIds(parsed.loadedFailedApproachIds, expected.failedApproachIds)) {
-        throw new Error("Modal startup did not load the exact failed-approach package");
-      }
-      return parsed;
+      raw = await sandbox.raw.filesystem.readText("/dex/startup.json");
     } catch (error) {
       if (isAbortError(error)) throw error;
+      if (!isRetryableModalFileRead(error)) throw error;
       lastError = error;
+      const terminal = await readPreStartupResult(sandbox);
+      if (terminal) {
+        if (terminal.taskId !== expected.taskId) {
+          throw new Error("Modal worker published a pre-start result for the wrong task");
+        }
+        if (terminal.handoffSha256 !== expected.handoffSha256) {
+          throw new Error("Modal worker published a pre-start result for the wrong handoff");
+        }
+        throw new Error(
+          `Modal worker ${terminal.status} before startup acknowledgement: ${redactString(terminal.summary).slice(0, 500)}`,
+        );
+      }
+      try {
+        const exitCode = await sandbox.poll();
+        if (exitCode !== null) {
+          throw new Error(
+            `Modal worker exited with code ${exitCode} before startup acknowledgement`,
+          );
+        }
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          /^Modal worker exited with code /.test(error.message)
+        ) {
+          throw error;
+        }
+        lastError = error;
+      }
       await abortableDelay(Math.min(500, Math.max(0, deadline - Date.now())), signal);
+      continue;
     }
+
+    let parsed: ModalStartupAcknowledgement;
+    try {
+      parsed = ModalStartupAcknowledgementSchema.parse(JSON.parse(raw));
+    } catch (error) {
+      throw new Error("Modal worker published an invalid startup acknowledgement", {
+        cause: error,
+      });
+    }
+    if (parsed.taskId !== expected.taskId) {
+      throw new Error("Modal startup acknowledged the wrong task");
+    }
+    if (parsed.handoffSha256 !== expected.handoffSha256) {
+      throw new Error("Modal startup acknowledged the wrong handoff hash");
+    }
+    if (!sameIds(parsed.loadedMemoryIds, expected.memoryIds)) {
+      throw new Error("Modal startup did not load the exact memory package");
+    }
+    if (!sameIds(parsed.loadedFailedApproachIds, expected.failedApproachIds)) {
+      throw new Error("Modal startup did not load the exact failed-approach package");
+    }
+    return parsed;
   }
   throw new Error("Timed out waiting for Codex/Modal startup acknowledgement", {
     cause: lastError,
   });
+}
+
+async function readPreStartupResult(
+  sandbox: ModalSandbox,
+): Promise<ReturnType<typeof ModalResultArtifactSchema.parse> | undefined> {
+  let raw: string;
+  try {
+    raw = await sandbox.raw.filesystem.readText("/dex/result.json");
+  } catch (error) {
+    if (isRetryableModalFileRead(error)) return undefined;
+    throw error;
+  }
+  try {
+    return ModalResultArtifactSchema.parse(JSON.parse(raw));
+  } catch (error) {
+    throw new Error("Modal worker published an invalid terminal result before startup", {
+      cause: error,
+    });
+  }
+}
+
+function isMissingModalFile(error: unknown): boolean {
+  const candidate = error as (NodeJS.ErrnoException & { name?: string }) | undefined;
+  return (
+    candidate?.code === "ENOENT" ||
+    candidate?.name === "SandboxFilesystemNotFoundError" ||
+    /(?:no such file|not found|does not exist)/i.test(errorMessage(error))
+  );
+}
+
+function isRetryableModalFileRead(error: unknown): boolean {
+  if (isMissingModalFile(error)) return true;
+  const retryableCodes = new Set<string | number>([
+    "EAI_AGAIN",
+    "ECONNRESET",
+    "EHOSTUNREACH",
+    "EIO",
+    "ENETDOWN",
+    "ENETUNREACH",
+    "EPIPE",
+    "ETIMEDOUT",
+    "ABORTED",
+    "CANCELLED",
+    "DEADLINE_EXCEEDED",
+    "INTERNAL",
+    "RESOURCE_EXHAUSTED",
+    "UNAVAILABLE",
+    1,
+    4,
+    8,
+    10,
+    13,
+    14,
+  ]);
+  for (const candidate of errorChain(error)) {
+    const code = (candidate as { code?: unknown }).code;
+    if (
+      (typeof code === "string" || typeof code === "number") &&
+      (retryableCodes.has(code) || retryableCodes.has(String(code).toUpperCase()))
+    ) {
+      return true;
+    }
+    const name = candidate instanceof Error ? candidate.name : "";
+    if (name === "SandboxTimeoutError" || name === "TimeoutError") return true;
+    const message = errorMessage(candidate);
+    if (
+      /(?:deadline exceeded|timed? out|temporarily unavailable|service unavailable|sandbox is unavailable|connection (?:reset|closed)|transport (?:error|closed)|control[- ]plane (?:error|unavailable))/i.test(message)
+    ) {
+      return true;
+    }
+    if (
+      name === "SandboxFilesystemError" &&
+      /^An unexpected error occurred,/i.test(message)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function errorChain(error: unknown): unknown[] {
+  const values: unknown[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  while (current !== undefined && current !== null && !seen.has(current) && values.length < 5) {
+    seen.add(current);
+    values.push(current);
+    if (typeof current !== "object") break;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return values;
 }
 
 async function terminalizeSandbox(
@@ -1615,6 +1985,68 @@ function sameIds(actual: string[], expected: string[]): boolean {
   return left.every((value, index) => value === right[index]);
 }
 
+function deriveHandoffSigningKey(
+  rootSigningKey: string,
+  taskId: string,
+  createdAt: string,
+): string {
+  return createHmac("sha256", rootSigningKey)
+    .update(HANDOFF_DERIVATION_DOMAIN)
+    .update("\0")
+    .update(taskId)
+    .update("\0")
+    .update(createdAt)
+    .digest("base64url");
+}
+
+function handoffSigningEnvelope(candidate: unknown, expectedTaskId: string): HandoffDocument {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    throw new Error("Local Modal handoff is not a document");
+  }
+  const envelope = candidate as Record<string, unknown>;
+  if (envelope.taskId !== expectedTaskId) {
+    throw new Error("Recovered handoff belongs to the wrong task");
+  }
+  if (
+    typeof envelope.createdAt !== "string" ||
+    envelope.createdAt.length > 64 ||
+    Number.isNaN(Date.parse(envelope.createdAt))
+  ) {
+    throw new Error("Recovered handoff has an invalid signing context");
+  }
+  return candidate as HandoffDocument;
+}
+
+async function repositoryInstructionConstraints(
+  repositoryPath: string,
+  revision: string,
+): Promise<string[]> {
+  const files = (await readTrackedTextFilesAtRevision({
+    repositoryPath,
+    revision,
+    pathspecs: ["AGENTS.md"],
+    maxFiles: MAX_REPOSITORY_INSTRUCTION_FILES,
+    maxFileBytes: MAX_REPOSITORY_INSTRUCTION_FILE_BYTES,
+    maxTotalBytes: MAX_REPOSITORY_INSTRUCTION_TOTAL_BYTES,
+  }))
+    .sort((left, right) => {
+      const depth = left.path.split("/").length - right.path.split("/").length;
+      return depth === 0 ? left.path.localeCompare(right.path) : depth;
+    });
+  const constraints: string[] = [];
+  for (const file of files) {
+    const content = file.content.trim();
+    if (!content) continue;
+    const scope = path.posix.dirname(file.path) === "."
+      ? "repository root"
+      : `${path.posix.dirname(file.path)}/`;
+    constraints.push(
+      `Repository instructions from ${file.path} (scope: ${scope}):\n${content}`,
+    );
+  }
+  return constraints;
+}
+
 function sha256(value: string | Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -1637,14 +2069,8 @@ async function validationCommands(
   ) {
     return configured as string[][];
   }
-  const packageCheck = await execFile("git", [
-    "-C",
-    repositoryPath,
-    "ls-files",
-    "--error-unmatch",
-    "package.json",
-  ]);
-  return packageCheck.exitCode === 0 ? [["npm", "test"]] : [];
+  const tracked = await listTrackedFiles({ repositoryPath, pathspecs: ["package.json"] });
+  return tracked.includes("package.json") ? [["npm", "test"]] : [];
 }
 
 function taskKnowledge(task: DexTask) {

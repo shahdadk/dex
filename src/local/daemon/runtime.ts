@@ -1136,30 +1136,49 @@ export class DexDaemonRuntime {
       await removePrompt();
       return "okay. i left the captured tasks running locally.";
     }
+    if (!prompt.taskSnapshots) {
+      await removePrompt();
+      return "that battery prompt predates worker fencing, so i left the captured tasks running locally.";
+    }
 
     const replies: string[] = [];
-    for (const taskId of prompt.taskIds) {
+    const completedLocally: string[] = [];
+    const changedBeforeClaim: string[] = [];
+    for (const captured of prompt.taskSnapshots) {
       const current = await this.#store.read();
-      const task = current.tasks[taskId];
-      if (!task || !ACTIVE_TASK_STATUSES.has(task.status)) continue;
+      const task = current.tasks[captured.taskId];
+      if (!task) continue;
       const worker = task.currentWorkerId ? current.workers[task.currentWorkerId] : undefined;
       if (worker?.target.kind !== "local") continue;
-      const ambiguousId = Object.values(current.tasks).some((candidate) =>
-        candidate.id !== taskId && (
-          candidate.id.toLowerCase().includes(taskId.toLowerCase()) ||
-          candidate.title.toLowerCase().includes(taskId.toLowerCase())
-        ),
-      );
-      if (ambiguousId) throw new Error(`Captured task ID is not uniquely resolvable: ${taskId}`);
-      replies.push(await this.#orchestrator.handle([{
-        type: "MOVE_TASK",
-        taskQuery: taskId,
-        destination: "cloud",
-        preferredAgent: "codex",
-      }], context));
+      if (task.status === "completed") {
+        completedLocally.push(task.title);
+        continue;
+      }
+      if (!ACTIVE_TASK_STATUSES.has(task.status)) continue;
+      const result = await this.#orchestrator.moveCapturedLocalTaskToCloud(captured, context);
+      if (result.status === "started") {
+        replies.push(`${result.title} is being handed to codex in the cloud.`);
+      } else if (result.status === "queued") {
+        replies.push(`${result.title} is queued to move to codex in the cloud.`);
+      } else if (result.status === "local_completed") {
+        completedLocally.push(result.title);
+      } else {
+        changedBeforeClaim.push(result.title);
+      }
     }
     await removePrompt();
-    return replies.filter(Boolean).join("\n\n") || "the captured tasks are no longer running locally, so there was nothing to move.";
+    const completedReply = completedLocally.length === 0
+      ? ""
+      : completedLocally.length === 1
+        ? `${completedLocally[0]} already finished locally, so i didn't move or rerun it.`
+        : `${completedLocally.join(", ")} already finished locally, so i didn't move or rerun them.`;
+    const changedReply = changedBeforeClaim.length === 0
+      ? ""
+      : changedBeforeClaim.length === 1
+        ? `${changedBeforeClaim[0]} changed workers before i could claim it, so i left the current work alone.`
+        : `${changedBeforeClaim.join(", ")} changed workers before i could claim them, so i left the current work alone.`;
+    return [...replies.filter(Boolean), completedReply, changedReply].filter(Boolean).join("\n\n")
+      || "the captured tasks are no longer running locally, so there was nothing to move.";
   }
 
   async #claimMessage(messageId: string, commandId: string): Promise<boolean> {

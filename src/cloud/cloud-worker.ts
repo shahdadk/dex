@@ -4,11 +4,13 @@ import { constants, type Stats } from "node:fs";
 import {
   access,
   chmod,
+  lstat,
   mkdir,
   mkdtemp,
   open,
   readFile,
   readdir,
+  realpath,
   rename,
   rm,
   stat,
@@ -45,6 +47,18 @@ const SECRET_ENVIRONMENT_NAME = /(?:^|_)(?:TOKEN|KEY|SECRET|PASSWORD|AUTH|COOKIE
 const SECRET_ENVIRONMENT_GREP = "(^|_)(TOKEN|KEY|SECRET|PASSWORD|AUTH|COOKIE)(_|$)";
 const MAX_BOOTSTRAP_MANIFEST_BYTES = 16 * 1024 * 1024;
 const MAX_CODEX_AUTH_BYTES = 16 * 1024 * 1024;
+const MAX_HANDOFF_KEY_BYTES = 4 * 1024;
+const MAX_TERMINAL_SUMMARY_LENGTH = 500;
+const MAX_FAILED_VALIDATION_COMMAND_LENGTH = 180;
+const TRUSTED_CODEX_PACKAGE_ROOT = "/usr/local/lib/node_modules/@openai/codex";
+const CODEX_ARG0_GENERATION = /^codex-arg0[A-Za-z0-9_-]{1,128}$/;
+const CODEX_ARG0_REQUIRED_ENTRIES = [
+  ".lock",
+  "apply_patch",
+  "applypatch",
+  "codex-execve-wrapper",
+] as const;
+const CODEX_ARG0_OPTIONAL_ENTRIES = ["codex-linux-sandbox"] as const;
 
 interface AuthCacheIdentity {
   dev: number;
@@ -94,9 +108,9 @@ export async function runCloudWorker(): Promise<void> {
     handoff = JSON.parse(await readFile(path.join(root, "handoff.json"), "utf8")) as HandoffDocument;
     requireHandoff(handoff);
     await verifyHandoffIntegrity(handoff);
-    // The HMAC is needed only to authenticate the immutable handoff. Remove it
-    // from the long-lived worker before any tool, package manager, or coding
-    // agent process can inherit or inspect the parent environment.
+    // Older deployments supplied this through an environment secret. The
+    // current worker accepts only the one-time file, but remove any inherited
+    // legacy value before a tool or coding process can inspect the environment.
     delete process.env.DEX_HANDOFF_SIGNING_KEY;
     await mkdir(workspaceRoot(), { recursive: true, mode: 0o700 });
     activeCodexRuntime = await createCodexRuntime();
@@ -108,7 +122,15 @@ export async function runCloudWorker(): Promise<void> {
       true,
       codexEnvironment(activeCodexRuntime.workerHome),
     );
-    await assertAuthOnlyCodexHome(activeCodexRuntime.workerHome);
+    await validateEphemeralCodexHome(activeCodexRuntime.workerHome);
+    await installCodexPermissionProfile(
+      activeCodexRuntime.workerHome,
+      CODEX_WORKER_PROFILE,
+      [activeCodexRuntime.persistentHome, activeCodexRuntime.workerHome],
+      true,
+      true,
+      [path.join(activeCodexRuntime.workerHome, "tmp", "arg0")],
+    );
 
     await runSafeHostGit(["clone", path.join(root, "repo.bundle"), project], workspaceRoot());
     await runSafeHostGit(["-C", project, "checkout", handoff.repository.workingBranch]);
@@ -124,16 +146,16 @@ export async function runCloudWorker(): Promise<void> {
     await rejectProjectCodexConfig();
 
     const worker = spawn("codex", [
+      "--profile",
+      CODEX_WORKER_PROFILE,
       "--ask-for-approval",
       "never",
       "exec",
       "--cd",
       project,
-      "--ignore-user-config",
+      "--strict-config",
       "--ignore-rules",
       "--ephemeral",
-      "--sandbox",
-      "workspace-write",
       "--json",
       "--color",
       "never",
@@ -169,7 +191,8 @@ export async function runCloudWorker(): Promise<void> {
         result: await runCredentialDenied(command[0]!, command.slice(1), project, false),
       });
     }
-    const validationPassed = validations.every(({ result }) => result.exitCode === 0);
+    const failedValidation = validations.find(({ result }) => result.exitCode !== 0);
+    const validationPassed = failedValidation === undefined;
     const succeeded = exitCode === 0 && turnCompleted && validationPassed;
     if (succeeded) {
       const status = await runCredentialDeniedGit(["status", "--porcelain=v1"], false);
@@ -199,9 +222,11 @@ export async function runCloudWorker(): Promise<void> {
       taskId: handoff.taskId,
       handoffSha256: handoff.contentHash,
       status: succeeded ? "succeeded" : "failed",
-      summary: redactText(
-        succeeded ? summary : bounded(stderr || summary || `Codex exited ${exitCode}`, 500),
-      ),
+      summary: succeeded
+        ? summary
+        : failedValidation
+          ? summarizeValidationFailure(failedValidation)
+          : summarizeCodexFailure(exitCode, turnCompleted, stderr),
       validation: {
         commands: validations.map(({ argv }) => JSON.stringify(argv)),
         passed: validationPassed,
@@ -483,27 +508,58 @@ function requireHandoff(value: HandoffDocument): void {
 }
 
 async function verifyHandoffIntegrity(handoff: HandoffDocument): Promise<void> {
-  const key = process.env.DEX_HANDOFF_SIGNING_KEY;
-  if (!key) throw new Error("Modal secret DEX_HANDOFF_SIGNING_KEY is unavailable");
-  const record = handoff as unknown as Record<string, unknown>;
-  const { contentHash: _contentHash, integrity, ...content } = record;
-  if (!integrity || typeof integrity !== "object") throw new Error("Handoff integrity manifest is missing");
-  const manifest = integrity as Record<string, unknown>;
-  const signature = manifest.signature as Record<string, unknown> | undefined;
-  const actualContentHash = sha256(canonicalJson(content));
-  if (!safeEqual(actualContentHash, handoff.contentHash)) throw new Error("Handoff content hash mismatch");
-  if (manifest.contentSha256 !== handoff.contentHash) throw new Error("Handoff manifest content hash mismatch");
-  if (signature?.algorithm !== "hmac-sha256" || typeof signature.value !== "string") {
-    throw new Error("Handoff HMAC signature is missing or unsupported");
+  const key = await consumeHandoffSigningKey();
+  try {
+    const record = handoff as unknown as Record<string, unknown>;
+    const { contentHash: _contentHash, integrity, ...content } = record;
+    if (!integrity || typeof integrity !== "object") throw new Error("Handoff integrity manifest is missing");
+    const manifest = integrity as Record<string, unknown>;
+    const signature = manifest.signature as Record<string, unknown> | undefined;
+    const actualContentHash = sha256(canonicalJson(content));
+    if (!safeEqual(actualContentHash, handoff.contentHash)) throw new Error("Handoff content hash mismatch");
+    if (manifest.contentSha256 !== handoff.contentHash) throw new Error("Handoff manifest content hash mismatch");
+    if (signature?.algorithm !== "hmac-sha256" || typeof signature.value !== "string") {
+      throw new Error("Handoff HMAC signature is missing or unsupported");
+    }
+    const { signature: _signature, ...unsignedManifest } = manifest;
+    const expected = createHmac("sha256", key).update(canonicalJson(unsignedManifest)).digest("hex");
+    if (!safeEqual(expected, signature.value)) throw new Error("Handoff HMAC signature is invalid");
+    const bundle = await readFile(path.join(root, "repo.bundle"));
+    const artifact = Array.isArray(manifest.artifacts)
+      ? (manifest.artifacts as Array<Record<string, unknown>>).find((item) => item.path === "repo.bundle")
+      : undefined;
+    if (!artifact || artifact.sha256 !== sha256(bundle)) throw new Error("Git bundle hash mismatch");
+  } finally {
+    key.fill(0);
   }
-  const { signature: _signature, ...unsignedManifest } = manifest;
-  const expected = createHmac("sha256", key).update(canonicalJson(unsignedManifest)).digest("hex");
-  if (!safeEqual(expected, signature.value)) throw new Error("Handoff HMAC signature is invalid");
-  const bundle = await readFile(path.join(root, "repo.bundle"));
-  const artifact = Array.isArray(manifest.artifacts)
-    ? (manifest.artifacts as Array<Record<string, unknown>>).find((item) => item.path === "repo.bundle")
-    : undefined;
-  if (!artifact || artifact.sha256 !== sha256(bundle)) throw new Error("Git bundle hash mismatch");
+}
+
+async function consumeHandoffSigningKey(): Promise<Buffer> {
+  const keyPath = path.join(root, "handoff.key");
+  let keyHandle;
+  try {
+    keyHandle = await open(keyPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const metadata = await keyHandle.stat();
+    if (!metadata.isFile() || metadata.nlink !== 1) {
+      throw new Error("Dex handoff key must be one regular file");
+    }
+    assertCurrentOwner(metadata.uid, "Dex handoff key");
+    if ((metadata.mode & 0o777) !== 0o600 || metadata.size < 16 || metadata.size > MAX_HANDOFF_KEY_BYTES) {
+      throw new Error("Dex handoff key has invalid permissions or size");
+    }
+    return await keyHandle.readFile();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ELOOP") {
+      throw new Error("Dex handoff key must not be a symbolic link");
+    }
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new Error("Dex handoff key is unavailable");
+    }
+    throw error;
+  } finally {
+    await keyHandle?.close().catch(() => undefined);
+    await unlink(keyPath).catch(() => undefined);
+  }
 }
 
 function canonicalJson(value: unknown): string {
@@ -538,6 +594,51 @@ function bounded(value: string, max: number): string {
 
 function boundedStart(value: string, max: number): string {
   return value.length > max ? value.slice(0, max) : value;
+}
+
+function boundedStartWithEllipsis(value: string, max: number): string {
+  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+}
+
+function boundedEndWithEllipsis(value: string, max: number): string {
+  return value.length > max ? `…${value.slice(value.length - max + 1)}` : value;
+}
+
+function summarizeValidationFailure(validation: {
+  argv: string[];
+  result: CommandResult;
+}): string {
+  const command = boundedStartWithEllipsis(
+    redactText(JSON.stringify(validation.argv)),
+    MAX_FAILED_VALIDATION_COMMAND_LENGTH,
+  );
+  const streams = [
+    validation.result.stdout.trim() ? `stdout: ${validation.result.stdout.trim()}` : "",
+    validation.result.stderr.trim() ? `stderr: ${validation.result.stderr.trim()}` : "",
+  ].filter(Boolean);
+  const usefulOutput = redactText(
+    (streams.join(" ") || "output: no stdout or stderr was produced").replace(/\s+/g, " "),
+  );
+  const prefix = `Validation failed for command ${command} (exit ${validation.result.exitCode}). `;
+  return `${prefix}${boundedEndWithEllipsis(
+    usefulOutput,
+    MAX_TERMINAL_SUMMARY_LENGTH - prefix.length,
+  )}`;
+}
+
+function summarizeCodexFailure(exitCode: number, turnCompleted: boolean, stderr: string): string {
+  const reason = exitCode !== 0
+    ? `Codex failed with exit code ${exitCode}.`
+    : turnCompleted
+      ? "Cloud continuation failed."
+      : "Codex failed to complete the cloud continuation.";
+  const usefulOutput = redactText(stderr.trim().replace(/\s+/g, " "));
+  if (!usefulOutput) return reason;
+  const prefix = `${reason} stderr: `;
+  return `${prefix}${boundedEndWithEllipsis(
+    usefulOutput,
+    MAX_TERMINAL_SUMMARY_LENGTH - prefix.length,
+  )}`;
 }
 
 async function exists(file: string): Promise<boolean> {
@@ -646,11 +747,144 @@ function requireActiveCodexRuntime(): CodexRuntime {
   return activeCodexRuntime;
 }
 
-async function assertAuthOnlyCodexHome(home: string): Promise<void> {
-  const entries = await readdir(home);
-  if (entries.length !== 1 || entries[0] !== "auth.json") {
-    throw new Error("Temporary Codex account home contains files other than auth.json");
+/**
+ * Accepts only the credential plus Codex's transient arg0 helper tree.
+ * Nothing below `tmp/` is persisted: only a separately revalidated auth.json
+ * is copied back to the private Modal Volume after the serialized worker ends.
+ */
+export async function validateEphemeralCodexHome(
+  home: string,
+  trustedPackageRoot = TRUSTED_CODEX_PACKAGE_ROOT,
+): Promise<void> {
+  await verifyCodexAuthentication(home);
+  const rootEntries = (await readdir(home)).sort();
+  if (rootEntries.length === 1 && rootEntries[0] === "auth.json") return;
+  if (rootEntries.length !== 2 || rootEntries[0] !== "auth.json" || rootEntries[1] !== "tmp") {
+    throw new Error("Temporary Codex account home contains an unrecognized root entry");
   }
+
+  const temporaryRoot = path.join(home, "tmp");
+  const arg0Root = path.join(temporaryRoot, "arg0");
+  await validateOwnedDirectory(temporaryRoot, "Codex temporary directory");
+  if (!sameEntries(await readdir(temporaryRoot), ["arg0"])) {
+    throw new Error("Temporary Codex account home contains an unrecognized tmp entry");
+  }
+  await validateOwnedDirectory(arg0Root, "Codex arg0 directory");
+  const generations = await readdir(arg0Root);
+  if (generations.length !== 1 || !CODEX_ARG0_GENERATION.test(generations[0]!)) {
+    throw new Error("Temporary Codex account home contains an invalid arg0 generation");
+  }
+
+  const generationRoot = path.join(arg0Root, generations[0]!);
+  await validateOwnedDirectory(generationRoot, "Codex arg0 generation");
+  const generationEntries = (await readdir(generationRoot)).sort();
+  const requiredEntries = [...CODEX_ARG0_REQUIRED_ENTRIES];
+  const allowedEntries = new Set<string>([
+    ...requiredEntries,
+    ...CODEX_ARG0_OPTIONAL_ENTRIES,
+  ]);
+  if (
+    !requiredEntries.every((entry) => generationEntries.includes(entry))
+    || generationEntries.some((entry) => !allowedEntries.has(entry))
+  ) {
+    throw new Error("Temporary Codex account home contains an invalid arg0 helper set");
+  }
+
+  const lockPath = path.join(generationRoot, ".lock");
+  let lockHandle;
+  try {
+    lockHandle = await open(lockPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ELOOP") {
+      throw new Error("Codex arg0 lock must not be a symbolic link");
+    }
+    throw error;
+  }
+  try {
+    const metadata = await lockHandle.stat();
+    if (!metadata.isFile() || metadata.nlink !== 1 || metadata.size !== 0) {
+      throw new Error("Codex arg0 lock must be one empty regular file");
+    }
+    assertTrustedFileOwner(metadata.uid, "Codex arg0 lock");
+    if ((metadata.mode & 0o133) !== 0) {
+      throw new Error("Codex arg0 lock has unsafe permissions");
+    }
+  } finally {
+    await lockHandle.close();
+  }
+
+  const trustedRoot = await validateTrustedCodexPackageRoot(trustedPackageRoot);
+  let trustedExecutable: string | undefined;
+  for (const alias of generationEntries.filter((entry) => entry !== ".lock")) {
+    const aliasPath = path.join(generationRoot, alias);
+    const aliasMetadata = await lstat(aliasPath);
+    if (!aliasMetadata.isSymbolicLink()) {
+      throw new Error(`Codex arg0 helper ${alias} must be a symbolic link`);
+    }
+    assertTrustedFileOwner(aliasMetadata.uid, `Codex arg0 helper ${alias}`);
+    const resolvedTarget = await realpath(aliasPath);
+    if (!isDescendant(trustedRoot, resolvedTarget) || path.basename(resolvedTarget) !== "codex") {
+      throw new Error(`Codex arg0 helper ${alias} points outside the trusted Codex package`);
+    }
+    const targetMetadata = await stat(resolvedTarget);
+    if (!targetMetadata.isFile() || (targetMetadata.mode & 0o111) === 0) {
+      throw new Error(`Codex arg0 helper ${alias} does not target an executable file`);
+    }
+    assertTrustedFileOwner(targetMetadata.uid, `Codex arg0 helper target ${alias}`);
+    if ((targetMetadata.mode & 0o022) !== 0) {
+      throw new Error(`Codex arg0 helper target ${alias} is writable by another user`);
+    }
+    if (trustedExecutable !== undefined && trustedExecutable !== resolvedTarget) {
+      throw new Error("Codex arg0 helpers do not resolve to the same executable");
+    }
+    trustedExecutable = resolvedTarget;
+  }
+}
+
+async function validateOwnedDirectory(directory: string, label: string): Promise<void> {
+  let handle;
+  try {
+    handle = await open(
+      directory,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ELOOP") {
+      throw new Error(`${label} must not be a symbolic link`);
+    }
+    throw error;
+  }
+  try {
+    const metadata = await handle.stat();
+    if (!metadata.isDirectory()) throw new Error(`${label} is not a directory`);
+    assertTrustedFileOwner(metadata.uid, label);
+    if ((metadata.mode & 0o022) !== 0) throw new Error(`${label} is writable by another user`);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function validateTrustedCodexPackageRoot(packageRoot: string): Promise<string> {
+  await validateOwnedDirectory(packageRoot, "Trusted Codex package root");
+  return realpath(packageRoot);
+}
+
+function assertTrustedFileOwner(actualUid: number, label: string): void {
+  const currentUid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if (actualUid !== 0 && currentUid !== undefined && actualUid !== currentUid) {
+    throw new Error(`${label} must be owned by root or the cloud worker user`);
+  }
+}
+
+function sameEntries(actual: string[], expected: string[]): boolean {
+  const left = [...actual].sort();
+  const right = [...expected].sort();
+  return left.length === right.length && left.every((entry, index) => entry === right[index]);
+}
+
+function isDescendant(parent: string, candidate: string): boolean {
+  const relative = path.relative(parent, candidate);
+  return relative.length > 0 && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative);
 }
 
 async function createCodexRuntime(): Promise<CodexRuntime> {
@@ -671,7 +905,7 @@ async function createCodexRuntime(): Promise<CodexRuntime> {
       sandboxHome,
       CODEX_WORKER_PROFILE,
       deniedCredentialRoots,
-      false,
+      true,
     );
     await installCodexPermissionProfile(
       sandboxHome,
@@ -869,12 +1103,16 @@ function codexPermissionProfile(
   profile: string,
   deniedCredentialRoots: readonly string[],
   networkEnabled: boolean,
+  selectByDefault = false,
+  readOnlyRoots: readonly string[] = [],
 ): string {
   const deniedRoots = [...new Set(["/codex-home", ...deniedCredentialRoots])]
     .map((value) => `${JSON.stringify(value)} = "deny"`)
     .join("\n");
-  return `default_permissions = "${profile}"
-approval_policy = "never"
+  const readableRoots = [...new Set(readOnlyRoots)]
+    .map((value) => `${JSON.stringify(value)} = "read"`)
+    .join("\n");
+  return `${selectByDefault ? `project_doc_max_bytes = 0\ndefault_permissions = "${profile}"\n` : ""}approval_policy = "never"
 
 [permissions.${profile}]
 extends = ":workspace"
@@ -883,6 +1121,7 @@ extends = ":workspace"
 ":root" = "deny"
 ":minimal" = "read"
 ${deniedRoots}
+${readableRoots}
 
 [permissions.${profile}.filesystem.":workspace_roots"]
 "." = "write"
@@ -908,11 +1147,19 @@ async function installCodexPermissionProfile(
   profile: string,
   deniedCredentialRoots: readonly string[],
   networkEnabled: boolean,
+  selectByDefault = false,
+  readOnlyRoots: readonly string[] = [],
 ): Promise<void> {
   const profilePath = path.join(sandboxHome, `${profile}.config.toml`);
   await writeTextAtomic(
     profilePath,
-    codexPermissionProfile(profile, deniedCredentialRoots, networkEnabled),
+    codexPermissionProfile(
+      profile,
+      deniedCredentialRoots,
+      networkEnabled,
+      selectByDefault,
+      readOnlyRoots,
+    ),
   );
   await chmod(profilePath, 0o600);
   if (((await stat(profilePath)).mode & 0o777) !== 0o600) {
@@ -927,12 +1174,12 @@ async function verifyCodexPermissionBoundary(
 ): Promise<void> {
   const runtime = requireActiveCodexRuntime();
   const smokeScript = [
-    'test ! -r "$1/auth.json"',
-    'test ! -r "$2/auth.json"',
-    'test -z "${CODEX_HOME-}${OPENAI_API_KEY-}${CODEX_API_KEY-}${DEX_HANDOFF_SIGNING_KEY-}"',
-    `if env | cut -d= -f1 | grep -Eiq '${SECRET_ENVIRONMENT_GREP}'; then exit 1; fi`,
-    "test ! -r /proc/1/environ",
-    ...(deniedRepositoryPath ? ['test ! -r "$3/.git/HEAD"'] : []),
+    'test ! -r "$1/auth.json" || exit 41',
+    'test ! -r "$2/auth.json" || exit 42',
+    'test -z "${CODEX_HOME-}${OPENAI_API_KEY-}${CODEX_API_KEY-}${DEX_HANDOFF_SIGNING_KEY-}" || exit 43',
+    `if env | cut -d= -f1 | grep -Eiq '${SECRET_ENVIRONMENT_GREP}'; then exit 44; fi`,
+    `if test -r /proc/1/environ && tr '\\0' '\\n' </proc/1/environ | cut -d= -f1 | grep -Eiq '${SECRET_ENVIRONMENT_GREP}'; then exit 45; fi`,
+    ...(deniedRepositoryPath ? ['test ! -r "$3/.git/HEAD" || exit 46'] : []),
   ].join("; ");
   const smoke = await run("codex", credentialDeniedSandboxArgs(
     profile,
@@ -948,7 +1195,15 @@ async function verifyCodexPermissionBoundary(
     cwd,
   ), cwd, false, codexEnvironment(runtime.sandboxHome));
   if (smoke.exitCode !== 0) {
-    throw new Error("Codex permission-boundary smoke failed; refusing to start the cloud task");
+    const reason = ({
+      41: "persistent account cache remained readable",
+      42: "ephemeral worker account cache remained readable",
+      43: "credential environment reached the child",
+      44: "a secret-like environment name reached the child",
+      45: "the parent process environment remained readable",
+      46: "the denied repository remained readable during dependency bootstrap",
+    } as Record<number, string>)[smoke.exitCode] ?? "the sandbox launcher rejected the profile";
+    throw new Error(`Codex permission-boundary smoke failed: ${reason}`);
   }
 }
 

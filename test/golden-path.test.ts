@@ -68,7 +68,7 @@ const PHONE = "+14165550123";
 const DEX_LINE = "+14165550999";
 const WEBHOOK_SECRET = "golden-sendblue-secret";
 const INTERNAL_SECRET = "golden-internal-secret";
-const HANDOFF_SECRET = "golden-handoff-signing-key";
+const HANDOFF_SECRET = Buffer.from("0123456789abcdef0123456789abcdef").toString("base64url");
 const SETUP_CODE = "K7D4Q9";
 const FAILED_APPROACH = "npm test -- --runInBand";
 const FAILED_REASON = "Serializing the retry test deadlocked and did not prove exactly-once delivery.";
@@ -242,6 +242,13 @@ function modalBoundary(): ModalBoundary {
     sandboxId: "sandbox-golden",
     filesystem,
     exec: async () => ({
+      stdin: new WritableStream<string>({
+        write: () => {
+          // Record only that the scoped key crossed the process stream; never
+          // retain the key material in the golden-path fixture.
+          calls.push("stdin:scoped-handoff-key");
+        },
+      }),
       stdout: { readText: async () => "" },
       stderr: { readText: async () => "" },
       wait: async () => 0,

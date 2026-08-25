@@ -317,6 +317,77 @@ describe("DexOrchestrator durable worker lifecycle", () => {
     expect(fixture.moved).toHaveLength(1);
   });
 
+  it("does not start a battery handoff when local completion wins the exact-worker claim", async () => {
+    const fixture = await createFixture(1, true);
+    await fixture.orchestrator.handle([
+      { type: "CREATE_TASK", description: "fix checkout", preferredAgent: "codex" },
+    ], fixture.context);
+    const before = Object.values((await fixture.store.read()).tasks)[0]!;
+    const workerId = before.currentWorkerId!;
+    const lifecycleGeneration = typeof before.metadata.lifecycleGeneration === "number"
+      ? before.metadata.lifecycleGeneration
+      : 0;
+
+    fixture.codex.finish(0, "completed", undefined, "local validation passed");
+    await eventually(async () => {
+      expect((await fixture.store.read()).tasks[before.id]?.status).toBe("completed");
+    });
+
+    await expect(fixture.orchestrator.moveCapturedLocalTaskToCloud({
+      taskId: before.id,
+      workerId,
+      lifecycleGeneration,
+    }, fixture.context)).resolves.toEqual({
+      status: "local_completed",
+      title: "checkout",
+    });
+    expect(fixture.moved).toHaveLength(0);
+    expect((await fixture.store.read()).tasks[before.id]).toMatchObject({
+      status: "completed",
+      currentWorkerId: workerId,
+    });
+  });
+
+  it("fences a racing local completion once the battery handoff claim wins", async () => {
+    const fixture = await createFixture(1, true);
+    await fixture.orchestrator.handle([
+      { type: "CREATE_TASK", description: "fix checkout", preferredAgent: "codex" },
+    ], fixture.context);
+    const before = Object.values((await fixture.store.read()).tasks)[0]!;
+    const workerId = before.currentWorkerId!;
+    const lifecycleGeneration = typeof before.metadata.lifecycleGeneration === "number"
+      ? before.metadata.lifecycleGeneration
+      : 0;
+    fixture.codex.completeOnStop(0, "local completion raced with handoff");
+    const gate = fixture.pauseNextCloudMove();
+
+    const moving = fixture.orchestrator.moveCapturedLocalTaskToCloud({
+      taskId: before.id,
+      workerId,
+      lifecycleGeneration,
+    }, fixture.context);
+    await gate.started;
+
+    const claimed = await fixture.store.read();
+    expect(claimed.tasks[before.id]).toMatchObject({
+      status: "checkpointing",
+      currentWorkerId: workerId,
+      metadata: { lifecycleGeneration: lifecycleGeneration + 1 },
+    });
+    expect(claimed.workers[workerId]).toMatchObject({ status: "completed" });
+    expect(claimed.pendingTransportEvents).toEqual([]);
+    expect(fixture.notifications).not.toContain("checkout is done. local completion raced with handoff");
+
+    gate.release();
+    await expect(moving).resolves.toEqual({ status: "started", title: "checkout" });
+    const handedOff = await fixture.store.read();
+    expect(fixture.moved).toHaveLength(1);
+    expect(handedOff.tasks[before.id]).toMatchObject({ status: "running", executionPreference: "cloud" });
+    expect(handedOff.workers[handedOff.tasks[before.id]!.currentWorkerId!]?.target)
+      .toMatchObject({ kind: "modal" });
+    expect(handedOff.pendingTransportEvents).toEqual([]);
+  });
+
   it("holds one atomic capacity slot while a cloud handoff is being created", async () => {
     const fixture = await createFixture(1, true);
     await fixture.orchestrator.handle([

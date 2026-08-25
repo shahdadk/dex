@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { validateEphemeralCodexHome } from "../src/cloud/cloud-worker.js";
+import { createGitBundle, type GitCheckpoint } from "../src/memory/git.js";
 import type { MemoryObservation } from "../src/memory/index.js";
 import { createManifest, signManifest } from "../src/memory/integrity.js";
 import { createHandoff, writeHandoff, type HandoffDocument } from "../src/tasks/handoff.js";
@@ -75,6 +77,7 @@ async function createWorkerFixture(
     directory: string;
     codexHome: string;
   }) => Promise<void>,
+  bypassTrustedCheckpointBoundary = false,
 ): Promise<WorkerFixture> {
   const directory = await mkdtemp(path.join(os.tmpdir(), "dex-cloud-worker-"));
   temporaryDirectories.push(directory);
@@ -99,6 +102,32 @@ async function createWorkerFixture(
   await mustExec("git", ["checkout", "-b", "dex/cloud-worker"], repositoryPath);
   await prepareRepository?.({ repositoryPath, directory, codexHome });
 
+  let checkpoint: GitCheckpoint | undefined;
+  if (bypassTrustedCheckpointBoundary) {
+    // These fixtures intentionally exercise the cloud worker against content
+    // that the trusted local checkpoint boundary now rejects. Build the test
+    // bundle directly so the independent cloud-side defenses remain covered.
+    const dirtyBeforeCheckpoint = Boolean(
+      await mustExec("git", ["status", "--porcelain=v1", "--untracked-files=all"], repositoryPath),
+    );
+    if (dirtyBeforeCheckpoint) {
+      await mustExec("git", ["add", "--all"], repositoryPath);
+      await mustExec("git", ["commit", "-m", "malicious cloud-boundary fixture"], repositoryPath);
+    }
+    const headCommit = await mustExec("git", ["rev-parse", "HEAD"], repositoryPath);
+    checkpoint = {
+      baseCommit,
+      headCommit,
+      branch: "dex/cloud-worker",
+      dirtyBeforeCheckpoint,
+      bundle: await createGitBundle({
+        repositoryPath,
+        bundlePath,
+        refs: ["dex/cloud-worker"],
+      }),
+    };
+  }
+
   const handoff = await createHandoff(
     {
       taskId: "task-cloud-worker",
@@ -109,6 +138,7 @@ async function createWorkerFixture(
         path: repositoryPath,
         baseCommit,
         workingBranch: "dex/cloud-worker",
+        ...(checkpoint === undefined ? {} : { checkpoint }),
       },
       memories: Array.from({ length: 5 }, (_, index) => memory(index + 1)),
       validation: { commands: validationCommands, expectedEvidence: ["Worker completes."] },
@@ -116,7 +146,9 @@ async function createWorkerFixture(
     },
     {
       discoverMemory: false,
-      gitCheckpoint: { bundlePath, commitDirty: true },
+      ...(checkpoint === undefined
+        ? { gitCheckpoint: { bundlePath, commitDirty: true } }
+        : {}),
       signingKey: SIGNING_KEY,
       signingKeyId: "worker-test-key",
     },
@@ -333,11 +365,15 @@ async function runWorker(
   message?: string,
   additionalEnvironment: NodeJS.ProcessEnv = {},
   prepareAuth?: (authPath: string) => Promise<void>,
+  prepareKey?: (keyPath: string) => Promise<void>,
 ) {
   const binaryDirectory = await installFakeCodex(fixture.directory);
   await mkdir(fixture.codexHome, { mode: 0o755 });
   const authPath = path.join(fixture.codexHome, "auth.json");
   await writeFile(authPath, JSON.stringify({ auth_mode: "chatgpt", tokens: {} }), { mode: 0o644 });
+  const keyPath = path.join(fixture.cloudRoot, "handoff.key");
+  await writeFile(keyPath, SIGNING_KEY, { mode: 0o600 });
+  await prepareKey?.(keyPath);
   await prepareAuth?.(authPath);
   return execFile(process.execPath, ["--import", "tsx", CLOUD_WORKER], {
     cwd: REPOSITORY_ROOT,
@@ -346,7 +382,6 @@ async function runWorker(
       PATH: `${binaryDirectory}${path.delimiter}${process.env.PATH ?? ""}`,
       DEX_CLOUD_ROOT: fixture.cloudRoot,
       DEX_CLOUD_PROJECT: fixture.projectPath,
-      DEX_HANDOFF_SIGNING_KEY: SIGNING_KEY,
       MODAL_TOKEN_SECRET: "modal-test-secret",
       CODEX_API_KEY: "must-not-reach-codex",
       OPENAI_API_KEY: "must-not-reach-codex",
@@ -384,6 +419,49 @@ async function expectMissing(file: string): Promise<void> {
   await expect(access(file)).rejects.toMatchObject({ code: "ENOENT" });
 }
 
+async function createCodexArg0Fixture(directory: string): Promise<{
+  home: string;
+  trustedPackageRoot: string;
+  generationRoot: string;
+}> {
+  const home = path.join(directory, "ephemeral-codex-home");
+  const trustedPackageRoot = path.join(directory, "trusted", "@openai", "codex");
+  const executable = path.join(
+    trustedPackageRoot,
+    "node_modules",
+    "@openai",
+    "codex-linux-x64",
+    "vendor",
+    "x86_64-unknown-linux-musl",
+    "bin",
+    "codex",
+  );
+  const generationRoot = path.join(home, "tmp", "arg0", "codex-arg0AbC123");
+  await Promise.all([
+    mkdir(path.dirname(executable), { recursive: true, mode: 0o755 }),
+    mkdir(generationRoot, { recursive: true, mode: 0o755 }),
+  ]);
+  await Promise.all([
+    chmod(home, 0o700),
+    chmod(path.join(home, "tmp"), 0o755),
+    chmod(path.join(home, "tmp", "arg0"), 0o700),
+    chmod(generationRoot, 0o755),
+    chmod(trustedPackageRoot, 0o755),
+    writeFile(path.join(home, "auth.json"), JSON.stringify({ auth_mode: "chatgpt" }), { mode: 0o600 }),
+    writeFile(path.join(generationRoot, ".lock"), "", { mode: 0o644 }),
+    writeFile(executable, "#!/bin/sh\nexit 0\n", { mode: 0o755 }),
+  ]);
+  for (const alias of [
+    "apply_patch",
+    "applypatch",
+    "codex-execve-wrapper",
+    "codex-linux-sandbox",
+  ]) {
+    await symlink(executable, path.join(generationRoot, alias));
+  }
+  return { home, trustedPackageRoot, generationRoot };
+}
+
 async function resignHandoffWithHead(
   fixture: WorkerFixture,
   headCommit: string,
@@ -411,6 +489,44 @@ async function resignHandoffWithHead(
 }
 
 describe("Modal cloud worker", () => {
+  it("accepts only Codex's exact transient arg0 helper tree after account login", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "dex-codex-arg0-"));
+    temporaryDirectories.push(directory);
+    const fixture = await createCodexArg0Fixture(directory);
+
+    await expect(
+      validateEphemeralCodexHome(fixture.home, fixture.trustedPackageRoot),
+    ).resolves.toBeUndefined();
+
+    await rm(path.join(fixture.home, "tmp"), { recursive: true });
+    await expect(
+      validateEphemeralCodexHome(fixture.home, fixture.trustedPackageRoot),
+    ).resolves.toBeUndefined();
+  });
+
+  it("rejects unrecognized Codex-home entries and arg0 targets outside the trusted package", async () => {
+    const extraDirectory = await mkdtemp(path.join(os.tmpdir(), "dex-codex-arg0-extra-"));
+    temporaryDirectories.push(extraDirectory);
+    const extra = await createCodexArg0Fixture(extraDirectory);
+    await writeFile(path.join(extra.home, "config.toml"), "model = 'attacker'\n");
+    await expect(
+      validateEphemeralCodexHome(extra.home, extra.trustedPackageRoot),
+    ).rejects.toThrow("unrecognized root entry");
+
+    const outsideDirectory = await mkdtemp(path.join(os.tmpdir(), "dex-codex-arg0-outside-"));
+    temporaryDirectories.push(outsideDirectory);
+    const outside = await createCodexArg0Fixture(outsideDirectory);
+    const externalExecutable = path.join(outsideDirectory, "outside", "codex");
+    await mkdir(path.dirname(externalExecutable), { recursive: true });
+    await writeFile(externalExecutable, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const attackedAlias = path.join(outside.generationRoot, "apply_patch");
+    await rm(attackedAlias);
+    await symlink(externalExecutable, attackedAlias);
+    await expect(
+      validateEphemeralCodexHome(outside.home, outside.trustedPackageRoot),
+    ).rejects.toThrow("points outside the trusted Codex package");
+  });
+
   it("rejects handoff and bundle tampering before starting Codex", async () => {
     const cases: Array<{
       tamper(fixture: WorkerFixture): Promise<void>;
@@ -470,6 +586,30 @@ describe("Modal cloud worker", () => {
     await expectMissing(fixture.promptPath);
   });
 
+  it("rejects a handoff key whose original permissions are broader than 0600", async () => {
+    const fixture = await createWorkerFixture();
+
+    const execution = await runWorker(
+      fixture,
+      undefined,
+      {},
+      undefined,
+      async (keyPath) => chmod(keyPath, 0o644),
+    );
+
+    expect(execution.exitCode).not.toBe(0);
+    expect(execution.stderr).toContain("Dex handoff key has invalid permissions or size");
+    expect(JSON.parse(await readFile(path.join(fixture.cloudRoot, "result.json"), "utf8")))
+      .toMatchObject({
+        taskId: fixture.handoff.taskId,
+        handoffSha256: fixture.handoff.contentHash,
+        status: "failed",
+        summary: "Dex handoff key has invalid permissions or size",
+      });
+    await expectMissing(fixture.promptPath);
+    await expectMissing(path.join(fixture.cloudRoot, "handoff.key"));
+  });
+
   it("acknowledges the exact inherited memory and failed-approach IDs with the Codex thread", async () => {
     const fixture = await createWorkerFixture();
 
@@ -499,16 +639,16 @@ describe("Modal cloud worker", () => {
     expect(workerEnvironment.codexHome).not.toBe(fixture.codexHome);
     expect(workerEnvironment.codexHome).toMatch(/\.dex-codex-auth-/);
     expect(JSON.parse(await readFile(fixture.argumentsPath, "utf8"))).toEqual([
+      "--profile",
+      "modal-worker",
       "--ask-for-approval",
       "never",
       "exec",
       "--cd",
       fixture.projectPath,
-      "--ignore-user-config",
+      "--strict-config",
       "--ignore-rules",
       "--ephemeral",
-      "--sandbox",
-      "workspace-write",
       "--json",
       "--color",
       "never",
@@ -531,7 +671,7 @@ describe("Modal cloud worker", () => {
       args[0] === "sandbox" && args[2] === "modal-worker"
     );
     const profile = workerProfileCall?.profileText ?? "";
-    expect(profile).toContain('default_permissions = "modal-worker"');
+    expect(profile).not.toContain('default_permissions = "modal-worker"');
     expect(profile).toContain('approval_policy = "never"');
     expect(profile).toContain('[permissions.modal-worker]');
     expect(profile).toContain('extends = ":workspace"');
@@ -542,7 +682,7 @@ describe("Modal cloud worker", () => {
     expect(profile).toContain(`${JSON.stringify(workerEnvironment.codexHome)} = "deny"`);
     expect(profile).toContain('[permissions.modal-worker.filesystem.":workspace_roots"]');
     expect(profile).toContain('"." = "write"');
-    expect(profile).toContain('[permissions.modal-worker.network]\nenabled = false');
+    expect(profile).toContain('[permissions.modal-worker.network]\nenabled = true');
     expect(profile).toContain('[shell_environment_policy]\ninherit = "core"');
     expect(profile).toContain('CODEX_HOME = "exclude"');
     expect(profile).toContain('OPENAI_API_KEY = "exclude"');
@@ -579,12 +719,17 @@ describe("Modal cloud worker", () => {
     expect(calls.every(({ environment }) => environment.secretLikeNames.length === 0)).toBe(true);
     expect(await realpath(taskCall!.cwd)).toBe(await realpath(fixture.projectPath));
     expect(calls.flatMap(({ args }) => args)).not.toContain("--dangerously-bypass-approvals-and-sandbox");
-    expect(taskCall?.args).toContain("--sandbox");
-    expect(taskCall?.args).toContain("workspace-write");
+    expect(taskCall?.args).not.toContain("--sandbox");
+    expect(taskCall?.args).not.toContain("workspace-write");
     expect(taskCall?.args).not.toContain("--skip-git-repo-check");
-    expect(taskCall?.args).not.toContain("--profile");
-    expect(taskCall?.args).not.toContain("--strict-config");
-    expect(taskCall?.homeEntries).toEqual(["auth.json"]);
+    expect(taskCall?.args).toContain("--profile");
+    expect(taskCall?.args).toContain("--strict-config");
+    expect(taskCall?.profileText).toContain("project_doc_max_bytes = 0");
+    expect(taskCall?.profileText).toContain('default_permissions = "modal-worker"');
+    expect(taskCall?.profileText).toContain(`${JSON.stringify(workerEnvironment.codexHome)} = "deny"`);
+    expect(taskCall?.profileText).toContain(`${JSON.stringify(path.join(workerEnvironment.codexHome, "tmp", "arg0"))} = "read"`);
+    expect(taskCall?.homeEntries).toEqual(["auth.json", "modal-worker.config.toml"]);
+    await expectMissing(path.join(fixture.cloudRoot, "handoff.key"));
     await expectMissing(workerEnvironment.codexHome);
     await expectMissing(workerProfileCall!.environment.codexHome!);
     expect(JSON.parse(await readFile(path.join(fixture.cloudRoot, "result.json"), "utf8"))).toMatchObject({
@@ -638,7 +783,7 @@ describe("Modal cloud worker", () => {
       taskId: fixture.handoff.taskId,
       handoffSha256: fixture.handoff.contentHash,
       status: "failed",
-      summary: "Codex permission-boundary smoke failed; refusing to start the cloud task",
+      summary: "Codex permission-boundary smoke failed: the sandbox launcher rejected the profile",
     });
   });
 
@@ -674,7 +819,7 @@ describe("Modal cloud worker", () => {
           await writeFile(target, 'notify = ["/bin/sh", "-c", "exit 99"]\n');
           await symlink(target, path.join(configDirectory, "config.toml"));
         }
-      });
+      }, true);
 
       const execution = await runWorker(fixture);
 
@@ -748,6 +893,58 @@ describe("Modal cloud worker", () => {
     });
   });
 
+  it("reports stdout-only validation failure evidence instead of the agent success claim", async () => {
+    const validationCommand = [
+      "node",
+      "-e",
+      "process.stdout.write('stdout-only validation evidence'); process.exit(23)",
+    ];
+    const fixture = await createWorkerFixture([validationCommand]);
+
+    const execution = await runWorker(fixture, "Everything passed successfully.");
+
+    expect(execution.exitCode).not.toBe(0);
+    const result = JSON.parse(
+      await readFile(path.join(fixture.cloudRoot, "result.json"), "utf8"),
+    ) as { status: string; summary: string; validation: { commands: string[]; passed: boolean } };
+    expect(result).toMatchObject({
+      status: "failed",
+      validation: {
+        commands: [JSON.stringify(validationCommand)],
+        passed: false,
+      },
+    });
+    expect(result.summary).toContain("Validation failed for command");
+    expect(result.summary).toContain(JSON.stringify(validationCommand));
+    expect(result.summary).toContain("exit 23");
+    expect(result.summary).toContain("stdout: stdout-only validation evidence");
+    expect(result.summary).not.toContain("Everything passed successfully.");
+  });
+
+  it("bounds the failed validation command and output while retaining useful evidence", async () => {
+    const oversizedArgument = `payload=${"command".repeat(100)}`;
+    const validationCommand = [
+      "node",
+      "-e",
+      "process.stdout.write('output'.repeat(300) + ' ' + ['useful', 'tail', 'evidence'].join('-')); process.exit(29)",
+      oversizedArgument,
+    ];
+    const fixture = await createWorkerFixture([validationCommand]);
+
+    const execution = await runWorker(fixture, "Validation succeeded.");
+
+    expect(execution.exitCode).not.toBe(0);
+    const result = JSON.parse(
+      await readFile(path.join(fixture.cloudRoot, "result.json"), "utf8"),
+    ) as { summary: string };
+    expect(result.summary).toHaveLength(500);
+    expect(result.summary).toMatch(/^Validation failed for command \["node","-e",/);
+    expect(result.summary).toContain("exit 29");
+    expect(result.summary).toContain("useful-tail-evidence");
+    expect(result.summary).not.toContain(oversizedArgument);
+    expect(result.summary).not.toContain("Validation succeeded.");
+  });
+
   it("isolates dependency bootstrap from repository source and repository-selected npm helpers", async () => {
     let bootstrapMarker = "";
     let bootstrapListing = "";
@@ -779,7 +976,7 @@ if (leaked) fs.writeFileSync(process.env.FAKE_BOOTSTRAP_EXFIL_MARKER, "leaked");
         ),
       ]);
       await chmod(maliciousGit, 0o755);
-    });
+    }, true);
 
     const execution = await runWorker(fixture, undefined, {
       FAKE_TARGET_CREDENTIAL_PATH: path.join(fixture.codexHome, "auth.json"),
@@ -812,7 +1009,7 @@ if (leaked) fs.writeFileSync(process.env.FAKE_BOOTSTRAP_EXFIL_MARKER, "leaked");
     expect(calls[bootstrapCallIndex]?.environment.codexHome).not.toBe(fixture.codexHome);
     expect(calls[bootstrapCallIndex]?.homeEntries).not.toContain("auth.json");
     const bootstrapProfile = calls[bootstrapCallIndex]?.profileText ?? "";
-    expect(bootstrapProfile).toContain('default_permissions = "modal-bootstrap"');
+    expect(bootstrapProfile).not.toContain('default_permissions = "modal-bootstrap"');
     expect(bootstrapProfile).toContain('[permissions.modal-bootstrap.network]\nenabled = true');
     expect(bootstrapProfile).toContain(`${JSON.stringify(fixture.codexHome)} = "deny"`);
     expect(bootstrapProfile).toContain('CODEX_HOME = "exclude"');

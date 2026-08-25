@@ -277,7 +277,7 @@ export async function seedModalCodexAuth(options: SeedModalCodexAuthOptions = {}
       sandbox = await modal.create({
         appName: "dex-auth-setup",
         image: "node:22-bookworm",
-        imageCommands: ["RUN npm install --global @openai/codex@0.149.0"],
+        imageCommands: ["RUN npm install --global @openai/codex@0.149.1"],
         volumeNames: { [MODAL_CODEX_HOME]: volumeName },
         params: {
           timeoutMs: SETUP_SANDBOX_TIMEOUT_MS,

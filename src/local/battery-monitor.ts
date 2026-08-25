@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import type { EventLog } from "../state/events.js";
+import type { DexTask } from "../state/schemas.js";
 import type { DexStateStore } from "../state/store.js";
 import type { BatteryReading } from "./power/battery.js";
 import { MacMachineController } from "./machine/mac-machine.js";
@@ -14,6 +15,11 @@ const ACTIVE_TASK_STATUSES = new Set([
   "checkpointing",
   "handoff",
 ]);
+
+function taskLifecycleGeneration(task: DexTask): number {
+  const value = task.metadata.lifecycleGeneration;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
 
 export interface BatteryMonitorOptions {
   store: DexStateStore;
@@ -40,6 +46,11 @@ export class BatteryMonitor {
     let crossed: number | undefined;
     let activeTitles: string[] = [];
     let activeTaskIds: string[] = [];
+    let activeTaskSnapshots: Array<{
+      taskId: string;
+      workerId: string;
+      lifecycleGeneration: number;
+    }> = [];
     const now = this.#options.now?.() ?? new Date();
     const nowIso = now.toISOString();
     const promptTtlMs = this.#options.promptTtlMs ?? DEFAULT_PROMPT_TTL_MS;
@@ -79,6 +90,11 @@ export class BatteryMonitor {
         });
       activeTitles = activeLocalTasks.map((task) => task.title);
       activeTaskIds = activeLocalTasks.map((task) => task.id);
+      activeTaskSnapshots = activeLocalTasks.map((task) => ({
+        taskId: task.id,
+        workerId: task.currentWorkerId!,
+        lifecycleGeneration: taskLifecycleGeneration(task),
+      }));
       shouldAlert = crossed !== undefined && activeTitles.length > 0;
       state.pendingConversationPrompts = state.pendingConversationPrompts.filter(
         (prompt) => Date.parse(prompt.expiresAt) > now.getTime(),
@@ -92,6 +108,7 @@ export class BatteryMonitor {
           type: "battery.low",
           conversationId: this.#options.conversationId,
           taskIds: activeTaskIds,
+          taskSnapshots: activeTaskSnapshots,
           createdAt: nowIso,
           expiresAt: new Date(now.getTime() + promptTtlMs).toISOString(),
         });

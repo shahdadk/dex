@@ -148,6 +148,11 @@ export const PendingConversationPromptSchema = z.object({
   type: z.literal("battery.low"),
   conversationId: z.string().min(1),
   taskIds: z.array(z.string().min(1)).min(1),
+  taskSnapshots: z.array(z.object({
+    taskId: z.string().min(1),
+    workerId: z.string().min(1),
+    lifecycleGeneration: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  }).strict()).min(1).optional(),
   createdAt: z.string().datetime(),
   expiresAt: z.string().datetime(),
 });

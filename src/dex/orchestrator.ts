@@ -35,6 +35,16 @@ export interface OrchestratorMessageContext {
   sourceMessageId?: string;
 }
 
+export interface CapturedLocalTaskClaim {
+  taskId: string;
+  workerId: string;
+  lifecycleGeneration: number;
+}
+
+export type CapturedLocalTaskMoveResult =
+  | { status: "started" | "queued"; title: string }
+  | { status: "local_completed" | "stale"; title: string };
+
 export interface MemoryObserver {
   observe(task: DexTask, worker: WorkerSession, event: AgentEvent): Promise<void>;
   summarize?(worker: WorkerSession, lastAssistantMessage?: string): Promise<void>;
@@ -134,6 +144,42 @@ export class DexOrchestrator {
 
   constructor(options: DexOrchestratorOptions) {
     this.#options = options;
+  }
+
+  /**
+   * Moves the exact local worker snapshot accepted by a battery follow-up.
+   * Claiming increments the lifecycle generation in the same state revision
+   * that verifies task status and worker identity, so this operation and local
+   * completion have a single deterministic winner.
+   */
+  async moveCapturedLocalTaskToCloud(
+    captured: CapturedLocalTaskClaim,
+    context: OrchestratorMessageContext,
+  ): Promise<CapturedLocalTaskMoveResult> {
+    if (!this.#options.mover) throw new Error("Cloud movement is not configured");
+    const claim = await this.#options.tasks.claimLocalWorkerForCloudHandoff(
+      captured.taskId,
+      captured.workerId,
+      captured.lifecycleGeneration,
+    );
+    if (claim.status !== "claimed") {
+      return { status: claim.status, title: claim.task.title };
+    }
+
+    await this.#stopActive(captured.taskId);
+    const latest = await this.#latestTask(captured.taskId);
+    if (lifecycleGeneration(latest) !== claim.claimedGeneration) {
+      return { status: "stale", title: latest.title };
+    }
+    const started = await this.#moveToCloudOrQueue(
+      latest,
+      "codex",
+      "cloud handoff queued behind active work",
+      false,
+      claim.claimedGeneration,
+    );
+    await this.drainQueue(context.conversationId);
+    return { status: started ? "started" : "queued", title: latest.title };
   }
 
   async handle(actions: DexAction[], context: OrchestratorMessageContext): Promise<string> {
@@ -816,7 +862,15 @@ export class DexOrchestrator {
       if (startup.controller.signal.aborted) throw new WorkerStartCancelledError(task.id);
       await this.#options.events.append({ type: "worker.started", taskId: task.id, workerId: id, payload: { agent, target: "local", purpose, providerSessionId: startedHandle.providerSessionId } });
       if (startup.controller.signal.aborted) throw new WorkerStartCancelledError(task.id);
-      const supervision = this.#supervise(task, worker, startedHandle, conversationId, purpose, intent.sourceAgent);
+      const supervision = this.#supervise(
+        task,
+        worker,
+        startedHandle,
+        conversationId,
+        purpose,
+        intent.sourceAgent,
+        expectedGeneration,
+      );
       this.#supervisions.set(task.id, supervision);
       void supervision.then(
         () => {
@@ -1150,19 +1204,28 @@ export class DexOrchestrator {
     conversationId: string,
     purpose: WorkerPurpose,
     sourceAgent?: AgentKind,
+    expectedGeneration = lifecycleGeneration(task),
   ): Promise<void> {
     let shouldRecover = false;
     let failureSummary = "worker stopped unexpectedly";
     let terminationProven = false;
     try {
       for await (const event of handle.events) {
-        await this.#recordAgentEvent(task, worker, event, purpose);
+        await this.#recordAgentEvent(task, worker, event, purpose, expectedGeneration);
         await this.#options.memory?.observe(task, worker, event).catch(() => undefined);
       }
       const result = await handle.result;
       await awaitAgentHandleTermination(handle);
       terminationProven = true;
-      const outcome = await this.#finishWorker(task, worker, result, conversationId, purpose, sourceAgent);
+      const outcome = await this.#finishWorker(
+        task,
+        worker,
+        result,
+        conversationId,
+        purpose,
+        sourceAgent,
+        expectedGeneration,
+      );
       shouldRecover = outcome.shouldRecover;
       failureSummary = outcome.summary;
     } catch (error) {
@@ -1198,7 +1261,9 @@ export class DexOrchestrator {
           current.endedAt = new Date().toISOString();
           current.lastMessage = message;
         }
-        ownsTask = state.tasks[task.id]?.currentWorkerId === worker.id;
+        const currentTask = state.tasks[task.id];
+        ownsTask = currentTask?.currentWorkerId === worker.id &&
+          lifecycleGeneration(currentTask) === expectedGeneration;
       });
       if (!deliberatelyStopping && ownsTask) {
         if (purpose === "review") {
@@ -1211,9 +1276,10 @@ export class DexOrchestrator {
             reviewedAt: new Date().toISOString(),
           }, false, conversationId);
         } else {
-          await this.#options.tasks.finalizeIfCurrentWorkerWithNotification(
+          await this.#options.tasks.finalizeIfCurrentWorkerAndGenerationWithNotification(
             task.id,
             worker.id,
+            expectedGeneration,
             {
               status: "failed",
               stage: "failed",
@@ -1260,9 +1326,10 @@ export class DexOrchestrator {
             reviewedAt: new Date().toISOString(),
           }, false, conversationId);
         } else {
-          await this.#options.tasks.finalizeIfCurrentWorkerWithNotification(
+          await this.#options.tasks.finalizeIfCurrentWorkerAndGenerationWithNotification(
             task.id,
             worker.id,
+            expectedGeneration,
             {
               status: "failed",
               stage: "failed",
@@ -1286,6 +1353,7 @@ export class DexOrchestrator {
     worker: WorkerSession,
     event: AgentEvent,
     purpose: WorkerPurpose,
+    expectedGeneration: number,
   ): Promise<void> {
     const stage = purpose === "review" ? "reviewing" : stageForEvent(event);
     const summary = event.type === "message" && event.role === "assistant" && !event.delta
@@ -1298,7 +1366,10 @@ export class DexOrchestrator {
         if (summary) currentWorker.lastMessage = summary;
       }
       const currentTask = state.tasks[task.id];
-      if (currentTask?.currentWorkerId === worker.id) {
+      if (
+        currentTask?.currentWorkerId === worker.id &&
+        lifecycleGeneration(currentTask) === expectedGeneration
+      ) {
         if (stage) currentTask.stage = stage;
         if (summary) currentTask.latestSummary = summary;
         currentTask.updatedAt = event.timestamp;
@@ -1318,6 +1389,7 @@ export class DexOrchestrator {
     conversationId: string,
     purpose: WorkerPurpose,
     sourceAgent?: AgentKind,
+    expectedGeneration = lifecycleGeneration(task),
   ): Promise<{ shouldRecover: boolean; summary: string }> {
     const succeeded = result.status === "completed" && result.exitCode === 0;
     const rawSummary = result.output || result.error || (succeeded ? "work completed" : "worker failed");
@@ -1332,7 +1404,10 @@ export class DexOrchestrator {
       current.endedAt = result.finishedAt;
       current.lastMessage = summary;
       const currentTask = state.tasks[task.id];
-      if (currentTask?.currentWorkerId !== worker.id) return;
+      if (
+        currentTask?.currentWorkerId !== worker.id ||
+        lifecycleGeneration(currentTask) !== expectedGeneration
+      ) return;
       ownsTask = true;
       if (succeeded) delete currentTask.metadata.workerRecoveryAttempts;
       if (purpose !== "review" && (succeeded || result.status === "cancelled")) {
@@ -1358,9 +1433,10 @@ export class DexOrchestrator {
         }, false, conversationId);
         await this.#options.flushTransport().catch(() => undefined);
       } else {
-        const transitioned = await this.#options.tasks.completeIfCurrentWorkerWithNotification(
+        const transitioned = await this.#options.tasks.completeIfCurrentWorkerAndGenerationWithNotification(
           task.id,
           worker.id,
+          expectedGeneration,
           summary,
           conversationId,
           `${task.title} is done. ${summary}`,
@@ -1372,9 +1448,10 @@ export class DexOrchestrator {
         }
       }
     } else if (result.status !== "cancelled") {
-      const transitioned = await this.#options.tasks.markRecoveryPendingIfCurrentWorker(
+      const transitioned = await this.#options.tasks.markRecoveryPendingIfCurrentWorkerAndGeneration(
         task.id,
         worker.id,
+        expectedGeneration,
         { stage: "failed", blockedReason: result.error ?? summary, latestSummary: summary },
         `worker failed while recovery is being evaluated: ${result.error ?? summary}`,
       );
@@ -1906,7 +1983,7 @@ function workerPrompt(task: DexTask, inheritedMemories: string[] = []): string {
   const memory = inheritedMemories.length > 0
     ? `\n\nRELEVANT PRIOR KNOWLEDGE:\n${inheritedMemories.slice(0, 15).map((item) => `- ${item}`).join("\n")}\n\nTreat recorded failed approaches as constraints. Do not repeat them without new evidence.`
     : "";
-  return `You are a coding worker operating under Dex.\n\nTASK:\n${task.title}\n\nUSER'S ORIGINAL REQUEST:\n${task.originalRequest}\n\nREPOSITORY:\n${task.repositoryPath}\n\nBRANCH:\n${task.dexBranch}${memory}\n\nREQUIREMENTS:\n1. Complete the task rather than only explaining it.\n2. Inspect the existing implementation before modifying it.\n3. Preserve existing conventions.\n4. Run relevant tests.\n5. Do not push, deploy, merge, or perform destructive remote actions.\n6. Summarize changes, validation, failed approaches, and remaining issues.`;
+  return `You are a coding worker operating under Dex.\n\nTASK:\n${task.title}\n\nUSER'S ORIGINAL REQUEST:\n${task.originalRequest}\n\nREPOSITORY:\n${task.repositoryPath}\n\nBRANCH:\n${task.dexBranch}${memory}\n\nREQUIREMENTS:\n1. Complete the task rather than only explaining it.\n2. Inspect the existing implementation before modifying it.\n3. Preserve existing conventions.\n4. Run relevant tests.\n5. Do not push, deploy, merge, or perform destructive remote actions.\n6. Report every unsuccessful attempt as \`FAILED APPROACH: <approach>; WHY: <reason>\` so a replacement worker can avoid repeating it.\n7. Summarize changes, validation, and remaining issues.`;
 }
 
 function reviewPrompt(

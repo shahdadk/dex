@@ -18,10 +18,10 @@ import { EventLog } from "../src/state/events.js";
 import { DexTaskSchema, type DexTask } from "../src/state/schemas.js";
 import { DexStateStore } from "../src/state/store.js";
 import { TaskManager } from "../src/tasks/task-manager.js";
-import type { HandoffDocument } from "../src/tasks/handoff.js";
+import { readHandoff, type HandoffDocument } from "../src/tasks/handoff.js";
 import { execFile } from "../src/utils/exec.js";
 
-const SIGNING_KEY = "modal-task-mover-test-signing-key";
+const SIGNING_KEY = Buffer.from("0123456789abcdef0123456789abcdef").toString("base64url");
 const ACKNOWLEDGED_AT = "2026-08-23T12:30:00.000Z";
 const TEST_CODEX_AUTH_VOLUME = "dex-codex-auth-0123456789abcdef0123";
 const ORIGINAL_CODEX_AUTH_VOLUME = process.env.DEX_MODAL_CODEX_AUTH_VOLUME;
@@ -42,6 +42,8 @@ interface ModalHarness {
   modal: ModalAdapter;
   calls: string[];
   getUploadedHandoff(): HandoffDocument | undefined;
+  getWrittenText(remotePath: string): string | undefined;
+  getExecCommands(): Array<{ command: string[]; params: Record<string, unknown> | undefined }>;
   getCreateParams(): ModalSandboxCreateParams | undefined;
 }
 
@@ -49,6 +51,8 @@ interface ModalHarnessHooks {
   onCreate?(): void | Promise<void>;
   onCopy?(remotePath: string): void | Promise<void>;
   onStartupRead?(): void | Promise<void>;
+  onResultRead?(): void | Promise<void>;
+  result?(handoff: HandoffDocument): Record<string, unknown> | undefined;
   onList?(tags: Record<string, string>): void | Promise<void>;
   listSandboxIds?(tags: Record<string, string>): string[] | Promise<string[]>;
   onFromId?(sandboxId: string): void | Promise<void>;
@@ -80,6 +84,12 @@ async function mustGit(args: readonly string[], cwd: string): Promise<string> {
   return result.stdout.trim();
 }
 
+function missingModalFile(): never {
+  const error = new Error("No such file") as NodeJS.ErrnoException;
+  error.code = "ENOENT";
+  throw error;
+}
+
 async function createMoverFixture(): Promise<MoverFixture> {
   const directory = await mkdtemp(path.join(os.tmpdir(), "dex-modal-mover-"));
   temporaryDirectories.push(directory);
@@ -94,7 +104,12 @@ async function createMoverFixture(): Promise<MoverFixture> {
   await mustGit(["config", "user.name", "Dex Test"], repositoryPath);
   await mustGit(["config", "user.email", "dex@example.test"], repositoryPath);
   await writeFile(path.join(repositoryPath, "README.md"), "modal mover fixture\n", "utf8");
-  await mustGit(["add", "README.md"], repositoryPath);
+  await writeFile(
+    path.join(repositoryPath, "AGENTS.md"),
+    "Run npm test before claiming completion. Never push from a Dex worker.\n",
+    "utf8",
+  );
+  await mustGit(["add", "README.md", "AGENTS.md"], repositoryPath);
   await mustGit(["commit", "-m", "initial checkpoint"], repositoryPath);
   await mustGit(["checkout", "-b", "dex/task-modal"], repositoryPath);
   await writeFile(workerScriptPath, "// copied into the fake sandbox\n", "utf8");
@@ -117,6 +132,27 @@ async function createMoverFixture(): Promise<MoverFixture> {
     workerHistory: ["worker-local"],
     metadata: {
       validationArgv: [],
+      resultImport: { status: "completed", sandboxId: "sb-previous" },
+      cloudCompletionEffects: {
+        version: 1,
+        commandId: "command-previous-cloud-completion",
+        completion: { taskId: "task-modal" },
+        finalStatus: "succeeded",
+        summary: "previous cloud handoff completed",
+        eventId: "event-previous-cloud-completion",
+        phase: "complete",
+        createdAt: now,
+        updatedAt: now,
+        effects: {
+          sandboxTerminated: true,
+          eventAppended: true,
+          leaseReleased: true,
+          queueDrained: true,
+          receiptQueued: true,
+          receiptAccepted: true,
+          powerChecked: true,
+        },
+      },
       taskKnowledge: {
         learnedFacts: ["The task requires durable cloud ownership."],
         decisions: ["Persist the Modal sandbox before detach."],
@@ -155,6 +191,11 @@ function createModalHarness(
   hooks: ModalHarnessHooks = {},
 ): ModalHarness {
   const calls: string[] = [];
+  const writtenText = new Map<string, string>();
+  const execCommands: Array<{
+    command: string[];
+    params: Record<string, unknown> | undefined;
+  }> = [];
   let uploadedHandoff: HandoffDocument | undefined;
   let createParams: ModalSandboxCreateParams | undefined;
   const filesystem = {
@@ -171,6 +212,11 @@ function createModalHarness(
     readText: async (remotePath: string) => {
       calls.push(`read:${remotePath}`);
       if (remotePath === "/dex/startup.json") await hooks.onStartupRead?.();
+      if (remotePath === "/dex/result.json") await hooks.onResultRead?.();
+      if (remotePath === "/dex/result.json" && uploadedHandoff) {
+        const result = hooks.result?.(uploadedHandoff);
+        if (result) return JSON.stringify(result);
+      }
       if (remotePath !== "/dex/startup.json" || !uploadedHandoff) {
         const error = new Error(`Missing fake Modal file ${remotePath}`) as NodeJS.ErrnoException;
         error.code = "ENOENT";
@@ -178,18 +224,39 @@ function createModalHarness(
       }
       return JSON.stringify(startup(uploadedHandoff));
     },
-    writeText: async (_data: string, remotePath: string) => {
-      calls.push(`write:${remotePath}`);
+    writeText: async (data: string, remotePath: string) => {
+      calls.push(`filesystem-write:${remotePath}`);
+      writtenText.set(remotePath, data);
     },
   };
   const rawSandbox: ModalSdkSandboxLike = {
     sandboxId: "sb-durable-123",
     filesystem,
-    exec: async () => ({
-      stdout: { readText: async () => "" },
-      stderr: { readText: async () => "" },
-      wait: async () => 0,
-    }),
+    exec: async (command, params) => {
+      execCommands.push({ command, params });
+      const installsHandoffKey =
+        command[0] === "node" &&
+        command[1] === "-e" &&
+        command[2]?.includes("Dex handoff key failed post-rename security validation");
+      let streamed = "";
+      const stdin = new WritableStream<string>({
+        write: (chunk) => {
+          streamed += chunk;
+        },
+        close: () => {
+          if (installsHandoffKey) {
+            calls.push("write:/dex/handoff.key");
+            writtenText.set("/dex/handoff.key", streamed);
+          }
+        },
+      });
+      return {
+        stdin,
+        stdout: { readText: async () => "" },
+        stderr: { readText: async () => "" },
+        wait: async () => 0,
+      };
+    },
     detach: () => {
       calls.push("detach");
     },
@@ -262,6 +329,8 @@ function createModalHarness(
     modal: new ModalAdapter({ client }),
     calls,
     getUploadedHandoff: () => uploadedHandoff,
+    getWrittenText: (remotePath) => writtenText.get(remotePath),
+    getExecCommands: () => execCommands,
     getCreateParams: () => createParams,
   };
 }
@@ -293,8 +362,138 @@ describe("ModalTaskMover", () => {
     });
   });
 
+  it("rejects a weak runtime root signing key before mutating task state", async () => {
+    const fixture = await createMoverFixture();
+    const harness = createModalHarness(() => ({}));
+    const before = await fixture.store.read();
+    const mover = new ModalTaskMover({
+      store: fixture.store,
+      events: fixture.events,
+      tasks: fixture.tasks,
+      handoffsRoot: fixture.handoffsRoot,
+      workerScriptPath: fixture.workerScriptPath,
+      signingKey: "e".repeat(32),
+      modal: harness.modal,
+      scheduleMonitor: async () => undefined,
+    });
+
+    await expect(mover.moveToCloud(fixture.task)).rejects.toThrow(
+      "DEX_HANDOFF_SIGNING_KEY must be 43 unpadded base64url characters encoding exactly 32 bytes",
+    );
+    expect(harness.calls).not.toContain("create");
+    expect(await fixture.store.read()).toEqual(before);
+  });
+
+  it("refuses to erase a pending cloud-result recovery when another handoff is requested", async () => {
+    const fixture = await createMoverFixture();
+    await fixture.store.updateState((state) => {
+      state.tasks[fixture.task.id]!.metadata.pendingCloudResultImport = {
+        version: 1,
+        status: "pending",
+        sandboxId: "sb-previous",
+      };
+    });
+    const harness = createModalHarness(() => ({}));
+    const mover = new ModalTaskMover({
+      store: fixture.store,
+      events: fixture.events,
+      tasks: fixture.tasks,
+      handoffsRoot: fixture.handoffsRoot,
+      workerScriptPath: fixture.workerScriptPath,
+      signingKey: SIGNING_KEY,
+      modal: harness.modal,
+      scheduleMonitor: async () => undefined,
+    });
+
+    await expect(mover.moveToCloud(fixture.task)).rejects.toThrow(
+      "still has a pending cloud result import",
+    );
+    expect(harness.calls).not.toContain("create");
+    expect((await fixture.store.read()).tasks[fixture.task.id]).toMatchObject({
+      status: "running",
+      metadata: {
+        pendingCloudResultImport: {
+          status: "pending",
+          sandboxId: "sb-previous",
+        },
+      },
+    });
+  });
+
+  it("preserves unfinished cloud completion effects instead of starting another handoff", async () => {
+    const fixture = await createMoverFixture();
+    await fixture.store.updateState((state) => {
+      const effects = state.tasks[fixture.task.id]!.metadata.cloudCompletionEffects as {
+        phase: string;
+        effects: Record<string, boolean>;
+      };
+      effects.phase = "pending";
+      effects.effects.receiptAccepted = false;
+    });
+    const before = await fixture.store.read();
+    const harness = createModalHarness(() => ({}));
+    const mover = new ModalTaskMover({
+      store: fixture.store,
+      events: fixture.events,
+      tasks: fixture.tasks,
+      handoffsRoot: fixture.handoffsRoot,
+      workerScriptPath: fixture.workerScriptPath,
+      signingKey: SIGNING_KEY,
+      modal: harness.modal,
+      scheduleMonitor: async () => undefined,
+    });
+
+    await expect(mover.moveToCloud(fixture.task)).rejects.toThrow(
+      "still has unfinished cloud completion effects",
+    );
+    expect(harness.calls).not.toContain("create");
+    expect(await fixture.store.read()).toEqual(before);
+  });
+
+  it("preserves an active Modal handoff journal instead of replacing its recovery owner", async () => {
+    const fixture = await createMoverFixture();
+    await fixture.store.updateState((state) => {
+      const task = state.tasks[fixture.task.id]!;
+      delete task.metadata.cloudCompletionEffects;
+      delete task.metadata.resultImport;
+      task.metadata.modalHandoffJournal = {
+        version: 1,
+        phase: "prepared",
+        workerId: "worker-prior-cloud",
+        handoffSha256: "a".repeat(64),
+        operationToken: "b".repeat(64),
+        startedAt: "2026-08-23T12:05:00.000Z",
+        updatedAt: "2026-08-23T12:05:00.000Z",
+      };
+    });
+    const before = await fixture.store.read();
+    const harness = createModalHarness(() => ({}));
+    const mover = new ModalTaskMover({
+      store: fixture.store,
+      events: fixture.events,
+      tasks: fixture.tasks,
+      handoffsRoot: fixture.handoffsRoot,
+      workerScriptPath: fixture.workerScriptPath,
+      signingKey: SIGNING_KEY,
+      modal: harness.modal,
+      scheduleMonitor: async () => undefined,
+    });
+
+    await expect(mover.moveToCloud(fixture.task)).rejects.toThrow(
+      "still has an active or unfinished Modal handoff",
+    );
+    expect(harness.calls).not.toContain("create");
+    expect(await fixture.store.read()).toEqual(before);
+  });
+
   it("journals before create, uploads before monitoring, and updates the persisted worker on startup", async () => {
     const fixture = await createMoverFixture();
+    await mkdir(path.join(fixture.task.worktreePath, "src"));
+    await writeFile(
+      path.join(fixture.task.worktreePath, "src", "AGENTS.md"),
+      "For src/, run the focused checkout regression before completion.\n",
+      "utf8",
+    );
     let stateAtCreate: Awaited<ReturnType<DexStateStore["read"]>> | undefined;
     let stateAtUpload: Awaited<ReturnType<DexStateStore["read"]>> | undefined;
     let stateAtStartupRead: Awaited<ReturnType<DexStateStore["read"]>> | undefined;
@@ -342,6 +541,14 @@ describe("ModalTaskMover", () => {
     const uploaded = harness.getUploadedHandoff();
     expect(uploaded).toBeDefined();
     expect(uploaded?.memories.length).toBeGreaterThanOrEqual(5);
+    expect(uploaded?.constraints.some((constraint) =>
+      constraint.includes("Repository instructions from AGENTS.md") &&
+      constraint.includes("Run npm test before claiming completion")
+    )).toBe(true);
+    expect(uploaded?.constraints.some((constraint) =>
+      constraint.includes("Repository instructions from src/AGENTS.md (scope: src/)") &&
+      constraint.includes("run the focused checkout regression")
+    )).toBe(true);
     expect(uploaded?.failedApproaches).toContainEqual(expect.objectContaining({
       approach: "Detach before scheduling the monitor",
       reason: "The task could become unowned.",
@@ -418,6 +625,9 @@ describe("ModalTaskMover", () => {
       providerSessionId: "thread-durable-456",
       target: { kind: "modal", sandboxId: "sb-durable-123" },
     });
+    expect(reloaded.tasks[fixture.task.id]?.metadata).not.toHaveProperty("resultImport");
+    expect(reloaded.tasks[fixture.task.id]?.metadata).not.toHaveProperty("pendingCloudResultImport");
+    expect(reloaded.tasks[fixture.task.id]?.metadata).not.toHaveProperty("cloudCompletionEffects");
     expect(Object.values(reloaded.workers).filter((worker) => worker.target.kind === "modal")).toHaveLength(1);
     expect(harness.calls.indexOf("copy:/dex/repo.bundle")).toBeLessThan(harness.calls.indexOf("monitor"));
     expect(harness.calls.indexOf("copy:/dex/handoff.json")).toBeLessThan(harness.calls.indexOf("monitor"));
@@ -426,9 +636,41 @@ describe("ModalTaskMover", () => {
     expect(harness.calls.indexOf("read:/dex/startup.json")).toBeLessThan(harness.calls.indexOf("monitor"));
     expect(harness.calls.indexOf("monitor")).toBeLessThan(harness.calls.indexOf("detach"));
     expect(harness.calls).toContain(`volume:${TEST_CODEX_AUTH_VOLUME}:false`);
-    expect(harness.calls).toContain("secret:dex-workers:DEX_HANDOFF_SIGNING_KEY");
+    expect(harness.calls).toContain("write:/dex/handoff.key");
+    expect(harness.calls).not.toContain("filesystem-write:/dex/handoff.key");
+    const scopedSigningKey = harness.getWrittenText("/dex/handoff.key");
+    expect(scopedSigningKey).toEqual(expect.any(String));
+    expect(scopedSigningKey).not.toBe(SIGNING_KEY);
+    const keyInstaller = harness.getExecCommands().find(({ command }) =>
+      command[0] === "node" && command[1] === "-e" && command[2]?.includes("O_NOFOLLOW")
+    );
+    expect(keyInstaller).toBeDefined();
+    expect(JSON.stringify(keyInstaller)).not.toContain(scopedSigningKey);
+    expect(keyInstaller?.command[2]).toContain("O_EXCL");
+    expect(keyInstaller?.command[2]).toContain("renameSync(temporary, target)");
+    expect(keyInstaller?.params).toMatchObject({ mode: "text", timeoutMs: 30_000 });
+    const localHandoffPath = path.join(fixture.handoffsRoot, fixture.task.id, "handoff.json");
+    await expect(readHandoff(localHandoffPath, scopedSigningKey!)).resolves.toMatchObject({
+      taskId: fixture.task.id,
+      contentHash: uploaded?.contentHash,
+    });
+    await expect(readHandoff(localHandoffPath, SIGNING_KEY)).rejects.toThrow(
+      "Handoff verification failed",
+    );
+    expect(harness.calls.some((call) => call.startsWith("secret:"))).toBe(false);
     expect(harness.getCreateParams()).toMatchObject({
       timeoutMs: 24 * 60 * 60_000,
+      outboundDomainAllowlist: [
+        "openai.com",
+        "*.openai.com",
+        "chatgpt.com",
+        "*.chatgpt.com",
+        "oaistatic.com",
+        "*.oaistatic.com",
+        "oaiusercontent.com",
+        "*.oaiusercontent.com",
+        "registry.npmjs.org",
+      ],
       command: expect.arrayContaining([
         expect.stringContaining("while :; do sleep 3600; done"),
       ]),
@@ -456,7 +698,7 @@ describe("ModalTaskMover", () => {
       loadedMemoryIds: handoff.memories.slice(0, 4).map(({ id }) => String(id)),
       loadedFailedApproachIds: [],
       acknowledgedAt: ACKNOWLEDGED_AT,
-    }));
+    }), { onStartupRead: missingModalFile });
     const scheduleMonitor = vi.fn(async () => {
       harness.calls.push("monitor");
     });
@@ -514,6 +756,213 @@ describe("ModalTaskMover", () => {
     )).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("fails immediately when the worker publishes malformed startup evidence", async () => {
+    const fixture = await createMoverFixture();
+    const harness = createModalHarness(() => ({}));
+    const mover = new ModalTaskMover({
+      store: fixture.store,
+      events: fixture.events,
+      tasks: fixture.tasks,
+      handoffsRoot: fixture.handoffsRoot,
+      workerScriptPath: fixture.workerScriptPath,
+      signingKey: SIGNING_KEY,
+      modal: harness.modal,
+      scheduleMonitor: async () => undefined,
+      startupTimeoutMs: 30_000,
+    });
+
+    await expect(mover.moveToCloud(fixture.task)).rejects.toThrow(
+      "Modal worker published an invalid startup acknowledgement",
+    );
+    expect(harness.calls.filter((call) => call === "read:/dex/startup.json")).toHaveLength(1);
+  });
+
+  it("fails immediately when startup evidence belongs to another task", async () => {
+    const fixture = await createMoverFixture();
+    const harness = createModalHarness((handoff) => ({
+      taskId: "task-attacker",
+      handoffSha256: handoff.contentHash,
+      providerThreadId: "thread-wrong-task",
+      loadedMemoryIds: handoff.memories.map(({ id }) => String(id)),
+      loadedFailedApproachIds: handoff.failedApproaches.map(
+        ({ sourceMemoryId }, index) => String(sourceMemoryId ?? `failed-${index + 1}`),
+      ),
+    }));
+    const mover = new ModalTaskMover({
+      store: fixture.store,
+      events: fixture.events,
+      tasks: fixture.tasks,
+      handoffsRoot: fixture.handoffsRoot,
+      workerScriptPath: fixture.workerScriptPath,
+      signingKey: SIGNING_KEY,
+      modal: harness.modal,
+      scheduleMonitor: async () => undefined,
+      startupTimeoutMs: 30_000,
+    });
+
+    await expect(mover.moveToCloud(fixture.task)).rejects.toThrow(
+      "Modal startup acknowledged the wrong task",
+    );
+    expect(harness.calls.filter((call) => call === "read:/dex/startup.json")).toHaveLength(1);
+  });
+
+  it("fails immediately when the sandbox exits before publishing startup evidence", async () => {
+    const fixture = await createMoverFixture();
+    const harness = createModalHarness(() => ({}), {
+      onStartupRead: missingModalFile,
+      poll: () => 17,
+    });
+    const mover = new ModalTaskMover({
+      store: fixture.store,
+      events: fixture.events,
+      tasks: fixture.tasks,
+      handoffsRoot: fixture.handoffsRoot,
+      workerScriptPath: fixture.workerScriptPath,
+      signingKey: SIGNING_KEY,
+      modal: harness.modal,
+      scheduleMonitor: async () => undefined,
+      startupTimeoutMs: 30_000,
+    });
+
+    await expect(mover.moveToCloud(fixture.task)).rejects.toThrow(
+      "Modal worker exited with code 17 before startup acknowledgement",
+    );
+    expect(harness.calls.filter((call) => call === "read:/dex/startup.json")).toHaveLength(1);
+  });
+
+  it("retries when both startup and terminal-result filesystem reads fail transiently", async () => {
+    const fixture = await createMoverFixture();
+    let startupFailures = 2;
+    let resultFailures = 2;
+    const transient = (): Error => {
+      const error = new Error("Modal filesystem deadline exceeded") as NodeJS.ErrnoException;
+      error.code = "ETIMEDOUT";
+      return error;
+    };
+    const harness = createModalHarness((handoff) => ({
+      taskId: handoff.taskId,
+      handoffSha256: handoff.contentHash,
+      providerThreadId: "thread-after-transient-outage",
+      loadedMemoryIds: handoff.memories.map(({ id }) => String(id)),
+      loadedFailedApproachIds: handoff.failedApproaches.map(
+        ({ sourceMemoryId }, index) => String(sourceMemoryId ?? `failed-${index + 1}`),
+      ),
+    }), {
+      onStartupRead: () => {
+        if (startupFailures-- > 0) throw transient();
+      },
+      onResultRead: () => {
+        if (resultFailures-- > 0) throw transient();
+      },
+    });
+    const mover = new ModalTaskMover({
+      store: fixture.store,
+      events: fixture.events,
+      tasks: fixture.tasks,
+      handoffsRoot: fixture.handoffsRoot,
+      workerScriptPath: fixture.workerScriptPath,
+      signingKey: SIGNING_KEY,
+      modal: harness.modal,
+      scheduleMonitor: async () => undefined,
+      startupTimeoutMs: 3_000,
+    });
+
+    await expect(mover.moveToCloud(fixture.task)).resolves.toBeUndefined();
+    expect(harness.calls.filter((call) => call === "read:/dex/startup.json").length)
+      .toBeGreaterThanOrEqual(3);
+    expect(harness.calls.filter((call) => call === "read:/dex/result.json")).toHaveLength(2);
+  });
+
+  it("retries real Modal filesystem and control-plane error shapes during startup", async () => {
+    const fixture = await createMoverFixture();
+    let startupFailures = 1;
+    let resultFailures = 1;
+    const harness = createModalHarness((handoff) => ({
+      taskId: handoff.taskId,
+      handoffSha256: handoff.contentHash,
+      providerThreadId: "thread-after-modal-control-plane-outage",
+      loadedMemoryIds: handoff.memories.map(({ id }) => String(id)),
+      loadedFailedApproachIds: handoff.failedApproaches.map(
+        ({ sourceMemoryId }, index) => String(sourceMemoryId ?? `failed-${index + 1}`),
+      ),
+    }), {
+      onStartupRead: () => {
+        if (startupFailures-- > 0) {
+          const error = new Error(
+            "An unexpected error occurred, please contact support@modal.com (Error code: ABCD1234)",
+          );
+          error.name = "SandboxFilesystemError";
+          throw error;
+        }
+      },
+      onResultRead: () => {
+        if (resultFailures-- > 0) {
+          const error = new Error(
+            "The Sandbox is unavailable. This Sandbox may have already shut down.",
+          );
+          error.name = "NotFoundError";
+          throw error;
+        }
+      },
+    });
+    const mover = new ModalTaskMover({
+      store: fixture.store,
+      events: fixture.events,
+      tasks: fixture.tasks,
+      handoffsRoot: fixture.handoffsRoot,
+      workerScriptPath: fixture.workerScriptPath,
+      signingKey: SIGNING_KEY,
+      modal: harness.modal,
+      scheduleMonitor: async () => undefined,
+      startupTimeoutMs: 3_000,
+    });
+
+    await expect(mover.moveToCloud(fixture.task)).resolves.toBeUndefined();
+    expect(harness.calls.filter((call) => call === "read:/dex/startup.json")).toHaveLength(2);
+    expect(harness.calls.filter((call) => call === "read:/dex/result.json")).toHaveLength(1);
+  });
+
+  it("surfaces a terminal worker result immediately when Codex fails before startup", async () => {
+    const fixture = await createMoverFixture();
+    const harness = createModalHarness((handoff) => ({
+      taskId: handoff.taskId,
+      handoffSha256: handoff.contentHash,
+      providerThreadId: "thread-never-started",
+      loadedMemoryIds: [],
+      loadedFailedApproachIds: [],
+    }), {
+      onStartupRead: missingModalFile,
+      result: (handoff) => ({
+        taskId: handoff.taskId,
+        handoffSha256: handoff.contentHash,
+        status: "failed",
+        summary: "Codex account runtime validation failed",
+        validation: { commands: [], passed: false },
+        git: { branch: handoff.repository.workingBranch, commit: "unavailable" },
+      }),
+    });
+    const scheduleMonitor = vi.fn(async () => undefined);
+    const mover = new ModalTaskMover({
+      store: fixture.store,
+      events: fixture.events,
+      tasks: fixture.tasks,
+      handoffsRoot: fixture.handoffsRoot,
+      workerScriptPath: fixture.workerScriptPath,
+      signingKey: SIGNING_KEY,
+      modal: harness.modal,
+      scheduleMonitor,
+      startupTimeoutMs: 30_000,
+    });
+
+    await expect(mover.moveToCloud(fixture.task)).rejects.toThrow(
+      "Modal worker failed before startup acknowledgement: Codex account runtime validation failed",
+    );
+
+    expect(harness.calls).toContain("read:/dex/result.json");
+    expect(harness.calls).toContain("terminate:true");
+    expect(scheduleMonitor).not.toHaveBeenCalled();
+  });
+
   it("durably retries lease release after startup cleanup without terminating twice", async () => {
     const fixture = await createMoverFixture();
     const harness = createModalHarness((handoff) => ({
@@ -523,7 +972,7 @@ describe("ModalTaskMover", () => {
       loadedMemoryIds: [],
       loadedFailedApproachIds: [],
       acknowledgedAt: ACKNOWLEDGED_AT,
-    }));
+    }), { onStartupRead: missingModalFile });
     const releaseFailure = vi.fn(async () => {
       throw new Error("simulated lease unlink failure");
     });
@@ -924,6 +1373,7 @@ describe("ModalTaskMover", () => {
       loadedFailedApproachIds: [],
       acknowledgedAt: ACKNOWLEDGED_AT,
     }), {
+      onStartupRead: missingModalFile,
       terminate: () => {
         if (terminationFails) throw new Error("temporary Modal termination outage");
       },
@@ -1066,7 +1516,11 @@ describe("ModalTaskMover", () => {
       acknowledgedAt: ACKNOWLEDGED_AT,
     }), {
       onStartupRead: () => {
-        if (failStartupReads) throw new Error("temporary startup read outage");
+        if (failStartupReads) {
+          const error = new Error("temporary startup read outage") as NodeJS.ErrnoException;
+          error.code = "ETIMEDOUT";
+          throw error;
+        }
       },
     });
     const initialMover = new ModalTaskMover({
@@ -1138,7 +1592,11 @@ describe("ModalTaskMover", () => {
       acknowledgedAt: ACKNOWLEDGED_AT,
     }), {
       onStartupRead: () => {
-        if (failStartupReads) throw new Error("temporary startup read outage");
+        if (failStartupReads) {
+          const error = new Error("temporary startup read outage") as NodeJS.ErrnoException;
+          error.code = "ETIMEDOUT";
+          throw error;
+        }
       },
     });
     const initialMover = new ModalTaskMover({

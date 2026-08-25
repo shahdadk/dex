@@ -30,7 +30,7 @@ const ALLOWED: Record<TaskStatus, ReadonlySet<TaskStatus>> = {
   preparing: new Set(["running", "checkpointing", "failed", "cancelled"]),
   running: new Set(["queued", "preparing", "waiting_user", "checkpointing", "completed", "failed", "cancelled"]),
   waiting_user: new Set(["queued", "preparing", "running", "checkpointing", "cancelled", "failed"]),
-  checkpointing: new Set(["preparing", "handoff", "running", "failed", "cancelled"]),
+  checkpointing: new Set(["queued", "preparing", "handoff", "running", "failed", "cancelled"]),
   handoff: new Set(["preparing", "running", "failed", "cancelled"]),
   completed: new Set(["queued", "preparing", "checkpointing"]),
   failed: new Set(["queued", "preparing", "checkpointing", "cancelled"]),
@@ -123,6 +123,19 @@ export interface TaskPreparationOperations {
   createWorktree(repository: RepositoryInfo, worktreesRoot: string, taskId: string): Promise<WorktreeResult>;
   rollbackCreatedWorktree(repositoryRoot: string, worktree: WorktreeResult): Promise<void>;
 }
+
+export type LocalWorkerHandoffClaim =
+  | {
+      status: "claimed";
+      task: DexTask;
+      sourceWorkerId: string;
+      sourceGeneration: number;
+      claimedGeneration: number;
+    }
+  | {
+      status: "local_completed" | "stale";
+      task: DexTask;
+    };
 
 export class TaskManager {
   readonly #store: DexStateStore;
@@ -380,6 +393,83 @@ export class TaskManager {
   }
 
   /**
+   * Atomically chooses the winner between a local worker's terminal result and
+   * a battery-response cloud handoff. The compare-and-swap is intentionally
+   * bound to both worker identity and lifecycle generation: a stale prompt can
+   * never claim a replacement worker, and a worker result from the generation
+   * before this claim can never finish the task afterward.
+   */
+  async claimLocalWorkerForCloudHandoff(
+    taskId: string,
+    expectedWorkerId: string,
+    expectedGeneration: number,
+  ): Promise<LocalWorkerHandoffClaim> {
+    let outcome: LocalWorkerHandoffClaim | undefined;
+    await this.#store.updateState((state) => {
+      const current = requireTask(state, taskId);
+      const worker = state.workers[current.currentWorkerId ?? ""];
+      const generation = taskLifecycleGeneration(current);
+
+      if (current.status === "completed" || (
+        current.currentWorkerId === expectedWorkerId && worker?.status === "completed"
+      )) {
+        outcome = { status: "local_completed", task: current };
+        return;
+      }
+      if (
+        current.currentWorkerId !== expectedWorkerId ||
+        generation !== expectedGeneration ||
+        worker?.target.kind !== "local" ||
+        worker.purpose !== "work" ||
+        !["starting", "running", "waiting"].includes(worker.status) ||
+        !["queued", "preparing", "running", "waiting_user"].includes(current.status)
+      ) {
+        outcome = { status: "stale", task: current };
+        return;
+      }
+      if (expectedGeneration >= Number.MAX_SAFE_INTEGER) {
+        throw new Error(`Lifecycle generation exhausted for ${current.title}`);
+      }
+
+      const claimedGeneration = expectedGeneration + 1;
+      const timestamp = new Date().toISOString();
+      const claimed = DexTaskSchema.parse({
+        ...current,
+        status: "checkpointing",
+        stage: "checkpointing",
+        latestSummary: "checkpointing local work for cloud handoff",
+        metadata: {
+          ...metadataForTransition(current, "checkpointing"),
+          lifecycleGeneration: claimedGeneration,
+        },
+        updatedAt: timestamp,
+      });
+      state.tasks[taskId] = claimed;
+      outcome = {
+        status: "claimed",
+        task: claimed,
+        sourceWorkerId: expectedWorkerId,
+        sourceGeneration: expectedGeneration,
+        claimedGeneration,
+      };
+    });
+    if (!outcome) throw new Error(`Task ${taskId} handoff claim did not resolve`);
+    if (outcome.status === "claimed") {
+      await this.#events.append({
+        type: "handoff.started",
+        taskId,
+        workerId: outcome.sourceWorkerId,
+        payload: {
+          reason: "battery_response",
+          sourceGeneration: outcome.sourceGeneration,
+          claimedGeneration: outcome.claimedGeneration,
+        },
+      }).catch(() => undefined);
+    }
+    return outcome;
+  }
+
+  /**
    * Commits a successful local-worker outcome and its user notification to
    * the same atomic state revision. Power policy can therefore never observe
    * a terminal task without also observing the durable transport event that
@@ -403,6 +493,30 @@ export class TaskManager {
     });
   }
 
+  async completeIfCurrentWorkerAndGenerationWithNotification(
+    taskId: string,
+    expectedWorkerId: string,
+    expectedGeneration: number,
+    summary: string,
+    conversationId: string,
+    text: string,
+  ): Promise<DexTask | undefined> {
+    return this.finalizeIfCurrentWorkerAndGenerationWithNotification(
+      taskId,
+      expectedWorkerId,
+      expectedGeneration,
+      {
+        status: "completed",
+        stage: "done",
+        summary,
+        conversationId,
+        text,
+        kind: "work_completed",
+        dedupeKey: `work-completed:${expectedWorkerId}`,
+      },
+    );
+  }
+
   async markRecoveryPendingIfCurrentWorker(
     taskId: string,
     expectedWorkerId: string,
@@ -412,6 +526,23 @@ export class TaskManager {
     reason: string,
   ): Promise<DexTask | undefined> {
     return this.#markRecoveryPending(taskId, (task) => task.currentWorkerId === expectedWorkerId, patch, reason);
+  }
+
+  async markRecoveryPendingIfCurrentWorkerAndGeneration(
+    taskId: string,
+    expectedWorkerId: string,
+    expectedGeneration: number,
+    patch: Partial<Pick<DexTask, "latestSummary" | "nextStep" | "blockedReason" | "testStatus">> & {
+      stage?: SemanticStage;
+    },
+    reason: string,
+  ): Promise<DexTask | undefined> {
+    return this.#markRecoveryPending(
+      taskId,
+      (task) => ownsWorkerGeneration(task, expectedWorkerId, expectedGeneration),
+      patch,
+      reason,
+    );
   }
 
   async markRecoveryPendingIfGeneration(
@@ -436,6 +567,19 @@ export class TaskManager {
     input: TerminalNotificationInput,
   ): Promise<DexTask | undefined> {
     return this.#finalizeWithNotification(taskId, (task) => task.currentWorkerId === expectedWorkerId, input);
+  }
+
+  async finalizeIfCurrentWorkerAndGenerationWithNotification(
+    taskId: string,
+    expectedWorkerId: string,
+    expectedGeneration: number,
+    input: TerminalNotificationInput,
+  ): Promise<DexTask | undefined> {
+    return this.#finalizeWithNotification(
+      taskId,
+      (task) => ownsWorkerGeneration(task, expectedWorkerId, expectedGeneration),
+      input,
+    );
   }
 
   async finalizeIfGenerationWithNotification(
@@ -679,6 +823,15 @@ function requireTask(state: DexState, taskId: string): DexTask {
   const task = state.tasks[taskId];
   if (!task) throw new Error(`Unknown Dex task: ${taskId}`);
   return task;
+}
+
+function taskLifecycleGeneration(task: DexTask): number {
+  const value = task.metadata.lifecycleGeneration;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+function ownsWorkerGeneration(task: DexTask, workerId: string, generation: number): boolean {
+  return task.currentWorkerId === workerId && taskLifecycleGeneration(task) === generation;
 }
 
 function metadataForTransition(task: DexTask, status: TaskStatus): Record<string, unknown> {

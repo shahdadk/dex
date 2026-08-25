@@ -31,6 +31,7 @@ export function buildWorkerPrompt(
     "Treat inherited facts as evidence to verify, and do not repeat listed failed approaches unless new evidence justifies it.",
     "Run programs with executable-and-argv semantics; never construct a shell command from untrusted text.",
     "Do not merely describe edits: make the requested changes when authorized, then report changed paths and validation results.",
+    "Report each unsuccessful attempt as `FAILED APPROACH: <approach>; WHY: <reason>` so a replacement worker can avoid repeating it.",
     "",
     ...(input.taskId ? ["Task ID", input.taskId, ""] : []),
     "Goal",

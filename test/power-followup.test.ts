@@ -91,7 +91,7 @@ function messageCommand(text: string, conversationId = "chat-1"): DexVerifiedCom
 }
 
 describe("low-battery conversation follow-up", () => {
-  it("persists simulated provenance, expiry, and the exact active local task IDs", async () => {
+  it("persists simulated provenance, expiry, and exact active local worker snapshots", async () => {
     const { store, events } = await fixture();
     await addTask(store, "task-local", { title: "local fix" });
     await addTask(store, "task-cloud", { target: "modal" });
@@ -120,6 +120,11 @@ describe("low-battery conversation follow-up", () => {
       type: "battery.low",
       conversationId: "chat-1",
       taskIds: ["task-local"],
+      taskSnapshots: [{
+        taskId: "task-local",
+        workerId: "worker-task-local",
+        lifecycleGeneration: 0,
+      }],
       createdAt: NOW,
       expiresAt: "2026-08-23T12:01:00.000Z",
     })]);
@@ -144,13 +149,16 @@ describe("low-battery conversation follow-up", () => {
     }));
     await addTask(store, "later-task");
 
-    const handle = vi.fn(async (actions: Array<{ taskQuery?: string }>) => `moving ${actions[0]?.taskQuery}`);
+    const moveCapturedLocalTaskToCloud = vi.fn(async (captured: { taskId: string }) => ({
+      status: "started" as const,
+      title: captured.taskId,
+    }));
     const notify = vi.fn(async () => undefined);
     const receipt = vi.fn(async () => undefined);
     const runtime = new DexDaemonRuntime({
       bridge: { notify, receipt, syncOnce: vi.fn(async () => []) } as unknown as DexCloudBridge,
       router: { route: vi.fn(async () => { throw new Error("plain yes should not be routed"); }) } as unknown as MessageRouter,
-      orchestrator: { handle } as unknown as DexOrchestrator,
+      orchestrator: { moveCapturedLocalTaskToCloud } as unknown as DexOrchestrator,
       store,
       events,
       battery,
@@ -160,14 +168,348 @@ describe("low-battery conversation follow-up", () => {
 
     await runtime.handleCommand(messageCommand("yes"));
 
-    expect(handle.mock.calls.map(([actions]) => actions)).toEqual([
-      [{ type: "MOVE_TASK", taskQuery: "captured-one", destination: "cloud", preferredAgent: "codex" }],
-      [{ type: "MOVE_TASK", taskQuery: "captured-two", destination: "cloud", preferredAgent: "codex" }],
+    expect(moveCapturedLocalTaskToCloud.mock.calls.map(([captured]) => captured)).toEqual([
+      { taskId: "captured-one", workerId: "worker-captured-one", lifecycleGeneration: 0 },
+      { taskId: "captured-two", workerId: "worker-captured-two", lifecycleGeneration: 0 },
     ]);
-    expect(handle.mock.calls.flatMap(([actions]) => actions).some((action) => action.taskQuery === "later-task")).toBe(false);
+    expect(moveCapturedLocalTaskToCloud.mock.calls.some(([captured]) => captured.taskId === "later-task")).toBe(false);
     expect((await store.read()).pendingConversationPrompts).toEqual([]);
-    expect(notify).toHaveBeenCalledWith("chat-1", expect.stringContaining("moving captured-one"));
+    expect(notify).toHaveBeenCalledWith("chat-1", expect.stringContaining("captured-one is being handed"));
     expect(receipt).toHaveBeenCalledWith(expect.stringContaining("command-yes-chat-1"), "processed");
+  });
+
+  it("does not let a stale prompt claim a replacement worker before yes arrives", async () => {
+    const { directory, store, events } = await fixture();
+    await addTask(store, "replaced-task");
+    const battery = new BatteryMonitor({
+      store,
+      events,
+      conversationId: "chat-1",
+      notify: async () => undefined,
+    });
+    await battery.handleBatteryReading(simulatedBatteryReading({
+      batteryPercent: 8,
+      charging: false,
+      powerSource: "battery",
+      remainingMinutes: 20,
+    }));
+    await store.updateState((state) => {
+      const originalWorker = state.workers["worker-replaced-task"]!;
+      originalWorker.status = "stopped";
+      originalWorker.endedAt = new Date().toISOString();
+      const replacementWorker = WorkerSessionSchema.parse({
+        id: "worker-replacement",
+        taskId: "replaced-task",
+        agent: "codex",
+        target: { kind: "local", machineId: "device-1" },
+        status: "running",
+        startedAt: new Date().toISOString(),
+      });
+      state.workers[replacementWorker.id] = replacementWorker;
+      const task = state.tasks["replaced-task"]!;
+      task.currentWorkerId = replacementWorker.id;
+      task.workerHistory.push(replacementWorker.id);
+      task.metadata.lifecycleGeneration = 1;
+      task.updatedAt = new Date().toISOString();
+    });
+
+    const tasks = new TaskManager(store, events, resolveDexPaths(directory));
+    let cloudStarts = 0;
+    const moveCapturedLocalTaskToCloud = vi.fn(async (captured: {
+      taskId: string;
+      workerId: string;
+      lifecycleGeneration: number;
+    }) => {
+      const claim = await tasks.claimLocalWorkerForCloudHandoff(
+        captured.taskId,
+        captured.workerId,
+        captured.lifecycleGeneration,
+      );
+      if (claim.status === "claimed") {
+        cloudStarts += 1;
+        return { status: "started" as const, title: claim.task.title };
+      }
+      return { status: claim.status, title: claim.task.title };
+    });
+    const notify = vi.fn(async () => undefined);
+    const runtime = new DexDaemonRuntime({
+      bridge: {
+        notify,
+        receipt: vi.fn(async () => undefined),
+        syncOnce: vi.fn(async () => []),
+      } as unknown as DexCloudBridge,
+      router: { route: vi.fn(async () => { throw new Error("plain yes should not be routed"); }) } as unknown as MessageRouter,
+      orchestrator: { moveCapturedLocalTaskToCloud } as unknown as DexOrchestrator,
+      store,
+      events,
+      battery,
+      power: new DexPowerController({ store, events, notify: async () => undefined }),
+      codexAuthLeasePath: path.join(directory, "lease"),
+    });
+
+    await runtime.handleCommand(messageCommand("yes"));
+
+    expect(moveCapturedLocalTaskToCloud).toHaveBeenCalledWith(
+      { taskId: "replaced-task", workerId: "worker-replaced-task", lifecycleGeneration: 0 },
+      expect.objectContaining({ conversationId: "chat-1" }),
+    );
+    expect(cloudStarts).toBe(0);
+    const state = await store.read();
+    expect(state.tasks["replaced-task"]).toMatchObject({
+      status: "running",
+      currentWorkerId: "worker-replacement",
+      metadata: { lifecycleGeneration: 1 },
+    });
+    expect(state.workers["worker-replacement"]?.status).toBe("running");
+    expect(state.pendingConversationPrompts).toEqual([]);
+    expect(notify).toHaveBeenCalledWith(
+      "chat-1",
+      "replaced-task changed workers before i could claim it, so i left the current work alone.",
+    );
+  });
+
+  it("loads legacy task-ID-only prompts but fails closed on yes", async () => {
+    const { directory, store, events } = await fixture();
+    await addTask(store, "legacy-task");
+    await store.updateState((state) => {
+      state.pendingConversationPrompts.push({
+        id: "prompt-legacy",
+        type: "battery.low",
+        conversationId: "chat-1",
+        taskIds: ["legacy-task"],
+        createdAt: new Date(Date.now() - 1_000).toISOString(),
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      });
+    });
+    const moveCapturedLocalTaskToCloud = vi.fn();
+    const notify = vi.fn(async () => undefined);
+    const runtime = new DexDaemonRuntime({
+      bridge: {
+        notify,
+        receipt: vi.fn(async () => undefined),
+        syncOnce: vi.fn(async () => []),
+      } as unknown as DexCloudBridge,
+      router: { route: vi.fn(async () => { throw new Error("plain yes should not be routed"); }) } as unknown as MessageRouter,
+      orchestrator: { moveCapturedLocalTaskToCloud } as unknown as DexOrchestrator,
+      store,
+      events,
+      battery: { start: vi.fn(), stop: vi.fn() } as unknown as BatteryMonitor,
+      power: new DexPowerController({ store, events, notify: async () => undefined }),
+      codexAuthLeasePath: path.join(directory, "lease"),
+    });
+
+    await runtime.handleCommand(messageCommand("yes"));
+
+    expect(moveCapturedLocalTaskToCloud).not.toHaveBeenCalled();
+    const state = await store.read();
+    expect(state.pendingConversationPrompts).toEqual([]);
+    expect(state.tasks["legacy-task"]).toMatchObject({
+      status: "running",
+      currentWorkerId: "worker-legacy-task",
+    });
+    expect(notify).toHaveBeenCalledWith(
+      "chat-1",
+      "that battery prompt predates worker fencing, so i left the captured tasks running locally.",
+    );
+  });
+
+  it("does not move or rerun a captured task that finishes locally before yes arrives", async () => {
+    const { directory, store, events } = await fixture();
+    await addTask(store, "fast-local");
+    const battery = new BatteryMonitor({
+      store,
+      events,
+      conversationId: "chat-1",
+      notify: async () => undefined,
+    });
+    await battery.handleBatteryReading(simulatedBatteryReading({
+      batteryPercent: 8,
+      charging: false,
+      powerSource: "battery",
+      remainingMinutes: 20,
+    }));
+    await store.updateState((state) => {
+      const task = state.tasks["fast-local"]!;
+      const worker = state.workers["worker-fast-local"]!;
+      task.status = "completed";
+      task.stage = "done";
+      task.updatedAt = new Date().toISOString();
+      worker.status = "completed";
+      worker.endedAt = new Date().toISOString();
+      worker.exitCode = 0;
+    });
+
+    const moveCapturedLocalTaskToCloud = vi.fn(async () => ({ status: "started" as const, title: "fast-local" }));
+    const notify = vi.fn(async () => undefined);
+    const runtime = new DexDaemonRuntime({
+      bridge: {
+        notify,
+        receipt: vi.fn(async () => undefined),
+        syncOnce: vi.fn(async () => []),
+      } as unknown as DexCloudBridge,
+      router: { route: vi.fn(async () => { throw new Error("plain yes should not be routed"); }) } as unknown as MessageRouter,
+      orchestrator: { moveCapturedLocalTaskToCloud } as unknown as DexOrchestrator,
+      store,
+      events,
+      battery,
+      power: new DexPowerController({ store, events, notify: async () => undefined }),
+      codexAuthLeasePath: path.join(directory, "lease"),
+    });
+
+    await runtime.handleCommand(messageCommand("yes"));
+
+    expect(moveCapturedLocalTaskToCloud).not.toHaveBeenCalled();
+    const state = await store.read();
+    expect(state.pendingConversationPrompts).toEqual([]);
+    expect(state.tasks["fast-local"]?.status).toBe("completed");
+    expect(state.workers["worker-fast-local"]).toMatchObject({
+      status: "completed",
+      target: { kind: "local", machineId: "device-1" },
+    });
+    expect(notify).toHaveBeenCalledOnce();
+    expect(notify).toHaveBeenCalledWith(
+      "chat-1",
+      "fast-local already finished locally, so i didn't move or rerun it.",
+    );
+  });
+
+  it("lets local completion win atomically after the daemon read but before its handoff claim", async () => {
+    const { directory, store, events } = await fixture();
+    await addTask(store, "finish-at-claim");
+    const battery = new BatteryMonitor({
+      store,
+      events,
+      conversationId: "chat-1",
+      notify: async () => undefined,
+    });
+    await battery.handleBatteryReading(simulatedBatteryReading({
+      batteryPercent: 8,
+      charging: false,
+      powerSource: "battery",
+      remainingMinutes: 20,
+    }));
+    const tasks = new TaskManager(store, events, resolveDexPaths(directory));
+    let cloudStarts = 0;
+    const moveCapturedLocalTaskToCloud = vi.fn(async (captured: {
+      taskId: string;
+      workerId: string;
+      lifecycleGeneration: number;
+    }) => {
+      // This callback begins only after runtime has read an active local task.
+      // Commit completion before the atomic handoff CAS to reproduce the
+      // original read/dispatch race deterministically.
+      await tasks.completeIfCurrentWorkerAndGenerationWithNotification(
+        captured.taskId,
+        captured.workerId,
+        captured.lifecycleGeneration,
+        "finished during battery reply",
+        "chat-1",
+        "finish-at-claim is done",
+      );
+      const claim = await tasks.claimLocalWorkerForCloudHandoff(
+        captured.taskId,
+        captured.workerId,
+        captured.lifecycleGeneration,
+      );
+      if (claim.status === "claimed") cloudStarts += 1;
+      return { status: claim.status, title: claim.task.title };
+    });
+    const notify = vi.fn(async () => undefined);
+    const runtime = new DexDaemonRuntime({
+      bridge: {
+        notify,
+        receipt: vi.fn(async () => undefined),
+        syncOnce: vi.fn(async () => []),
+      } as unknown as DexCloudBridge,
+      router: { route: vi.fn(async () => { throw new Error("plain yes should not be routed"); }) } as unknown as MessageRouter,
+      orchestrator: { moveCapturedLocalTaskToCloud } as unknown as DexOrchestrator,
+      store,
+      events,
+      battery,
+      power: new DexPowerController({ store, events, notify: async () => undefined }),
+      codexAuthLeasePath: path.join(directory, "lease"),
+    });
+
+    await runtime.handleCommand(messageCommand("yes"));
+
+    expect(moveCapturedLocalTaskToCloud).toHaveBeenCalledOnce();
+    expect(cloudStarts).toBe(0);
+    const state = await store.read();
+    expect(state.tasks["finish-at-claim"]).toMatchObject({
+      status: "completed",
+      currentWorkerId: "worker-finish-at-claim",
+    });
+    expect(state.pendingConversationPrompts).toEqual([]);
+    expect(notify).toHaveBeenCalledWith(
+      "chat-1",
+      "finish-at-claim already finished locally, so i didn't move or rerun it.",
+    );
+  });
+
+  it("moves only active tasks when captured tasks finish locally at different times", async () => {
+    const { directory, store, events } = await fixture();
+    await addTask(store, "still-active");
+    await addTask(store, "already-done");
+    const battery = new BatteryMonitor({
+      store,
+      events,
+      conversationId: "chat-1",
+      notify: async () => undefined,
+    });
+    await battery.handleBatteryReading(simulatedBatteryReading({
+      batteryPercent: 8,
+      charging: false,
+      powerSource: "battery",
+      remainingMinutes: 20,
+    }));
+    await store.updateState((state) => {
+      const task = state.tasks["already-done"]!;
+      const worker = state.workers["worker-already-done"]!;
+      task.status = "completed";
+      task.stage = "done";
+      task.updatedAt = new Date().toISOString();
+      worker.status = "completed";
+      worker.endedAt = new Date().toISOString();
+      worker.exitCode = 0;
+    });
+
+    const moveCapturedLocalTaskToCloud = vi.fn(async (captured: { taskId: string }) => ({
+      status: "started" as const,
+      title: captured.taskId,
+    }));
+    const notify = vi.fn(async () => undefined);
+    const runtime = new DexDaemonRuntime({
+      bridge: {
+        notify,
+        receipt: vi.fn(async () => undefined),
+        syncOnce: vi.fn(async () => []),
+      } as unknown as DexCloudBridge,
+      router: { route: vi.fn(async () => { throw new Error("plain yes should not be routed"); }) } as unknown as MessageRouter,
+      orchestrator: { moveCapturedLocalTaskToCloud } as unknown as DexOrchestrator,
+      store,
+      events,
+      battery,
+      power: new DexPowerController({ store, events, notify: async () => undefined }),
+      codexAuthLeasePath: path.join(directory, "lease"),
+    });
+
+    await runtime.handleCommand(messageCommand("yes"));
+
+    expect(moveCapturedLocalTaskToCloud).toHaveBeenCalledOnce();
+    expect(moveCapturedLocalTaskToCloud).toHaveBeenCalledWith(
+      { taskId: "still-active", workerId: "worker-still-active", lifecycleGeneration: 0 },
+      {
+        conversationId: "chat-1",
+        messageId: "message-yes-chat-1",
+        sourceMessageId: "message-yes-chat-1",
+      },
+    );
+    expect(moveCapturedLocalTaskToCloud.mock.calls.some(([captured]) => captured.taskId === "already-done")).toBe(false);
+    expect((await store.read()).pendingConversationPrompts).toEqual([]);
+    expect(notify).toHaveBeenCalledWith(
+      "chat-1",
+      "still-active is being handed to codex in the cloud.\n\nalready-done already finished locally, so i didn't move or rerun it.",
+    );
   });
 
   it("uses no to clear the prompt without moving or changing local tasks", async () => {

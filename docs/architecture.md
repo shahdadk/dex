@@ -152,9 +152,9 @@ The acceptance criterion is behavioral, not numerical: a fresh worker should use
 Before upload, Dex checkpoints the task branch and creates:
 
 - `repo.bundle`, containing the reconstructable task branch; and
-- `handoff.json`, containing task identity, original request, completed work, decisions, failures, touched files, validation state, blockers, next step, and selected memories.
+- `handoff.json`, containing task identity, original request, completed work, decisions, failures, touched files, validation state, blockers, next step, selected memories, and bounded tracked `AGENTS.md` instructions with their repository scopes.
 
-The package is redacted, secret-scanned, hashed, and HMAC-signed. Credentials are injected separately and are not stored in the handoff. All memory required for continuation is materialized before cloud ownership can be confirmed, so cloud Codex does not depend on the sleeping Mac or its local Claude-Mem process.
+The package is redacted, secret-scanned, hashed, and HMAC-signed with a task-and-handoff-scoped key derived from the device root. Only that scoped key enters the sandbox; the reusable device root never does. Dex streams the scoped key over the installer process's stdin into an exclusive `0600` file, verifies the file before use, and deletes it immediately after handoff verification. Credentials are injected separately and are not stored in the handoff. All memory and repository instructions required for continuation are materialized before cloud ownership can be confirmed, so cloud Codex does not depend on the sleeping Mac or its local Claude-Mem process.
 
 Fresh Codex starts only after the cloud worker verifies the task ID, hashes, signature, Git bundle, and required context. Startup evidence records the provider session ID, sandbox ID, handoff hash, and loaded continuity identifiers.
 
@@ -197,7 +197,7 @@ On a recoverable import failure, Dex records the failure without claiming local 
 
 Both real and controlled readings call the same policy function. Real telemetry is parsed from `/usr/bin/pmset -g batt`; controlled readings carry `simulated: true` through events, prompts, `dex watch`, and user-facing text.
 
-Low-battery prompts capture exact active local task IDs and expire. A plain `yes` in the same verified conversation moves only those captured tasks to Codex in Modal. It is not interpreted as arbitrary approval for another conversation or task.
+Low-battery prompts capture exact active local task IDs and expire. A plain `yes` in the same verified conversation moves only those captured tasks to Codex in Modal. At dispatch, Dex atomically claims the current local worker ID and lifecycle generation: either local completion wins, or the cloud handoff advances the generation and fences the late local result. It is not interpreted as arbitrary approval for another conversation or task.
 
 Normal keep-awake uses a parent-bound `caffeinate` process. Dex does not use `sudo`, change persistent system sleep settings, or enable aggressive closed-lid behavior.
 

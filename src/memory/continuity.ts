@@ -68,9 +68,83 @@ function hasKnowledge(knowledge: TaskKnowledge): boolean {
   return Object.values(knowledge).some((value) => Array.isArray(value) && value.length > 0);
 }
 
+export function extractExplicitFailedApproaches(text: string): NonNullable<TaskKnowledge["failedApproaches"]> {
+  const failures: NonNullable<TaskKnowledge["failedApproaches"]> = [];
+  const seen = new Set<string>();
+  const lines = text.split(/\r?\n/);
+
+  const add = (rawApproach: string, rawReason: string): void => {
+    const approach = rawApproach
+      .replace(/^[-*]\s*/, "")
+      .replace(/[.;:]\s*$/, "")
+      .trim();
+    const reason = rawReason
+      .replace(/^[-*]\s*/, "")
+      .replace(/[.;:]\s*$/, "")
+      .trim();
+    if (!approach || !reason || /^(?:none|n\/a|no(?:ne)? identified)$/i.test(approach)) return;
+    const key = `${approach.toLowerCase()}\0${reason.toLowerCase()}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    failures.push({ approach, reason, failed: true, shouldRetry: false });
+  };
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!.trim();
+    const marker = line.match(/(?:^|[.!?]\s+)(?:[-*]\s*)?(?:failed(?:\s+approach)?|do not repeat)\s*:\s*(.*)$/i);
+    if (!marker) continue;
+
+    let detail = marker[1]!.trim();
+    if (!detail) {
+      const next = lines[index + 1]?.trim();
+      if (next && !/^(?:why|reason|validation|remaining issues?)\s*:/i.test(next)) {
+        detail = next.replace(/^[-*]\s*/, "").trim();
+        index += 1;
+      }
+    }
+    if (!detail || /^(?:none|n\/a|no(?:ne)? identified)[.!]?$/i.test(detail)) continue;
+
+    const explicitReason = detail.match(/^(.{3,500}?)\s*(?:;|\.|\s)\s*(?:why|reason)\s*:\s*(.{3,800})$/i);
+    if (explicitReason) {
+      add(explicitReason[1]!, explicitReason[2]!);
+      continue;
+    }
+
+    const followingReason = lines[index + 1]?.trim().match(/^(?:why|reason)\s*:\s*(.*)$/i);
+    if (followingReason) {
+      let reason = followingReason[1]!.trim();
+      if (!reason) {
+        reason = lines[index + 2]?.trim().replace(/^[-*]\s*/, "") ?? "";
+        if (reason) index += 1;
+      }
+      if (reason) {
+        add(detail, reason);
+        index += 1;
+        continue;
+      }
+    }
+
+    // Workers often report a compact sentence such as
+    // "Failed approach: moving the check after the charge caused duplicates."
+    // Keep the extraction deliberately label-gated and causal so ordinary
+    // explanatory prose is never reclassified as an unsuccessful attempt.
+    const causal = detail.match(
+      /^(.{3,500}?)\s+((?:broke|breaks|failed|fails|caused|causes|risked|risks|resulted(?:\s+in)?|results?(?:\s+in)?|led(?:\s+to)?|leads?(?:\s+to)?|made)\b.{3,800}?)(?:\.\s+(?:no remaining|remaining issues?|validation)\b.*)?$/i,
+    );
+    if (causal) add(causal[1]!, causal[2]!);
+  }
+
+  return failures;
+}
+
 function knowledgeFromEvent(event: AgentEvent): TaskKnowledge {
   if (event.type === "message" && event.role === "assistant" && !event.delta && event.text.trim()) {
-    return { learnedFacts: [event.text.trim()] };
+    const text = event.text.trim();
+    const failures = extractExplicitFailedApproaches(text);
+    return {
+      learnedFacts: [text],
+      ...(failures.length === 0 ? {} : { failedApproaches: failures }),
+    };
   }
   if (event.type === "tool" && event.status === "failed") {
     return {
