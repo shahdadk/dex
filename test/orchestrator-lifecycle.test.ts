@@ -217,6 +217,99 @@ describe("DexOrchestrator durable worker lifecycle", () => {
     expect(fixture.moved).toHaveLength(2);
   });
 
+  it("preserves a user's updated outcome on the same task during cloud handoff", async () => {
+    const fixture = await createFixture(1, true);
+    await fixture.orchestrator.handle([
+      { type: "CREATE_TASK", description: "investigate checkout", preferredAgent: "claude" },
+    ], fixture.context);
+    const original = Object.values((await fixture.store.read()).tasks)[0]!;
+    fixture.claude.finish(0, "completed", undefined, "The ordering failure is understood.");
+    await eventually(async () => {
+      expect((await fixture.store.read()).tasks[original.id]?.status).toBe("completed");
+    });
+
+    await fixture.orchestrator.handle([{
+      type: "MOVE_TASK",
+      taskQuery: "checkout",
+      destination: "cloud",
+      preferredAgent: "codex",
+      instruction: "implement the recommended fix and run the regression test",
+    }], fixture.context);
+
+    expect(fixture.moved).toHaveLength(1);
+    expect(fixture.moved[0]).toMatchObject({
+      id: original.id,
+      nextStep: "implement the recommended fix and run the regression test",
+    });
+    expect((await fixture.store.read()).tasks[original.id]).toMatchObject({
+      id: original.id,
+      nextStep: "implement the recommended fix and run the regression test",
+      status: "running",
+      executionPreference: "cloud",
+    });
+  });
+
+  it("does not claim an updated outcome reached a task already running in Modal", async () => {
+    const fixture = await createFixture(1, true);
+    await fixture.orchestrator.handle([
+      { type: "CREATE_TASK", description: "fix checkout", preferredAgent: "codex" },
+    ], fixture.context);
+    const original = Object.values((await fixture.store.read()).tasks)[0]!;
+    await fixture.orchestrator.handle([{
+      type: "MOVE_TASK",
+      taskQuery: "checkout",
+      destination: "cloud",
+      preferredAgent: "codex",
+    }], fixture.context);
+
+    const reply = await fixture.orchestrator.handle([{
+      type: "MOVE_TASK",
+      taskQuery: "checkout",
+      destination: "cloud",
+      preferredAgent: "codex",
+      instruction: "also add the duplicate-delivery regression test",
+    }], fixture.context);
+
+    expect(fixture.moved).toHaveLength(1);
+    expect((await fixture.store.read()).tasks[original.id]).toMatchObject({
+      id: original.id,
+      status: "running",
+    });
+    expect((await fixture.store.read()).tasks[original.id]?.nextStep).toBeUndefined();
+    expect(reply).toContain("can't change its outcome mid-run");
+  });
+
+  it("continues a multi-task cloud move when one target is already in Modal", async () => {
+    const fixture = await createFixture(2, true);
+    await fixture.orchestrator.handle([
+      { type: "CREATE_TASK", description: "fix auth", preferredAgent: "codex" },
+      { type: "CREATE_TASK", description: "investigate checkout", preferredAgent: "claude" },
+    ], fixture.context);
+    await fixture.orchestrator.handle([{
+      type: "MOVE_TASK",
+      taskQuery: "auth",
+      destination: "cloud",
+      preferredAgent: "codex",
+    }], fixture.context);
+
+    const reply = await fixture.orchestrator.handle([{
+      type: "MOVE_TASK",
+      taskQuery: "everything unfinished",
+      destination: "cloud",
+      preferredAgent: "codex",
+      instruction: "implement the verified remediation",
+    }], fixture.context);
+
+    expect(fixture.moved).toHaveLength(2);
+    const state = await fixture.store.read();
+    const auth = Object.values(state.tasks).find((task) => task.title === "auth")!;
+    const checkout = Object.values(state.tasks).find((task) => task.title === "checkout")!;
+    expect(auth.nextStep).toBeUndefined();
+    expect(checkout.nextStep).toBe("implement the verified remediation");
+    expect(reply).toContain("auth is already running in the cloud");
+    expect(reply).toContain("checkout is being handed to codex in the cloud");
+  });
+
   it("keeps one task identity while changing from Codex to Claude", async () => {
     const fixture = await createFixture(2);
     await fixture.orchestrator.handle([

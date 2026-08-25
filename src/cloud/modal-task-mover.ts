@@ -2073,9 +2073,17 @@ async function validationCommands(
   return tracked.includes("package.json") ? [["npm", "test"]] : [];
 }
 
-function taskKnowledge(task: DexTask) {
+function taskKnowledge(task: DexTask): TaskKnowledge {
   const stored = task.metadata.taskKnowledge;
-  if (stored && typeof stored === "object" && !Array.isArray(stored)) return stored;
+  if (stored && typeof stored === "object" && !Array.isArray(stored)) {
+    const durable = stored as TaskKnowledge;
+    return {
+      ...durable,
+      // An explicit, durable continuation instruction is the user's latest
+      // requested outcome and supersedes worker-authored prior next steps.
+      nextSteps: task.nextStep ? [task.nextStep] : (durable.nextSteps ?? []),
+    };
+  }
   return {
     learnedFacts: task.latestSummary ? [task.latestSummary] : [],
     failedApproaches: Array.isArray(task.metadata.failedApproaches)

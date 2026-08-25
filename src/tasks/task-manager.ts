@@ -357,6 +357,23 @@ export class TaskManager {
     return updated;
   }
 
+  async setContinuationInstruction(taskId: string, instruction: string): Promise<DexTask> {
+    const nextStep = redactString(instruction).trim();
+    if (!nextStep) throw new TypeError("A continuation instruction is required");
+    let updated: DexTask | undefined;
+    await this.#store.updateState((state) => {
+      const current = requireTask(state, taskId);
+      updated = DexTaskSchema.parse({
+        ...current,
+        nextStep,
+        updatedAt: new Date().toISOString(),
+      });
+      state.tasks[taskId] = updated;
+    });
+    if (!updated) throw new Error(`Task ${taskId} was not updated`);
+    return updated;
+  }
+
   /**
    * Applies a worker outcome only while that worker still owns the durable task.
    * A late process result must never overwrite a replacement worker or an

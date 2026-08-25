@@ -488,6 +488,11 @@ describe("ModalTaskMover", () => {
 
   it("journals before create, uploads before monitoring, and updates the persisted worker on startup", async () => {
     const fixture = await createMoverFixture();
+    const continuation = "Implement the user-requested remediation and rerun checkout validation.";
+    const task = DexTaskSchema.parse({ ...fixture.task, nextStep: continuation });
+    await fixture.store.updateState((state) => {
+      state.tasks[task.id] = task;
+    });
     await mkdir(path.join(fixture.task.worktreePath, "src"));
     await writeFile(
       path.join(fixture.task.worktreePath, "src", "AGENTS.md"),
@@ -536,7 +541,7 @@ describe("ModalTaskMover", () => {
       startupTimeoutMs: 50,
     });
 
-    await mover.moveToCloud(fixture.task);
+    await mover.moveToCloud(task);
 
     const uploaded = harness.getUploadedHandoff();
     expect(uploaded).toBeDefined();
@@ -553,6 +558,15 @@ describe("ModalTaskMover", () => {
       approach: "Detach before scheduling the monitor",
       reason: "The task could become unowned.",
       doNotRepeat: true,
+    }));
+    expect(uploaded?.acceptanceCriteria).toContain(continuation);
+    expect(uploaded?.memories).toContainEqual(expect.objectContaining({
+      type: "next-step",
+      narrative: continuation,
+    }));
+    expect(uploaded?.memories).not.toContainEqual(expect.objectContaining({
+      type: "next-step",
+      narrative: "Schedule deterministic monitoring.",
     }));
     const journalAtCreate = stateAtCreate?.tasks[fixture.task.id]?.metadata.modalHandoffJournal as Record<string, unknown> | undefined;
     expect(journalAtCreate).toMatchObject({

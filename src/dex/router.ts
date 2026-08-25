@@ -17,7 +17,7 @@ const NAMED_TASK_REVIEW = /^(?:please\s+)?(?:have|ask|use)\s+(claude|codex)\s+(?
 const KEEP_AWAKE = /\bkeep (?:this|my|the)?\s*mac awake(?: until (?:everything|all tasks) (?:is|are) (?:done|finished))?/i;
 const SLEEP = /\bsleep (?:this|my|the)?\s*mac\b|\bwhen (?:everything|all tasks) (?:is|are) (?:done|finished),? sleep/i;
 const SLEEP_AFTER_TASKS = /\b(?:when|after|once)\s+(?:(?:everything|all tasks|the tasks|the work)\s+(?:(?:is|are)\s+)?(?:done|finished|complete)|(?:everything|all tasks|the tasks|the work)\s+(?:finishes|completes)|it(?:(?:'s| is)\s+(?:done|finished|complete)|\s+(?:finishes|completes))|you(?:'re| are)\s+done)\b/i;
-const MOVE = /\bmove\s+(.+?)\s+to\s+(?:the\s+)?(cloud|local)(?:\s+and\s+use\s+(claude|codex))?/i;
+const MOVE = /\bmove\s+(.+?)\s+to\s+(?:the\s+)?(cloud|local)(?:\s*[,;]?\s*(?:and\s+)?use\s+(claude|codex))?/i;
 const CHANGE = /\b(?:give|have|use)\s+(?:the\s+)?(.+?)\s+(?:to|with|use)\s+(claude|codex)\b|\b(?:claude|codex)\s+(?:take over|handle)\s+(.+)/i;
 const CHANGE_AGENT_FIRST = /\b(?:use|switch to)\s+(claude|codex)\s+(?:for|on)\s+(.+)/i;
 const IMPLICIT_TAKEOVER = /^(?:please\s+)?(?:have\s+)?(claude|codex)\s+(?:take over|handle it|handle that|handle this)$/i;
@@ -119,11 +119,13 @@ export function deterministicActions(message: string): DexAction[] {
   const actions: DexAction[] = [];
   const move = message.match(MOVE);
   if (move?.[1] && move[2]) {
+    const instruction = moveContinuationInstruction(message, move);
     actions.push({
       type: "MOVE_TASK",
       taskQuery: normalizeTaskQuery(move[1]),
       destination: move[2].toLowerCase() === "cloud" ? "cloud" : "local",
       ...(move[3] ? { preferredAgent: move[3].toLowerCase() as "claude" | "codex" } : {}),
+      ...(instruction ? { instruction } : {}),
     });
   }
 
@@ -161,8 +163,14 @@ function deterministicTaskSplit(message: string): DexAction[] {
     | "claude"
     | "codex"
     | undefined;
+  const independentTaskStart = String.raw`(?:please\s+)?(?:(?:have|use)\s+(?:claude|codex)\b|(?:claude|codex)\s+(?:to\s+)?(?:fix|investigate|implement|build|review|debug|add|finish|test|refactor|update|create|remove)\b|(?:fix|investigate|implement|build|review|debug|add|finish|test|refactor|update|create|remove)\b)`;
+  const providerTaskStart = String.raw`(?:claude|codex)\s+(?:to\s+)?\S`;
+  const taskSeparator = new RegExp(
+    String.raw`\s*(?:;|,?\s*\b(?:and|also)\s+have\b|,(?=\s*${independentTaskStart})|,(?=\s*${providerTaskStart})|\band also\b(?=\s*${independentTaskStart})|\band\b(?=\s*${providerTaskStart}))\s*`,
+    "i",
+  );
   const parts = message
-    .split(/\s*(?:,|;|\band also\b|\balso have\b|\band have\b)\s*/i)
+    .split(taskSeparator)
     .map((part) => part.trim())
     .filter((part) => part.length > 2)
     .slice(0, 3);
@@ -196,7 +204,8 @@ function isAmbiguous(message: string): boolean {
 }
 
 function hasExplicitAgentAssignment(message: string): boolean {
-  return /\b(?:have|use)\s+(?:claude|codex)\b|\b(?:with|using)\s+(?:claude|codex)\b|\b(?:claude|codex)\s+(?:to\s+)?(?:fix|investigate|implement|build|review|debug|add|finish|test)\b/i.test(message);
+  return /\b(?:have|use)\s+(?:claude|codex)\b|\b(?:with|using)\s+(?:claude|codex)\b/i.test(message) ||
+    /^(?:please\s+)?(?:claude|codex)\s+(?:to\s+)?(?!(?:and|or|vs|versus)\b)\S+/i.test(message);
 }
 
 function normalizeTaskQuery(value: string): string {
@@ -205,6 +214,28 @@ function normalizeTaskQuery(value: string): string {
     .replace(/^the\s+/i, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function moveContinuationInstruction(message: string, move: RegExpMatchArray): string | undefined {
+  const end = (move.index ?? 0) + move[0].length;
+  const trailing = message
+    .slice(end)
+    .replace(/^[,;:\s]+/, "")
+    .replace(/^(?:and|then)\s+/i, "")
+    .trim();
+  if (!trailing) return undefined;
+
+  const powerIndexes = [trailing.match(KEEP_AWAKE)?.index, trailing.match(SLEEP)?.index]
+    .filter((index): index is number => index !== undefined && index >= 0);
+  const powerIndex = powerIndexes.length > 0 ? Math.min(...powerIndexes) : trailing.length;
+  const instruction = trailing
+    .slice(0, powerIndex)
+    .trim()
+    .replace(/(?:[,;:]\s*)?(?:and|then)\s*$/i, "")
+    .replace(/[,;:\s]+$/g, "")
+    .replace(/[.!?]+$/g, "")
+    .trim();
+  return instruction || undefined;
 }
 
 function sessionOrdinal(value: string): number {

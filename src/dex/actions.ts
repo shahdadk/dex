@@ -46,6 +46,7 @@ export const DexActionSchema = z.discriminatedUnion("type", [
     taskQuery: z.string().min(1),
     destination: z.enum(["local", "cloud"]),
     preferredAgent: AgentKindSchema.optional(),
+    instruction: z.string().min(1).max(4000).optional(),
   }),
   z.object({
     type: z.literal("CHANGE_AGENT"),

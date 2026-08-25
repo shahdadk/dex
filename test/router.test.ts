@@ -124,6 +124,23 @@ describe("MessageRouter", () => {
     ]);
   });
 
+  it("splits explicit provider tasks without requiring a verb allowlist", async () => {
+    await expect(router.route("have claude fix auth, codex document the API")).resolves.toEqual({
+      actions: [
+        { type: "CREATE_TASK", preferredAgent: "claude", description: "fix auth" },
+        { type: "CREATE_TASK", preferredAgent: "codex", description: "document the API" },
+      ],
+      source: "deterministic",
+    });
+    await expect(router.route("claude document the API, codex write tests")).resolves.toEqual({
+      actions: [
+        { type: "CREATE_TASK", preferredAgent: "claude", description: "document the API" },
+        { type: "CREATE_TASK", preferredAgent: "codex", description: "write tests" },
+      ],
+      source: "deterministic",
+    });
+  });
+
   it("does not let Gemini reinterpret explicit agent assignments", async () => {
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
       candidates: [{ content: { parts: [{ text: JSON.stringify([
@@ -137,6 +154,19 @@ describe("MessageRouter", () => {
       source: "deterministic",
     });
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("keeps validation and reporting clauses attached to their engineering task", async () => {
+    const message = "have claude investigate the checkout webhook ordering bug without implementing the final fix, run the failing test, and end with labeled Failed approach and Next step findings based on actual evidence";
+
+    await expect(router.route(message)).resolves.toEqual({
+      actions: [{
+        type: "CREATE_TASK",
+        preferredAgent: "claude",
+        description: "investigate the checkout webhook ordering bug without implementing the final fix, run the failing test, and end with labeled Failed approach and Next step findings based on actual evidence",
+      }],
+      source: "deterministic",
+    });
   });
 
   it("changes the worker without creating a duplicate task", async () => {
@@ -191,6 +221,62 @@ describe("MessageRouter", () => {
       taskQuery: "auth",
       destination: "cloud",
       preferredAgent: "codex",
+    });
+    expect(result.actions).toContainEqual({ type: "SLEEP", when: "tasks_complete" });
+  });
+
+  it("carries an updated implementation outcome into the cloud handoff", async () => {
+    await expect(router.route(
+      "move checkout webhook ordering to the cloud and use codex and implement the recommended fix",
+    )).resolves.toEqual({
+      actions: [{
+        type: "MOVE_TASK",
+        taskQuery: "checkout webhook ordering",
+        destination: "cloud",
+        preferredAgent: "codex",
+        instruction: "implement the recommended fix",
+      }],
+      source: "deterministic",
+    });
+    await expect(router.route(
+      "move checkout webhook ordering to the cloud, use codex and implement the recommended fix",
+    )).resolves.toEqual({
+      actions: [{
+        type: "MOVE_TASK",
+        taskQuery: "checkout webhook ordering",
+        destination: "cloud",
+        preferredAgent: "codex",
+        instruction: "implement the recommended fix",
+      }],
+      source: "deterministic",
+    });
+  });
+
+  it("keeps ordinary continuation language beginning with keep", async () => {
+    await expect(router.route(
+      "move checkout to the cloud and use codex and keep investigating the race",
+    )).resolves.toEqual({
+      actions: [{
+        type: "MOVE_TASK",
+        taskQuery: "checkout",
+        destination: "cloud",
+        preferredAgent: "codex",
+        instruction: "keep investigating the race",
+      }],
+      source: "deterministic",
+    });
+  });
+
+  it("keeps power commands out of a cloud worker instruction", async () => {
+    const result = await router.route(
+      "move checkout to the cloud and use codex and implement the fix, then sleep my mac when everything is done",
+    );
+    expect(result.actions).toContainEqual({
+      type: "MOVE_TASK",
+      taskQuery: "checkout",
+      destination: "cloud",
+      preferredAgent: "codex",
+      instruction: "implement the fix",
     });
     expect(result.actions).toContainEqual({ type: "SLEEP", when: "tasks_complete" });
   });

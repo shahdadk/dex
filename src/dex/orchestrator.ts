@@ -358,8 +358,15 @@ export class DexOrchestrator {
               const state = await this.#options.store.read();
               const currentWorker = task.currentWorkerId ? state.workers[task.currentWorkerId] : undefined;
               if (currentWorker?.target.kind === "modal" && ["starting", "running", "waiting"].includes(currentWorker.status)) {
+                if (action.instruction) {
+                  replies.push(`${task.title} is already running in the cloud. i can't change its outcome mid-run; wait for it to finish first.`);
+                  continue;
+                }
                 replies.push(`${task.title} is already running in the cloud with ${currentWorker.agent}.`);
                 continue;
+              }
+              if (action.instruction) {
+                await this.#options.tasks.setContinuationInstruction(task.id, action.instruction);
               }
               await this.#stopAndRestoreReview(
                 task,
