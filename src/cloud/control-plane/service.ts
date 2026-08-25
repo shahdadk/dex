@@ -50,6 +50,8 @@ export interface DexControlPlaneOptions {
   pairingChallengeTtlMs?: number;
   pairingChallengeMaxAttempts?: number;
   maxRequestAgeMs?: number;
+  commandPollIntervalMs?: number;
+  wait?: (milliseconds: number) => Promise<void>;
 }
 
 export type SendblueWebhookOutcome =
@@ -102,6 +104,8 @@ export class DexControlPlaneService {
   readonly #internalSecret: string;
   readonly #now: () => number;
   readonly #maxRequestAgeMs: number;
+  readonly #commandPollIntervalMs: number;
+  readonly #wait: (milliseconds: number) => Promise<void>;
   readonly #challenges: SetupCodePairingChallengeService;
 
   constructor(options: DexControlPlaneOptions) {
@@ -128,6 +132,16 @@ export class DexControlPlaneService {
     ) {
       throw new RangeError("Dex request age must be between one and fifteen minutes");
     }
+    this.#commandPollIntervalMs = options.commandPollIntervalMs ?? 1_000;
+    if (
+      !Number.isSafeInteger(this.#commandPollIntervalMs) ||
+      this.#commandPollIntervalMs < 50 ||
+      this.#commandPollIntervalMs > 5_000
+    ) {
+      throw new RangeError("Dex command polling interval must be between 50ms and five seconds");
+    }
+    this.#wait = options.wait ?? ((milliseconds) =>
+      new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
     this.#challenges = new SetupCodePairingChallengeService({
       secret: options.internalSecret,
       ...(options.pairingChallengeTtlMs === undefined
@@ -358,6 +372,13 @@ export class DexControlPlaneService {
       now,
       maxRequestAgeMs: this.#maxRequestAgeMs,
     });
+    if (
+      parsed.data.events.length === 0 &&
+      parsed.data.receipts.length === 0 &&
+      (parsed.data.waitMs ?? 0) > 0
+    ) {
+      await this.#waitForDeviceCommand(device.id, parsed.data.waitMs!);
+    }
     try {
       const committed = await this.#repository.commitDeviceSync({
         deviceId: device.id,
@@ -383,6 +404,16 @@ export class DexControlPlaneService {
         throw new ControlPlaneError(409, "sync_conflict", error.message);
       }
       throw error;
+    }
+  }
+
+  async #waitForDeviceCommand(deviceId: string, waitMs: number): Promise<void> {
+    let remaining = waitMs;
+    while (remaining > 0) {
+      if ((await this.#repository.listPendingDeviceCommands(deviceId, 1)).length > 0) return;
+      const step = Math.min(this.#commandPollIntervalMs, remaining);
+      await this.#wait(step);
+      remaining -= step;
     }
   }
 

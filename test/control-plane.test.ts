@@ -92,6 +92,8 @@ interface Fixture {
 
 function fixture(options: {
   association?: VerifiedConversationAssociation | null;
+  commandPollIntervalMs?: number;
+  wait?: (milliseconds: number) => Promise<void>;
 } = {}): Fixture {
   const repository = new InMemoryControlPlaneRepository();
   const signingKey = generateDexDeviceKeyPair();
@@ -109,6 +111,10 @@ function fixture(options: {
     sendblueWebhookSecret: WEBHOOK_SECRET,
     internalSecret: INTERNAL_SECRET,
     now: () => now.value,
+    ...(options.commandPollIntervalMs === undefined
+      ? {}
+      : { commandPollIntervalMs: options.commandPollIntervalMs }),
+    ...(options.wait === undefined ? {} : { wait: options.wait }),
   });
   return { repository, service, signingKey, associationVerifier, now };
 }
@@ -459,6 +465,47 @@ describe("deterministic device command protocol", () => {
     expect(second.acceptedReceiptIds).toEqual([first.commands[0]!.id]);
     expect(second.commands).toEqual([]);
     expect(await state.repository.listPendingDeviceCommands(paired.deviceId, 500)).toEqual([]);
+  });
+
+  it("long-polls read-only until a new device command arrives", async () => {
+    const waits: number[] = [];
+    let state!: Fixture;
+    let commandQueued = false;
+    state = fixture({
+      commandPollIntervalMs: 50,
+      wait: async (milliseconds) => {
+        waits.push(milliseconds);
+        if (commandQueued) return;
+        commandQueued = true;
+        await state.service.processSendblueWebhook(
+          inbound("long-poll-command", "fix checkout with codex"),
+          sendblueHeaders(),
+        );
+      },
+    });
+    const paired = await pairDevice(state);
+    const client = new DexCloudMessagingClient({
+      baseUrl: "https://cloud.dex.test",
+      deviceId: paired.deviceId,
+      ownerId: OWNER,
+      keyPair: paired.deviceKey,
+      pinnedServerKeys: [{
+        algorithm: "ed25519",
+        keyId: state.signingKey.keyId,
+        publicKey: state.signingKey.publicKey,
+      }],
+      initialSequence: paired.nextSequence - 1,
+      fetch: localFetch(state.service),
+      now: () => state.now.value,
+      nonce: (sequence) => `long-poll-proof-${sequence}`,
+    });
+
+    const result = await client.sync(createDexSyncPayload({ waitMs: 25_000 }));
+    expect(waits).toEqual([50]);
+    expect(result.commands).toHaveLength(1);
+    expect(result.commands[0]?.command.payload).toMatchObject({
+      text: "fix checkout with codex",
+    });
   });
 
   it("enqueues a bounded pairing instruction instead of a command for an unpaired owner", async () => {
