@@ -129,7 +129,7 @@ export function extractExplicitFailedApproaches(text: string): NonNullable<TaskK
     // Keep the extraction deliberately label-gated and causal so ordinary
     // explanatory prose is never reclassified as an unsuccessful attempt.
     const causal = detail.match(
-      /^(.{3,500}?)\s+((?:broke|breaks|failed|fails|caused|causes|risked|risks|resulted(?:\s+in)?|results?(?:\s+in)?|led(?:\s+to)?|leads?(?:\s+to)?|made)\b.{3,800}?)(?:\.\s+(?:no remaining|remaining issues?|validation)\b.*)?$/i,
+      /^(.{3,500}?)\s+((?:broke|breaks|failed|fails|caused|causes|risked|risks|resulted(?:\s+in)?|results?(?:\s+in)?|led(?:\s+to)?|leads?(?:\s+to)?|made)\b.{3,800}?)(?:\.\s+(?:no remaining|remaining issues?|validation|next steps?|remaining work|blocker)\b.*)?$/i,
     );
     if (causal) add(causal[1]!, causal[2]!);
   }
@@ -137,13 +137,30 @@ export function extractExplicitFailedApproaches(text: string): NonNullable<TaskK
   return failures;
 }
 
+function extractExplicitNextSteps(text: string): string[] {
+  const steps: string[] = [];
+  const seen = new Set<string>();
+  const marker = /(?:^|[.!?]\s+|\r?\n)(?:[-*]\s*)?(?:next steps?|remaining work)\s*:\s*(.+?)(?=(?:[.!?]\s+|\r?\n)(?:failed(?:\s+approach)?|do not repeat|validation|blocker|tests?|next steps?|remaining work)\s*:|$)/gis;
+  for (const match of text.matchAll(marker)) {
+    const step = match[1]?.replace(/[.;:,\s]+$/g, "").trim();
+    if (!step || /^(?:none|n\/a|nothing)$/i.test(step)) continue;
+    const key = step.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    steps.push(step);
+  }
+  return steps;
+}
+
 function knowledgeFromEvent(event: AgentEvent): TaskKnowledge {
   if (event.type === "message" && event.role === "assistant" && !event.delta && event.text.trim()) {
     const text = event.text.trim();
     const failures = extractExplicitFailedApproaches(text);
+    const nextSteps = extractExplicitNextSteps(text);
     return {
       learnedFacts: [text],
       ...(failures.length === 0 ? {} : { failedApproaches: failures }),
+      ...(nextSteps.length === 0 ? {} : { nextSteps }),
     };
   }
   if (event.type === "tool" && event.status === "failed") {

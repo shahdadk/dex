@@ -331,6 +331,7 @@ function createRunningAgent<TEvent extends AgentProviderEvent>(
 
   let providerSessionId: string | undefined;
   let finalOutput = "";
+  let lastCompleteAssistantMessage: string | undefined;
   let providerFailure: string | undefined;
   let providerCompleted = false;
   let stderr = "";
@@ -474,20 +475,50 @@ function createRunningAgent<TEvent extends AgentProviderEvent>(
     });
 
     const interpreted = config.interpret(event);
-    if (interpreted.finalOutput !== undefined) finalOutput = redactString(interpreted.finalOutput);
+    const interpretedFinalOutput = interpreted.finalOutput === undefined
+      ? undefined
+      : redactString(interpreted.finalOutput);
+    if (interpretedFinalOutput !== undefined) finalOutput = interpretedFinalOutput;
     if (interpreted.providerFailure) providerFailure = redactString(interpreted.providerFailure);
     if (interpreted.providerCompleted) providerCompleted = true;
 
     for (const message of interpreted.messages ?? []) {
       if (!message.text) continue;
+      const text = redactString(message.text);
+      const delta = message.delta ?? false;
       emit({
         ...eventBase(provider, workerId),
         type: "message",
         role: message.role,
-        text: redactString(message.text),
-        delta: message.delta ?? false,
+        text,
+        delta,
         raw: redact(event),
       });
+      if (message.role === "assistant" && !delta) {
+        lastCompleteAssistantMessage = text.trim();
+      }
+    }
+    // Some providers publish their terminal answer only on the result channel.
+    // Promote it to the canonical message stream so status, deterministic task
+    // knowledge, and external memory all observe the same completion. Providers
+    // such as Codex already emit a complete assistant message, so suppress the
+    // synthetic event when the terminal answer is identical.
+    const completeAssistantMessage = interpretedFinalOutput?.trim();
+    if (
+      completeAssistantMessage &&
+      !interpreted.providerFailure &&
+      !interpreted.error &&
+      completeAssistantMessage !== lastCompleteAssistantMessage
+    ) {
+      emit({
+        ...eventBase(provider, workerId),
+        type: "message",
+        role: "assistant",
+        text: interpretedFinalOutput!,
+        delta: false,
+        raw: redact(event),
+      });
+      lastCompleteAssistantMessage = completeAssistantMessage;
     }
     for (const tool of interpreted.tools ?? []) {
       emit({

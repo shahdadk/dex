@@ -1,4 +1,7 @@
 import { EventEmitter } from "node:events";
+import { mkdtemp } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -14,6 +17,10 @@ import {
   type AgentSpawnOptions,
   type SpawnedAgentProcess,
 } from "../src/agents/index.js";
+import { MemoryContinuity } from "../src/memory/index.js";
+import { DexTaskSchema, WorkerSessionSchema } from "../src/state/schemas.js";
+import { DexStateStore } from "../src/state/store.js";
+import { createHandoff } from "../src/tasks/handoff.js";
 
 class FakeAgentProcess extends EventEmitter {
   readonly pid: number | undefined;
@@ -165,6 +172,13 @@ describe("CodexAgentAdapter", () => {
     );
     expect(events).toContainEqual(
       expect.objectContaining({ type: "message", text: "Done", delta: false }),
+    );
+    const doneMessages = events.filter((event) =>
+      event.type === "message" && event.text === "Done" && !event.delta
+    );
+    expect(doneMessages).toHaveLength(1);
+    expect(events.indexOf(doneMessages[0]!)).toBeLessThan(
+      events.findIndex((event) => event.type === "finished"),
     );
 
     expect(calls).toHaveLength(1);
@@ -332,9 +346,11 @@ describe("ClaudeAgentAdapter", () => {
     process.finish(0);
 
     const events = await eventsPromise;
-    expect(events).toContainEqual(
-      expect.objectContaining({ type: "message", text: "hello", delta: true }),
-    );
+    expect(events.filter((event) => event.type === "message" && event.text === "hello"))
+      .toEqual([
+        expect.objectContaining({ type: "message", text: "hello", delta: true }),
+        expect.objectContaining({ type: "message", text: "hello", delta: false }),
+      ]);
     await expect(handle.result).resolves.toMatchObject({
       status: "completed",
       output: "hello",
@@ -351,6 +367,150 @@ describe("ClaudeAgentAdapter", () => {
       "session-old",
     ]);
     expect(process.prompt).toBe("Continue the fix");
+  });
+
+  it("does not duplicate a terminal result already emitted as a complete message", async () => {
+    const process = new FakeAgentProcess();
+    const { spawner } = fakeSpawner([process]);
+    const adapter = new ClaudeAgentAdapter({ spawner });
+    const handlePromise = adapter.start({ cwd: "/repo", prompt: "Investigate checkout" });
+    process.stdout.write('{"type":"system","subtype":"init","session_id":"session-dedup"}\n');
+    const handle = await handlePromise;
+    const eventsPromise = collectEvents(handle.events);
+    process.stdout.write(`${JSON.stringify({
+      type: "assistant",
+      session_id: "session-dedup",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "Investigation saved" }],
+      },
+    })}\n`);
+    process.stdout.write('{"type":"result","subtype":"success","is_error":false,"result":"Investigation saved","session_id":"session-dedup"}\n');
+    process.finish(0);
+
+    const events = await eventsPromise;
+    expect(events.filter((event) =>
+      event.type === "message" && event.text === "Investigation saved" && !event.delta
+    )).toHaveLength(1);
+    await expect(handle.result).resolves.toMatchObject({
+      status: "completed",
+      output: "Investigation saved",
+    });
+  });
+
+  it("does not promote a failed terminal result into an assistant fact", async () => {
+    const process = new FakeAgentProcess();
+    const { spawner } = fakeSpawner([process]);
+    const handlePromise = new ClaudeAgentAdapter({ spawner }).start({
+      cwd: "/repo",
+      prompt: "Investigate checkout",
+    });
+    process.stdout.write('{"type":"system","subtype":"init","session_id":"session-failed-result"}\n');
+    const handle = await handlePromise;
+    const eventsPromise = collectEvents(handle.events);
+    process.stdout.write('{"type":"result","subtype":"error","is_error":true,"result":"Could not complete checkout","errors":["validation failed"],"session_id":"session-failed-result"}\n');
+    process.finish(0);
+
+    const events = await eventsPromise;
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "error",
+      message: "validation failed",
+    }));
+    expect(events).not.toContainEqual(expect.objectContaining({
+      type: "message",
+      text: "Could not complete checkout",
+      delta: false,
+    }));
+    await expect(handle.result).resolves.toMatchObject({
+      status: "failed",
+      output: "Could not complete checkout",
+      error: "validation failed",
+    });
+  });
+
+  it("materializes a terminal-only result into durable handoff knowledge", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "dex-claude-terminal-memory-"));
+    const store = new DexStateStore(path.join(directory, "state.json"));
+    const now = new Date().toISOString();
+    const task = DexTaskSchema.parse({
+      id: "checkout-terminal-memory",
+      projectId: "project-1",
+      title: "checkout ordering",
+      originalRequest: "investigate checkout ordering",
+      repositoryPath: "/repo",
+      baseBranch: "main",
+      dexBranch: "dex/checkout-terminal-memory",
+      worktreePath: "/repo-worktree",
+      status: "running",
+      stage: "investigating",
+      createdAt: now,
+      updatedAt: now,
+    });
+    const process = new FakeAgentProcess();
+    const { spawner } = fakeSpawner([process]);
+    const handlePromise = new ClaudeAgentAdapter({ spawner }).start({
+      cwd: task.worktreePath,
+      prompt: task.originalRequest,
+    });
+    process.stdout.write('{"type":"system","subtype":"init","session_id":"session-memory"}\n');
+    const handle = await handlePromise;
+    const worker = WorkerSessionSchema.parse({
+      id: handle.workerId,
+      taskId: task.id,
+      agent: "claude",
+      target: { kind: "local", machineId: "mac-1" },
+      status: "running",
+      providerSessionId: handle.providerSessionId,
+      startedAt: now,
+    });
+    await store.updateState((state) => {
+      state.tasks[task.id] = task;
+      state.workers[worker.id] = worker;
+    });
+    const continuity = new MemoryContinuity({ client: null, store });
+    const observeEvents = (async () => {
+      for await (const event of handle.events) {
+        await continuity.observe(task, worker, event);
+      }
+    })();
+    const terminalSummary = "Found the checkout ordering race. Failed approach: moving idempotency after charge creation caused duplicate charges. Next step: preserve the check before the external charge. Next step: add the webhook ordering regression test.";
+    process.stdout.write(`${JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: terminalSummary,
+      session_id: "session-memory",
+    })}\n`);
+    process.finish(0);
+
+    await observeEvents;
+    await expect(handle.result).resolves.toMatchObject({ output: terminalSummary });
+    const persisted = (await store.read()).tasks[task.id]?.metadata.taskKnowledge;
+    expect(persisted).toMatchObject({
+      learnedFacts: [terminalSummary],
+      failedApproaches: [{
+        approach: "moving idempotency after charge creation",
+        reason: "caused duplicate charges",
+        failed: true,
+        shouldRetry: false,
+      }],
+      nextSteps: [
+        "preserve the check before the external charge",
+        "add the webhook ordering regression test",
+      ],
+    });
+    const handoff = await createHandoff({
+      taskId: task.id,
+      goal: task.originalRequest,
+      repository: { baseCommit: "abc123", workingBranch: task.dexBranch },
+      taskKnowledge: persisted,
+    }, { discoverMemory: false });
+    expect(handoff.memories.some(({ narrative }) => narrative.includes("checkout ordering race")))
+      .toBe(true);
+    expect(handoff.failedApproaches).toContainEqual(expect.objectContaining({
+      approach: "moving idempotency after charge creation",
+      doNotRepeat: true,
+    }));
   });
 
   it("keeps resume IDs as one argv entry", () => {
