@@ -7,7 +7,8 @@ export function buildStatusMessage(tasks: DexTask[], workers: WorkerSession[] = 
   const workerById = new Map(workers.map((worker) => [worker.id, worker]));
   const active = tasks.filter((task) => !TERMINAL.has(task.status));
   const heading = active.length > 0 ? `${active.length} ${active.length === 1 ? "thing" : "things"} active:` : "recent work:";
-  const lines = tasks.slice(0, 6).map((task) => {
+  const visible = active.length > 0 ? active : tasks.slice(0, 6);
+  const lines = visible.map((task) => {
     const worker = task.currentWorkerId ? workerById.get(task.currentWorkerId) : undefined;
     const baseDetail = task.latestSummary ? semanticSummary(task.latestSummary) : stageText(task);
     const detail = withReviewSummary(task, baseDetail);
@@ -46,7 +47,7 @@ function semanticSummary(value: string): string {
     .trim();
   const testEvidence = clean.match(/\b(\d+)\s*\/\s*(\d+)\s+tests?\s+passed\b/i);
   const narrative = clean.split(/\bValidation\s*:/i)[0]?.trim() || clean;
-  const detail = truncateAtWord(narrative, 210);
+  const detail = truncateAtWord(narrative, 150);
   if (!testEvidence || detail.toLowerCase().includes(testEvidence[0]!.toLowerCase())) return detail;
   return `${detail.replace(/[.;:,\s]+$/g, "")} — ${testEvidence[1]}/${testEvidence[2]} tests passed`;
 }

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildStatusMessage } from "../src/dex/status.js";
+import { DexTaskSchema } from "../src/state/schemas.js";
 import type { DexTask } from "../src/state/schemas.js";
 
 describe("status persona", () => {
@@ -29,6 +30,43 @@ describe("status persona", () => {
     expect(message).toContain("auth — implementing the change");
     expect(message).toContain("nothing needs you");
     expect(message).not.toContain("%");
+  });
+
+  it("shows only active work when active and historical tasks coexist", () => {
+    const now = new Date().toISOString();
+    const active = DexTaskSchema.parse({
+      id: "active-checkout",
+      kind: "dex",
+      projectId: "p1",
+      title: "checkout validation",
+      originalRequest: "validate checkout",
+      repositoryPath: "/repo",
+      baseBranch: "main",
+      dexBranch: "dex/active-checkout",
+      worktreePath: "/worktree/active",
+      status: "running",
+      stage: "testing",
+      createdAt: now,
+      updatedAt: now,
+      workerHistory: [],
+      memoryQueries: [],
+      metadata: {},
+    });
+    const historical = DexTaskSchema.parse({
+      ...active,
+      id: "old-auth",
+      title: "old auth task",
+      dexBranch: "dex/old-auth",
+      worktreePath: "/worktree/old",
+      status: "completed",
+      stage: "done",
+    });
+
+    const message = buildStatusMessage([active, historical]);
+
+    expect(message).toContain("1 thing active:");
+    expect(message).toContain("checkout validation — running validation");
+    expect(message).not.toContain("old auth task");
   });
 
   it("turns cloud-worker output into concise text instead of leaking workspace paths or validation logs", () => {
