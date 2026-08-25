@@ -441,7 +441,7 @@ export class DexDaemonRuntime {
           // never persisted and would duplicate the orchestrator's final reply.
           reply = await this.#orchestrator.handle(route.actions, context);
         }
-        if (reply) await this.#bridge.notify(message.conversationId, reply);
+        if (reply) await this.#bridge.notify(message.conversationId, reply, false);
       } else if (type === "demo.battery") {
         const { percent } = BatteryPayloadSchema.parse(payload);
         await this.#battery.handleBatteryReading(simulatedBatteryReading({
@@ -484,7 +484,7 @@ export class DexDaemonRuntime {
         await this.#bridge.receipt(command.id, "rejected", reason);
         const conversationId = command.authority.conversationId;
         if (conversationId && !(error instanceof StaleCloudCompletionError)) {
-          await this.#bridge.notify(conversationId, `i couldn't complete that request: ${reason}`);
+          await this.#bridge.notify(conversationId, `i couldn't complete that request: ${reason}`, false);
         }
       }
     }
@@ -1226,7 +1226,9 @@ export async function createDaemonRuntime(options: DexDaemonRuntimeOptions): Pro
   const defaultConversation = options.config.pairedConversationId ?? identity.pairedConversationId;
   const notifyDefault = async (text: string): Promise<void> => {
     if (!defaultConversation) throw new Error("Dex has no paired conversation for proactive notification");
-    await bridge.notify(defaultConversation, text);
+    // Command handling performs one explicit transport flush after durable
+    // orchestration. Do not make local work wait for Sendblue delivery here.
+    await bridge.notify(defaultConversation, text, false);
   };
   const power = new DexPowerController({
     store,
@@ -1277,7 +1279,7 @@ export async function createDaemonRuntime(options: DexDaemonRuntimeOptions): Pro
     config: { ...options.config, deviceId: identity.deviceId },
     project,
     agents: { codex: new CodexAgentAdapter(), claude: new ClaudeAgentAdapter() },
-    notify: (conversationId, text) => bridge.notify(conversationId, text),
+    notify: (conversationId, text) => bridge.notify(conversationId, text, false),
     flushTransport: async () => { await bridge.syncOnce(0); },
     publishTask: async (task, conversationId) => {
       await bridge.publish({

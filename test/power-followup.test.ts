@@ -174,7 +174,7 @@ describe("low-battery conversation follow-up", () => {
     ]);
     expect(moveCapturedLocalTaskToCloud.mock.calls.some(([captured]) => captured.taskId === "later-task")).toBe(false);
     expect((await store.read()).pendingConversationPrompts).toEqual([]);
-    expect(notify).toHaveBeenCalledWith("chat-1", expect.stringContaining("captured-one is being handed"));
+    expect(notify).toHaveBeenCalledWith("chat-1", expect.stringContaining("captured-one is being handed"), false);
     expect(receipt).toHaveBeenCalledWith(expect.stringContaining("command-yes-chat-1"), "processed");
   });
 
@@ -265,6 +265,7 @@ describe("low-battery conversation follow-up", () => {
     expect(notify).toHaveBeenCalledWith(
       "chat-1",
       "replaced-task changed workers before i could claim it, so i left the current work alone.",
+      false,
     );
   });
 
@@ -310,6 +311,7 @@ describe("low-battery conversation follow-up", () => {
     expect(notify).toHaveBeenCalledWith(
       "chat-1",
       "that battery prompt predates worker fencing, so i left the captured tasks running locally.",
+      false,
     );
   });
 
@@ -370,6 +372,7 @@ describe("low-battery conversation follow-up", () => {
     expect(notify).toHaveBeenCalledWith(
       "chat-1",
       "fast-local already finished locally, so i didn't move or rerun it.",
+      false,
     );
   });
 
@@ -443,6 +446,7 @@ describe("low-battery conversation follow-up", () => {
     expect(notify).toHaveBeenCalledWith(
       "chat-1",
       "finish-at-claim already finished locally, so i didn't move or rerun it.",
+      false,
     );
   });
 
@@ -509,6 +513,7 @@ describe("low-battery conversation follow-up", () => {
     expect(notify).toHaveBeenCalledWith(
       "chat-1",
       "still-active is being handed to codex in the cloud.\n\nalready-done already finished locally, so i didn't move or rerun it.",
+      false,
     );
   });
 
@@ -543,7 +548,11 @@ describe("low-battery conversation follow-up", () => {
     expect(handle).not.toHaveBeenCalled();
     expect((await store.read()).pendingConversationPrompts).toEqual([]);
     expect((await store.read()).workers["worker-stay-local"]?.target).toEqual({ kind: "local", machineId: "device-1" });
-    expect(notify).toHaveBeenCalledWith("chat-1", expect.stringContaining("left the captured tasks running locally"));
+    expect(notify).toHaveBeenCalledWith(
+      "chat-1",
+      expect.stringContaining("left the captured tasks running locally"),
+      false,
+    );
   });
 
   it("does not resolve a battery prompt from another conversation", async () => {
@@ -609,7 +618,7 @@ describe("low-battery conversation follow-up", () => {
 
     expect(handle).not.toHaveBeenCalled();
     expect((await store.read()).pendingConversationPrompts).toEqual([]);
-    expect(notify).toHaveBeenCalledWith("chat-1", expect.stringContaining("prompt expired"));
+    expect(notify).toHaveBeenCalledWith("chat-1", expect.stringContaining("prompt expired"), false);
   });
 
   it("accepts an atomically queued terminal outcome without sending a second failure", async () => {
