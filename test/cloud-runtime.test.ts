@@ -741,6 +741,75 @@ describe("runnable cloud composition", () => {
     expect(calls).toEqual(["https://api.sendblue.com/api/send-message"]);
   });
 
+  it("does not hold an accepted webhook open while Sendblue delivery is slow", async () => {
+    let releaseProvider!: () => void;
+    const providerPending = new Promise<Response>((resolve) => {
+      releaseProvider = () => resolve(new Response(JSON.stringify({
+        message_handle: "provider-background-1",
+        status: "QUEUED",
+        content: "Dex needs a paired Mac before it can accept engineering work. Run dex setup to begin.",
+        from_number: DEX_LINE,
+        number: PHONE,
+        is_outbound: true,
+        date_created: NOW_ISO,
+      }), { status: 200 }));
+    });
+    const sendblueFetch = vi.fn(async () => providerPending);
+    const modal = {
+      fromId: vi.fn(),
+      close: vi.fn(async () => undefined),
+    } as unknown as ModalAdapter;
+    const cloudConfig: DexCloudConfig = {
+      ...config(await stateFile()),
+      cloudTasks: {
+        project: "dex-project",
+        location: "northamerica-northeast1",
+        queue: "modal-monitors",
+        serviceUrl: "https://dex.example.test",
+        audience: "https://dex.example.test",
+        serviceAccountEmail: "tasks@dex-project.iam.gserviceaccount.com",
+      },
+    };
+    const runtime = createDexCloudRuntime({
+      config: cloudConfig,
+      fetch: sendblueFetch,
+      modal,
+      now: () => NOW,
+    });
+
+    const webhookPromise = runtime.fetchHandler(new Request(
+      "https://cloud.dex.test/webhooks/sendblue",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "sb-signing-secret": "webhook-secret",
+        },
+        body: JSON.stringify({
+          content: "implement durable retries",
+          is_outbound: false,
+          message_handle: "incoming-background-1",
+          date_sent: NOW_ISO,
+          from_number: PHONE,
+          to_number: DEX_LINE,
+        }),
+      },
+    ));
+    const blocked = Symbol("blocked");
+    const winner = await Promise.race([
+      webhookPromise,
+      new Promise<typeof blocked>((resolve) => setTimeout(() => resolve(blocked), 100)),
+    ]);
+    releaseProvider();
+    const webhook = await webhookPromise;
+
+    expect(winner).not.toBe(blocked);
+    expect(webhook.status).toBe(200);
+    await runtime.runCycle();
+    expect(sendblueFetch).toHaveBeenCalledOnce();
+    await runtime.close();
+  });
+
   it("serves webhook/pair/sync routes and drains the resulting Sendblue outbox", async () => {
     const calls: Array<{ url: string; method: string; body?: string }> = [];
     const sendblueFetch = vi.fn(async (

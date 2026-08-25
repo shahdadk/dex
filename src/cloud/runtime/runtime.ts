@@ -133,9 +133,14 @@ export class DexCloudRuntime {
       readiness,
       ...(monitorTask === undefined ? {} : {
         monitorTask,
-        // With no resident timer, each mutating request drains both the monitor
-        // outbox and terminal/user notifications before Cloud Run can scale down.
-        onMonitorRegistered: async () => { await this.runCycle(); },
+        // Persistence commits before this hook runs. Kick the serialized
+        // monitor/Sendblue cycle without holding provider webhooks or signed
+        // device sync responses open behind a slow outbound API call. The
+        // resident timer is the durable retry owner if this attempt fails.
+        onMonitorRegistered: () => {
+          this.#kickBackgroundCycle();
+          return Promise.resolve();
+        },
       }),
     };
     this.fetchHandler = createDexControlPlaneFetchHandler(handlerOptions);
@@ -230,25 +235,27 @@ export class DexCloudRuntime {
     if (this.#closed) throw new Error("Dex Cloud runtime is closed");
     if (this.#backgroundWorkStarted) return;
     this.#backgroundWorkStarted = true;
-    const tick = (): void => {
-      if (this.#backgroundCycleRunning || this.#closed) return;
-      this.#backgroundCycleRunning = true;
-      void this.runCycle()
-        .catch((error) => {
-          try {
-            this.#onBackgroundError(error);
-          } catch {
-            // A reporting hook must not turn a handled background failure into
-            // an unhandled rejection.
-          }
-        })
-        .finally(() => {
-          this.#backgroundCycleRunning = false;
-        });
-    };
+    const tick = (): void => this.#kickBackgroundCycle();
     this.#timer = setInterval(tick, this.config.pollIntervalMs);
     this.#timer.unref?.();
     tick();
+  }
+
+  #kickBackgroundCycle(): void {
+    if (this.#backgroundCycleRunning || this.#closed) return;
+    this.#backgroundCycleRunning = true;
+    void this.runCycle()
+      .catch((error) => {
+        try {
+          this.#onBackgroundError(error);
+        } catch {
+          // A reporting hook must not turn a handled background failure into
+          // an unhandled rejection.
+        }
+      })
+      .finally(() => {
+        this.#backgroundCycleRunning = false;
+      });
   }
 
   close(): Promise<void> {
